@@ -5,6 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <chrono>
 #include <common/scope_exit.h>
 
@@ -1804,10 +1809,32 @@ CaptureButtonState EmulatedController::GetCaptureButtons() const {
     return controller.capture_button_state;
 }
 
+// EDEN_AUTO_PRESS_A=<start>,<interval>,<end>: taps A for 200 ms every <interval> seconds between
+// <start> and <end> seconds after the emulator started. For unattended test runs.
+static const auto auto_press_epoch = std::chrono::steady_clock::now();
+static bool AutoPressA() {
+    static const auto schedule = []() -> std::optional<std::array<double, 3>> {
+        const char* value = std::getenv("EDEN_AUTO_PRESS_A");
+        std::array<double, 3> parsed{};
+        if (!value || std::sscanf(value, "%lf,%lf,%lf", &parsed[0], &parsed[1], &parsed[2]) != 3 ||
+            parsed[1] <= 0) {
+            return std::nullopt;
+        }
+        return parsed;
+    }();
+    if (!schedule) return false;
+    const double now =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
+    const auto [first, interval, last] = *schedule;
+    return now >= first && now <= last && std::fmod(now - first, interval) < 0.2;
+}
+
 NpadButtonState EmulatedController::GetNpadButtons() const {
     if (is_configuring)
         return {};
-    return {controller.npad_button_state.raw & GetTurboButtonMask()};
+    NpadButtonState state{controller.npad_button_state.raw & GetTurboButtonMask()};
+    if (AutoPressA()) state.a.Assign(1);
+    return state;
 }
 
 DebugPadButton EmulatedController::GetDebugPadButtons() const {

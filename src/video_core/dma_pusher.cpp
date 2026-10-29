@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <span>
+#include <fmt/ranges.h>
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/dma_pusher.h"
@@ -213,8 +217,36 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method_count = command_header.method_count;
 }
 
+static const bool method_trace_enabled = std::getenv("EDEN_NATIVE_METHOD_TRACE") != nullptr;
+
+void DmaPusher::TraceMethod(u32 method, u32 argument) {
+    if (!method_trace_enabled) return;
+    method_trace[method_trace_count++ % method_trace.size()] = {(dma_state.subchannel << 16) | method, argument};
+}
+
+void DmaPusher::DumpMethodTrace(std::string_view reason) const {
+    if (!method_trace_enabled) return;
+    const size_t count = std::min<size_t>(method_trace_count, 48);
+    LOG_WARNING(HW_GPU, "Native method trace, channel {} ({}), last {} methods:", channel_state.bind_id, reason, count);
+    for (size_t i = method_trace_count - count; i < method_trace_count; ++i) {
+        const auto& [method, argument] = method_trace[i % method_trace.size()];
+        LOG_WARNING(HW_GPU, "  s{} {:#06x} = {:#010x}", method >> 16, (method & 0xffff) * 4, argument);
+    }
+    // Raw words of the current segment, to decode exactly what the channel was given.
+    const u64 offset = dma_state.dma_word_offset;
+    LOG_WARNING(HW_GPU, "Native method trace: dma_get={:#x}, word offset={:#x}, method={:#x}, subchannel={}, count={}",
+                dma_state.dma_get, offset, dma_state.method, dma_state.subchannel, dma_state.method_count);
+    std::array<u32, 64> words{};
+    const GPUVAddr start = dma_state.dma_get + (offset > 0x80 ? offset - 0x80 : 0);
+    memory_manager.ReadBlockUnsafe(start, words.data(), sizeof(words));
+    for (size_t i = 0; i < words.size(); i += 8) {
+        LOG_WARNING(HW_GPU, "  {:#x}: {:08x}", start + i * 4, fmt::join(std::span{words.data() + i, 8}, " "));
+    }
+}
+
 void DmaPusher::CallMethod(u32 argument) {
     FlushPendingNativeMacro(false);
+    TraceMethod(dma_state.method, argument);
     if (dma_state.method < non_puller_methods) {
         puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
             dma_state.method,
@@ -236,6 +268,9 @@ void DmaPusher::CallMethod(u32 argument) {
 
 void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     FlushPendingNativeMacro(false);
+    for (u32 i = 0; i < num_methods && method_trace_enabled; ++i) {
+        TraceMethod(dma_state.method + (dma_state.non_incrementing ? 0 : i), base_start[i]);
+    }
     if (dma_state.method < non_puller_methods) {
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
     } else {

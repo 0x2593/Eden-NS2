@@ -46,6 +46,9 @@ public:
     void SetNativeSyncpointShim(GPUVAddr address);
     void EnableNativeTiling() { native_tiling = true; }
     bool UsesNativeTiling() const { return native_tiling; }
+    /// Bytes from gpu_addr to the end of the native mapping containing it. Native memory pools
+    /// are identity mapped back to back, so the kind map alone merges neighbouring pools.
+    [[nodiscard]] std::optional<size_t> GetNativeMappingSizeFrom(GPUVAddr gpu_addr) const;
     bool IsShuttingDown() const;
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
@@ -228,6 +231,9 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    std::map<GPUVAddr, GPUVAddr> native_mappings; ///< Start -> end of each native mapping.
+    mutable std::mutex native_mapping_guard;
+    void TrackNativeMapping(GPUVAddr gpu_addr, std::size_t size, bool mapped);
 
     static constexpr size_t continuous_bits = 64;
 

@@ -356,6 +356,7 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    TRACE_NATIVE_SEMAPHORE_RELEASE("DMA", this, address, payload);
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;

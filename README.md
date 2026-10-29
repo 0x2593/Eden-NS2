@@ -2,8 +2,9 @@
 
 An experimental fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator,
 built on top of a community "Switch 2 support" patch, with a set of fixes that get
-**Donkey Kong Bananza** (title `040074A01BF12000`, update v7.0.0) from a black screen to its
-**mode-select menu at full speed (60 FPS) on Windows**.
+**Donkey Kong Bananza** (title `040074A01BF12000`, update v7.0.0) from a black screen, through its
+mode-select menu (60 FPS) and first load, **into gameplay on Windows**. In gameplay the HUD
+renders but the 3D world does not yet, and it runs slowly (about 5 FPS).
 
 ![Mode-select menu](docs/ns2/screenshots/mode-select-menu.png)
 
@@ -18,18 +19,24 @@ built on top of a community "Switch 2 support" patch, with a set of fixes that g
 | Boot, audio, GPU queues, shaders | Working |
 | Mode-select menu ("Normal Mode / Assist Mode / Options") | **Working, 60 FPS, text readable** |
 | Selecting Normal Mode → loading screen ("Golden Bananas?!") | Working |
-| Finishing the first load | **Crashes** ~15 s into loading (see below) |
+| Finishing the first load | Working |
+| Gameplay ("Explore the mining tunnel") | **Reached**: HUD renders, 3D world does not; ~5 FPS |
 
 Tested on Windows 11 with an NVIDIA Turing-class GPU, in single-core and multi-core CPU modes.
 
-### Known issue: crash during the first load
+### Known issues
 
-While loading the opening, one of the game's VFX (`nn::vfx2`) shader programs fails
-`nvnProgramSetShaders`, because the GPU code addresses it passes are raw offsets (`0x0`, `0x3600`).
-The memory pool holding that effect's shader code reports a GPU address of 0. The game then binds
-uniform blocks on the uninitialised program and dereferences NULL. The next step is finding why that
-pool never receives a GPU mapping. [docs/ns2/NOTES.md](docs/ns2/NOTES.md) has the full trail and the
-addresses involved.
+- **3D world not drawn in gameplay.** Geometry-shader stages are not supported by the native shader
+  path yet (`Unsupported native graphics shader stage 4`), so those draws are skipped, and the
+  remaining rendering still needs work.
+- **Slow in gameplay** (~5 FPS, ~20% speed).
+- **Occasional crash right after Normal Mode is chosen** (guest memory corruption, `PC=4`). It was
+  only seen when A was pressed again during the menu-to-loading transition.
+
+## Reaching gameplay
+
+On a save that has already picked a mode, the menu still appears: press A (keyboard `C`) twice to
+pick Normal Mode and start. Loading takes about 30 s.
 
 ## What changed (on top of the NS2 patch)
 
@@ -47,9 +54,27 @@ Highlights; [docs/ns2/NOTES.md](docs/ns2/NOTES.md) lists every fix with the reas
   they were left unbacked, so every clear and draw went nowhere. They are now backed with memory.
 - **Loading:** the VFS file cache now stays below the C runtime's stream limit (MSVCRT caps it at
   2048 on MinGW builds), fixing "Too many open files" while streaming assets.
+- **Crash during the first load:** the GPU worker service refused new mappings after 1024 per
+  worker, so NVN failed one effect's shader-code memory pool (GPU address 0) and the game used the
+  broken shader program. The limit is now 65536.
+- **Deadlock on the first gameplay frame:** the graphics and compute queues hand off through
+  semaphores. Compute macros write that signal by patching a QMD with the inline-to-memory upload
+  engine and scheduling it. The native compute engine dropped those uploads, and the QMD scheduler
+  only read release slots at words 24/28, not the one at word 52. Both work now.
+- **More shader lowering:** FMNMX with a uniform register, IADD3/IADD3.X carry chains (uniform and
+  normal), IMAD.WIDE.U32, IABS, 8/16-bit global loads and stores, F2I to 8 bits, any PLOP3 truth
+  table, BREAK out of a reconvergence scope (PBK/BRK), RET without the copied link, TLD4 with a
+  partial mask, TEX on 2D arrays with explicit LOD, AST of RZ, texture descriptors in any constant
+  buffer, and uniform registers UR0–UR22.
+- **Buffer cache:** up to 32 storage buffers per stage, and storage buffers with no size in the
+  constant buffer stop at the end of their native mapping instead of spanning neighbouring pools.
 - Opt-in diagnostics (environment variables): `EDEN_NATIVE_FRAME_STATS`, `EDEN_NATIVE_TIC_TRACE`,
   `EDEN_NATIVE_HANDLE_TRACE`, `EDEN_NATIVE_SUBMIT_TRACE`, `EDEN_NATIVE_DISPLAY_OVERRIDE=<addr>`,
-  `EDEN_UNMAPPED_BACKTRACE`, plus the existing `EDEN_NATIVE_FRAME_CAPTURE` / `_DRAW_DIAGNOSTICS`.
+  `EDEN_UNMAPPED_BACKTRACE`, `EDEN_NATIVE_SEM_WATCH=<page,...>` (semaphore writers and waiters),
+  `EDEN_NATIVE_STALL_WATCH=<addr,...>` (report parked channels after 8 s idle),
+  `EDEN_NATIVE_METHOD_TRACE` (recent methods per channel at a watched wait),
+  `EDEN_NATIVE_NO_SSBO_WRITEBACK`, `EDEN_AUTO_PRESS_A=<start>,<interval>,<end>` (taps A for unattended
+  runs), plus the existing `EDEN_NATIVE_FRAME_CAPTURE` / `_DRAW_DIAGNOSTICS`.
 
 ## Repository layout
 

@@ -146,9 +146,21 @@ bool Puller::ResumeNativeAcquire(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
+    if (dma_pusher.channel_state.native_abi) {
+        const GPUVAddr address = regs.semaphore_address.SemaphoreAddress();
+        if (VideoCommon::IsWatchedNativeSemaphore(address)) {
+            auto& engines = *dma_pusher.channel_state.payload;
+            LOG_WARNING(HW_GPU, "Native semaphore watch: channel={} (host {}, 3D {}, compute {}, DMA {}), op={}, trigger={:#x}, address={:#x}, payload={:#x}, current={:#x}",
+                        dma_pusher.channel_state.bind_id, static_cast<const void*>(&dma_pusher),
+                        static_cast<const void*>(&engines.maxwell_3d), static_cast<const void*>(&engines.kepler_compute),
+                        static_cast<const void*>(&engines.maxwell_dma), static_cast<u32>(op), regs.semaphore_trigger,
+                        address, regs.semaphore_sequence, ReadNativeSemaphoreWord(dma_pusher, address));
+        }
+    }
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;
+        TRACE_NATIVE_SEMAPHORE_RELEASE("host write", &dma_pusher, sequence_address, payload);
         const auto properties = dma_pusher.channel_state.native_abi && (regs.semaphore_trigger & (1U << 24))
             ? VideoCommon::QueryPropertiesFlags::IsAFence : VideoCommon::QueryPropertiesFlags::HasTimeout;
         dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
@@ -183,6 +195,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                             0, native_acquire->value, native_acquire->operation);
                         LOG_WARNING(HW_GPU, "Native channel suspended for semaphore: channel={}, address={:#x}, current={}, required={}",
                                     dma_pusher.channel_state.bind_id, native_acquire->address, word, native_acquire->value);
+                        if (VideoCommon::IsWatchedNativeSemaphore(native_acquire->address)) {
+                            dma_pusher.DumpMethodTrace("semaphore wait");
+                        }
                     }
                 }
                 break;
@@ -218,6 +233,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
+    TRACE_NATIVE_SEMAPHORE_RELEASE("host", &dma_pusher, sequence_address, payload);
     dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
 }
 

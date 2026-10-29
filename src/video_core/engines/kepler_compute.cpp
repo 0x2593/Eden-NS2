@@ -65,12 +65,27 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         VideoCommon::TraceNativeQuery(13, memory_manager.GetID(),
             native_parameters.size() > 1 ? native_parameters[1] : 0, entry, 0, native_parameters[0],
             static_cast<u32>(native_parameters.size()));
+        // Log every method a macro emits when its parameters name a watched semaphore page.
+        bool watched_macro = false;
+        for (size_t i = 0; i + 1 < native_parameters.size(); ++i) {
+            watched_macro |= VideoCommon::IsWatchedNativeSemaphore(
+                (GPUVAddr{native_parameters[i + 1] & 0xff} << 32) | native_parameters[i]);
+        }
+        if (watched_macro) {
+            LOG_WARNING(HW_GPU, "Native compute macro {:#x} (start {:#x}) with watched parameters {:08x}",
+                        entry, native_macro_positions[entry], fmt::join(native_parameters, ","));
+        }
         const auto result = native_interpreter.Execute(native_macro->native_code,
             native_macro_positions[entry], native_parameters,
             [&](u32 address) { return address < native_registers.size() ? native_registers[address] : 0U; },
             [&](u32 address, u32 value) {
                 static u32 diagnostic_writes{};
-                if (diagnostic_writes++ < 4096) LOG_DEBUG(HW_GPU, "Native compute MME emit method={:#x}, value={:#x}", address, value);
+                static const bool trace = std::getenv("EDEN_NATIVE_METHOD_TRACE") != nullptr;
+                if (watched_macro) LOG_WARNING(HW_GPU, "  emit method={:#x}, value={:#x}", address, value);
+                if (diagnostic_writes++ < 4096) {
+                    if (trace) LOG_WARNING(HW_GPU, "Native compute MME emit method={:#x}, value={:#x}", address, value);
+                    else LOG_DEBUG(HW_GPU, "Native compute MME emit method={:#x}, value={:#x}", address, value);
+                }
                 if (address >= 0xe00) return false;
                 CallMethod(system, address, value, true);
                 return true;
@@ -84,6 +99,23 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 fmt::join(native_parameters, ","));
         }
         native_parameters.clear();
+        return true;
+    }
+    if (method >= KEPLER_COMPUTE_REG_INDEX(upload) && method <= KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+        // Inline-to-memory upload (line length/count, destination, LAUNCH_DMA, LOAD_INLINE_DATA).
+        // Native compute macros signal other queues' semaphores through it.
+        regs.reg_array[method] = argument;
+        if (method == KEPLER_COMPUTE_REG_INDEX(exec_upload)) {
+            static u32 upload_logs{};
+            if (std::getenv("EDEN_NATIVE_METHOD_TRACE") && upload_logs++ < 200) {
+                LOG_WARNING(HW_GPU, "Native compute upload: dest={:#x}, line length={:#x}, lines={}, launch={:#x}",
+                            regs.upload.dest.Address(), regs.upload.line_length_in, regs.upload.line_count, argument);
+            }
+            upload_state.ProcessExec(regs.exec_upload.linear != 0);
+        } else if (method == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+            TRACE_NATIVE_SEMAPHORE_RELEASE("compute upload", this, regs.upload.dest.Address(), argument);
+            upload_state.ProcessData(argument, is_last_call);
+        }
         return true;
     }
     native_registers[method] = argument;
@@ -170,6 +202,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             },
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+                TRACE_NATIVE_SEMAPHORE_RELEASE("QMD", this, address, payload);
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload] {
                         const u32 value = memory_manager.Read<u32>(address) + payload;

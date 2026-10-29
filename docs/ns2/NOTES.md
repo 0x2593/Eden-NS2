@@ -145,3 +145,31 @@ Config note: multi-core CPU mode was used for most of the above.
     offsets: the memory pool holding that effect's shader code has GPU address 0. The game then
     uses the uninitialised program and dereferences NULL.
   - Next step: find which memory pool that is and why it never gets a GPU mapping.
+
+## Third round (2026-10-29): first load and first gameplay frame
+
+21. First-load crash: IGpuWorker refused maps after 1024 mappings per worker (`0xce01`,
+    OutOfResource) and did so silently. NVN's `nvnMemoryPoolInitialize` (sdk 0x82e10ea0) then failed
+    inside its map step (0x82e21140); the game ignores the result, so an effect's BNSH shader-code
+    pool kept GPU address 0 and `nvnProgramSetShadersExt` got raw offsets. Limits raised to 65536 and
+    every rejected worker request is now logged with its words. Traced with NVN's proc-address table
+    (GOT 0x82479828 = Initialize, 0x82479858 = GetBufferAddress) and breakpoints on the failure path.
+22. Shader lowering added for what the load and first frame use: FMNMX UR form (0xc09); RET when the
+    callee returns through the untouched link register (or the high half is cleared one instruction
+    early); IADD3 carry-out and IADD3.X carry-in, including uniform forms with UPn emulated in R239;
+    IMAD.WIDE.U32 (and uniform 0x2a5); IABS (I2I); 8/16-bit STG/LDG; F2I to S8/U8; AST of RZ / ALD to
+    RZ; TEX 2D-array explicit LOD as Maxwell TEX ARRAY_2D.LL; texture descriptors in any constant
+    buffer; TLD4 partial masks; any PLOP3 truth table (LOP3 over widened predicates; sources 0xf0 =
+    bits 87-90, 0xcc = 77-80, 0xaa = 68-71); BREAK out of a BSSY scope (that scope becomes PBK/BRK);
+    uniform registers UR0-UR22 (R216-R238).
+23. Storage buffers: up to 32 per stage (the main compute shader binds 18; 16 overflowed and the host
+    crashed); unsized bindings stop at the end of their native mapping.
+24. Deadlock on the first gameplay frame: graphics (channel 1) and compute (channel 2) hand off through
+    semaphores at 0x216aba3000/+4. Channel 2's compute macro 0x44 signals +4 by patching a QMD with
+    the inline-to-memory engine (methods 0x60-0x6d) and scheduling it (0xad/0xb0 actions 3 and 7).
+    The native compute engine dropped those uploads and the QMD scheduler ignored the release slot at
+    word 52. Both are fixed; the game now reaches gameplay (HUD visible, 3D world not drawn, ~5 FPS).
+    Found with `EDEN_NATIVE_SEM_WATCH`, `EDEN_NATIVE_STALL_WATCH` and `EDEN_NATIVE_METHOD_TRACE`.
+25. Still open: geometry shaders are rejected by the native path (draws skipped); intermittent guest
+    memory corruption crash right after Normal Mode is chosen, only seen when A is pressed again during
+    the transition (unattended runs use `EDEN_AUTO_PRESS_A=58,4,70`).

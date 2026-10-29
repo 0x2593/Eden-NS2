@@ -8,6 +8,10 @@
 #include <unordered_map>
 
 namespace Tegra {
+// First word of each release slot: {address low, address high | flags, payload}. The SDK's
+// cross-queue signals also patch a third slot at word 52.
+inline constexpr std::array<std::uint32_t, 3> NativeQmdReleaseSlots{24, 28, 52};
+
 
 // Native QMD 3.0 dependency scheduling; nonempty grids require a dispatch backend.
 class NativeQmdScheduler {
@@ -61,9 +65,9 @@ public:
             if (!read(request.address, state.descriptor)) return "unmapped QMD";
             const auto qmd = state.descriptor;
             if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
-            // Validate both release slots before making either visible.
-            for (Word slot = 0; slot < 2; ++slot) {
-                const Word flags = qmd[25 + slot * 4];
+            // Validate every release slot before making any visible.
+            for (const Word slot : NativeQmdReleaseSlots) {
+                const Word flags = qmd[slot + 1];
                 if (!(flags & (1U << 23))) continue;
                 const bool add = (flags & (1U << 26)) != 0;
                 if ((flags & (0x3bU << 24)) || (flags >> 30) != 1 ||
@@ -81,15 +85,15 @@ public:
                 // still run so that queues waiting on them make progress.
             }
             state.completed = true;
-            for (Word slot = 0; slot < 2; ++slot) {
-                const Word flags = qmd[25 + slot * 4];
+            for (const Word slot : NativeQmdReleaseSlots) {
+                const Word flags = qmd[slot + 1];
                 if (!(flags & (1U << 23))) continue;
-                const Address destination = (Address{flags & 0xff} << 32) | qmd[24 + slot * 4];
+                const Address destination = (Address{flags & 0xff} << 32) | qmd[slot];
                 bool released{};
                 if constexpr (std::is_invocable_r_v<bool, Release, Address, Word, Word>) {
-                    released = release(destination, qmd[26 + slot * 4], flags);
+                    released = release(destination, qmd[slot + 2], flags);
                 } else {
-                    released = release(destination, qmd[26 + slot * 4]);
+                    released = release(destination, qmd[slot + 2]);
                 }
                 if (!released) return "unmapped QMD release";
             }
@@ -114,4 +118,5 @@ private:
     };
     std::unordered_map<Address, State> states;
 };
+
 } // namespace Tegra

@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <vector>
 #include "common/common_types.h"
 
 namespace VideoCommon {
@@ -40,4 +42,32 @@ inline void TraceNativeQuery(u32 event, u64 asid, u64 gpu, u64 cpu, u32 type, u6
     // Inline writes are bulk traffic; everything else is flushed so a hang keeps its tail.
     if (event != 11 && event != 12) state.file.flush();
 }
+
+// EDEN_NATIVE_SEM_WATCH=<hex GPU address>: log every release aimed at that 4 KiB page, with the
+// issuing engine instance (one per channel) so cross-channel waits can be matched to writers.
+inline bool IsWatchedNativeSemaphore(u64 gpu) {
+    // Comma-separated list of pages.
+    static const std::vector<u64> pages = [] {
+        std::vector<u64> result;
+        for (const char* cursor = std::getenv("EDEN_NATIVE_SEM_WATCH"); cursor && *cursor;) {
+            char* end{};
+            result.push_back(std::strtoull(cursor, &end, 16) & ~u64{0xfff});
+            cursor = *end == ',' ? end + 1 : nullptr;
+        }
+        return result;
+    }();
+    return std::find(pages.begin(), pages.end(), gpu & ~u64{0xfff}) != pages.end();
+}
+} // namespace VideoCommon
+
+#define TRACE_NATIVE_SEMAPHORE_RELEASE(source, engine, gpu, value)                                  \
+    do {                                                                                           \
+        if (VideoCommon::IsWatchedNativeSemaphore(gpu)) {                                          \
+            LOG_WARNING(HW_GPU, "Native semaphore watch: {} release by engine {}, address={:#x}, value={:#x}", \
+                        source, static_cast<const void*>(engine), static_cast<u64>(gpu),        \
+                        static_cast<u64>(value));                                                  \
+        }                                                                                          \
+    } while (false)
+
+namespace VideoCommon {
 } // namespace VideoCommon

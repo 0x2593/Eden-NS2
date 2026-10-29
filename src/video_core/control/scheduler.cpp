@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "common/assert.h"
+#include "common/logging.h"
+#include "video_core/memory_manager.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
@@ -48,6 +50,17 @@ void Scheduler::ResumePending(GPU& gpu) {
         });
     std::erase_if(pending_native_channels,
         [](const auto& state) { return !state->payload->dma_pusher.HasPendingNativeAcquire(); });
+}
+
+void Scheduler::ReportPending() const {
+    for (const auto& state : pending_native_channels) {
+        auto& pusher = state->payload->dma_pusher;
+        if (const auto& wait = pusher.PendingNativeAcquire()) {
+            LOG_WARNING(HW_GPU, "Native stall: channel {} waits op {} on {:#x} for {:#x}, current {:#x}",
+                        state->bind_id, wait->operation, wait->address, wait->value,
+                        pusher.GetMemoryManager().Read<u32>(wait->address));
+        }
+    }
 }
 
 void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {

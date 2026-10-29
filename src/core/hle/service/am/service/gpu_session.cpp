@@ -100,6 +100,9 @@ public:
         return system.IsPoweredOn() ? ctx.WriteToOutgoingCommandBuffer() : ResultSuccess;
     }
 private:
+    // Bounds per worker. Level loads keep well over a thousand pools mapped at once (the first
+    // Donkey Kong Bananza load passes 1024), and NVN reports a refused map as a failed pool init.
+    static constexpr size_t MaxObjects = 0x10000;
     struct Mapping { u32 as_id; u64 address; u64 size; u32 memory_id; };
     std::vector<Mapping> m_mappings;
     static u64 ReadPair(const u32* packet, size_t index) {
@@ -126,7 +129,7 @@ private:
         R_UNLESS(kind, Kernel::ResultNotImplemented);
         const u64 begin = ReadPair(packet, 3), end = ReadPair(packet, 5);
         R_UNLESS(end >= begin && end != ~u64{0}, Kernel::ResultInvalidSize);
-        R_UNLESS(m_mappings.size() < 1024, Kernel::ResultOutOfResource);
+        R_UNLESS(m_mappings.size() < MaxObjects, Kernel::ResultOutOfResource);
         const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(packet[2]);
         R_UNLESS(as, Kernel::ResultNotFound);
         const auto result = as->MapNative4K(packet[7], begin, ReadPair(packet, 8),
@@ -152,6 +155,10 @@ private:
             LOG_DEBUG(Service_AM, "GPU map4K as={}, memory={}, VA={:#x}..{:#x}, permission={}, cache={}, kinds={:#x}/{:#x}, mode={}, sync={}, notification={}, selected={:#x}, result={:#x}",
                       packet[2], packet[7], ReadPair(packet, 3), ReadPair(packet, 5), packet[10],
                       packet[11], packet[12], packet[13], packet[14], packet[16], packet[17], selected_kind, result.raw);
+        }
+        if (result.IsError()) {
+            LOG_WARNING(Service_AM, "GPU map4K rejected: result={:#x}, words={:08x}", result.raw,
+                        fmt::join(std::span{ctx.CommandBuffer(), 18}, ","));
         }
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(result.raw);
@@ -212,7 +219,8 @@ private:
         const u64 size = end - begin + 1;
         R_UNLESS(Common::IsAligned(begin, Kernel::PageSize) && Common::IsAligned(size, Kernel::PageSize),
                  Kernel::ResultInvalidSize);
-        R_UNLESS(m_memory.size() < 1024 && m_mappings.size() < 1024, Kernel::ResultOutOfResource);
+        R_UNLESS(m_memory.size() < MaxObjects && m_mappings.size() < MaxObjects,
+                 Kernel::ResultOutOfResource);
         const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(as_id);
         R_UNLESS(as, Kernel::ResultNotFound);
         auto& page_table = m_process->GetPageTable();
@@ -268,6 +276,9 @@ private:
                 LOG_WARNING(Service_AM, "GPU command 214 range left unbacked: {:#x}", backed.raw);
             }
             m_devices->events[packet[11]]->Signal(kernel);
+        }
+        if (result.IsError()) {
+            LOG_WARNING(Service_AM, "GPU command 214 rejected: words={:08x}", fmt::join(std::span{packet, 12}, ","));
         }
         LOG_DEBUG(Service_AM, "GPU command 214 as={}, VA={:#x}..{:#x}, words={:08x}, result={:#x}",
                   packet[2], ReadPair(packet, 3), ReadPair(packet, 5),
@@ -348,7 +359,7 @@ private:
         const u64 size = end - begin + 1;
         R_UNLESS(Common::IsAligned(begin, Kernel::PageSize), Kernel::ResultInvalidAddress);
         R_UNLESS(Common::IsAligned(size, Kernel::PageSize), Kernel::ResultInvalidSize);
-        R_UNLESS(m_memory.size() < 1024, Kernel::ResultOutOfResource);
+        R_UNLESS(m_memory.size() < MaxObjects, Kernel::ResultOutOfResource);
         auto& page_table = m_process->GetPageTable();
         R_UNLESS(page_table.Contains(begin, size), Kernel::ResultInvalidCurrentMemory);
         for (u64 address = begin; address <= end;) {
@@ -429,6 +440,10 @@ private:
             result = RegisterMemory(request->begin, request->end, request->flags, request->device, id);
             LOG_DEBUG(Service_AM, "GPU memory {:#x}..{:#x}, device={}, raw_device={:#x}, flags={}, id={}, result={:#x}",
                       request->begin, request->end, request->device, packet[7], request->flags, id, result.raw);
+        }
+        if (result.IsError()) {
+            LOG_WARNING(Service_AM, "GPU memory registration rejected: result={:#x}, words={:08x}", result.raw,
+                        fmt::join(std::span{packet, 8}, ","));
         }
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(result.raw);

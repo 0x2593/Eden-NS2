@@ -184,7 +184,39 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
     rasterizer = rasterizer_;
 }
 
+void MemoryManager::TrackNativeMapping(GPUVAddr gpu_addr, std::size_t size, bool mapped) {
+    // Recorded before native tiling is known to be enabled; only native titles query it.
+    if (size == 0) return;
+    const GPUVAddr end = gpu_addr + size;
+    std::scoped_lock lock{native_mapping_guard};
+    auto it = native_mappings.lower_bound(gpu_addr);
+    if (it != native_mappings.begin()) {
+        auto previous = std::prev(it);
+        if (previous->second > gpu_addr) {
+            // Keep the part of an overlapped mapping before and after the new range.
+            const GPUVAddr previous_end = previous->second;
+            previous->second = gpu_addr;
+            if (previous_end > end) native_mappings.emplace(end, previous_end);
+        }
+    }
+    for (it = native_mappings.lower_bound(gpu_addr); it != native_mappings.end() && it->first < end;) {
+        if (it->second > end) native_mappings.emplace(end, it->second);
+        it = native_mappings.erase(it);
+    }
+    if (mapped) native_mappings.emplace(gpu_addr, end);
+}
+
+std::optional<size_t> MemoryManager::GetNativeMappingSizeFrom(GPUVAddr gpu_addr) const {
+    std::scoped_lock lock{native_mapping_guard};
+    auto it = native_mappings.upper_bound(gpu_addr);
+    if (it == native_mappings.begin()) return std::nullopt;
+    --it;
+    if (gpu_addr >= it->second) return std::nullopt;
+    return static_cast<size_t>(it->second - gpu_addr);
+}
+
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
+    TrackNativeMapping(gpu_addr, size, true);
     if (is_big_pages)
         return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
     return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
@@ -200,6 +232,7 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
     if (size == 0) {
         return;
     }
+    TrackNativeMapping(gpu_addr, size, false);
     GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
 
     for (const auto& [map_addr, map_size] : page_stash) {

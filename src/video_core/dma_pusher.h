@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <string_view>
 #include <condition_variable>
 #include <span>
 #include <vector>
@@ -132,6 +133,10 @@ public:
 
     void DispatchCalls();
     [[nodiscard]] bool HasPendingNativeAcquire() const { return puller.HasPendingNativeAcquire(); }
+    [[nodiscard]] const auto& PendingNativeAcquire() const { return puller.PendingNativeAcquire(); }
+    [[nodiscard]] MemoryManager& GetMemoryManager() const { return memory_manager; }
+    /// EDEN_NATIVE_METHOD_TRACE: logs the most recent pushbuffer methods of this channel.
+    void DumpMethodTrace(std::string_view reason) const;
     [[nodiscard]] bool CanResumeNativeAcquire() { return !HasFailedNativeWork() && puller.CanResumeNativeAcquire(*this); }
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
@@ -145,6 +150,9 @@ private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool HasFailedNativeWork() const;
+    void TraceMethod(u32 method, u32 argument);
+    std::array<std::array<u32, 2>, 384> method_trace{};
+    size_t method_trace_count{};
     bool Step();
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
     size_t command_resume_offset{};

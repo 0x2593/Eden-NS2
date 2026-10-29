@@ -5,13 +5,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/memory.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
@@ -38,16 +41,40 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 
         auto current_context = context.Acquire();
         CommandDataContainer next;
+        // EDEN_NATIVE_STALL_WATCH=<hex guest address,...>: after 8 s without new GPU commands, log
+        // parked native channels and the listed u32 words (native GPU VAs equal guest addresses).
+        std::vector<u64> stall_watch;
+        for (const char* cursor = std::getenv("EDEN_NATIVE_STALL_WATCH"); cursor && *cursor;) {
+            char* end{};
+            stall_watch.push_back(std::strtoull(cursor, &end, 16));
+            cursor = *end == ',' ? end + 1 : nullptr;
+        }
+        auto last_command = std::chrono::steady_clock::now();
+        const auto report_stall = [&] {
+            if (stall_watch.empty() || std::chrono::steady_clock::now() - last_command < std::chrono::seconds{8}) return;
+            last_command = std::chrono::steady_clock::now();
+            scheduler.ReportPending();
+            for (const u64 address : stall_watch) {
+                LOG_WARNING(HW_GPU, "Native stall: [{:#x}] = {:#x}", address,
+                            system.ApplicationMemory().Read32(address));
+            }
+        };
         while (!stop_token.stop_requested()) {
             if (scheduler.HasPendingNativeChannels()) {
                 scheduler.ResumePending(system.GPU());
                 if (!state.queue.TryPop(next)) {
+                    report_stall();
                     std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     continue;
                 }
-            } else {
+            } else if (stall_watch.empty()) {
                 state.queue.PopWait(next, stop_token);
+            } else if (!state.queue.TryPop(next)) {
+                report_stall();
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                continue;
             }
+            last_command = std::chrono::steady_clock::now();
             if (stop_token.stop_requested()) {
                 break;
             }

@@ -76,6 +76,7 @@ public:
     };
 
     [[nodiscard]] bool HasPendingNativeAcquire() const { return native_acquire.has_value(); }
+    [[nodiscard]] const std::optional<NativeSemaphoreWait>& PendingNativeAcquire() const { return native_acquire; }
     [[nodiscard]] bool CanResumeNativeAcquire(DmaPusher& dma_pusher) const;
     bool ResumeNativeAcquire(DmaPusher& dma_pusher);
 

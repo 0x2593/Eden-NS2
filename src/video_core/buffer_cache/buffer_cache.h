@@ -1527,6 +1527,11 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    // Diagnostic: keep GPU writes on the host side only, so nothing is downloaded over guest memory.
+    static const bool no_writeback = std::getenv("EDEN_NATIVE_NO_SSBO_WRITEBACK") != nullptr;
+    if (no_writeback && gpu_memory && gpu_memory->UsesNativeTiling()) {
+        return;
+    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -2046,8 +2051,15 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
 
     const auto size = [&]() {
-        const u32 memory_layout_size =
-            static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+        u32 memory_layout_size = static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+        if (gpu_memory->UsesNativeTiling()) {
+            // Without a size in the constant buffer, stay inside the pool the pointer is in:
+            // a written binding that spans neighbouring pools and heap memory is downloaded
+            // over live CPU data.
+            if (const auto mapping = gpu_memory->GetNativeMappingSizeFrom(gpu_addr)) {
+                memory_layout_size = static_cast<u32>((std::min<u64>)(memory_layout_size, *mapping));
+            }
+        }
         const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
         const u32 packed_size = static_cast<u32>(next_qword);
         const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
