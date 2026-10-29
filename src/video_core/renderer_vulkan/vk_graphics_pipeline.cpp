@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <span>
+#include <tuple>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -419,6 +421,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
                 views.push_back({handle.first});
+                static const bool handle_trace = std::getenv("EDEN_NATIVE_HANDLE_TRACE") != nullptr;
+                if (handle_trace) {
+                    static std::set<std::tuple<size_t, u32, u32, u32>> seen;
+                    const GPUVAddr tic_address = regs.tex_header.Address() + u64{handle.first} * sizeof(Tegra::Texture::TICEntry);
+                    Tegra::Texture::TICEntry entry{};
+                    gpu_memory->ReadBlockUnsafe(tic_address, &entry, sizeof(entry));
+                    if (seen.size() < 600 && seen.emplace(stage, desc.cbuf_index, desc.cbuf_offset, handle.first).second) {
+                        std::array<u32, 8> tsc{};
+                        gpu_memory->ReadBlockUnsafe(regs.tex_sampler.Address() + u64{handle.second} * 32, tsc.data(), sizeof(tsc));
+                        const auto& program = regs.pipelines[stage + 1]; // slot 0 is VertexA
+                        LOG_INFO(Render_Vulkan, "Native texture handle: stage={}, program={:#x}, cbuf={}:{:#x}, tic={}, tsc={}, texture={:#x} {}x{}, tsc_raw={:08x}",
+                                 stage, (u64{program.reserved[0] & 0xff} << 32) | program.reserved[1],
+                                 desc.cbuf_index, desc.cbuf_offset, handle.first, handle.second,
+                                 entry.Address(), entry.Width(), entry.Height(), fmt::join(tsc, ","));
+                    }
+                }
 
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
                 samplers.push_back(sampler);

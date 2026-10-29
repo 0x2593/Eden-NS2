@@ -4,12 +4,14 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
 #include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/service.h"

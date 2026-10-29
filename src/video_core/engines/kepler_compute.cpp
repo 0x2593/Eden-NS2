@@ -62,7 +62,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         if (!is_last_call) return true;
         const u32 entry = ((*native_executing_macro - 0xe00) / 2) % native_macro_positions.size();
         native_executing_macro.reset();
-        const auto result = native_macro->native_interpreter.Execute(native_macro->native_code,
+        VideoCommon::TraceNativeQuery(13, memory_manager.GetID(),
+            native_parameters.size() > 1 ? native_parameters[1] : 0, entry, 0, native_parameters[0],
+            static_cast<u32>(native_parameters.size()));
+        const auto result = native_interpreter.Execute(native_macro->native_code,
             native_macro_positions[entry], native_parameters,
             [&](u32 address) { return address < native_registers.size() ? native_registers[address] : 0U; },
             [&](u32 address, u32 value) {
@@ -93,9 +96,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         const GPUVAddr program = (GPUVAddr{native_registers[0xc8 + 49] & 0x1ffff} << 32) |
             native_registers[0xc8 + 48];
         const u32 control = native_registers[0xa7];
-        LOG_WARNING(HW_GPU, "Native inline QMD: address={:#x}, program={:#x}, control={:#x}, grid={}/{}/{}",
-            address, program, control, native_registers[0xc8 + 12],
-            native_registers[0xc8 + 13] & 0xffff, native_registers[0xc8 + 14] & 0xffff);
+        static u32 inline_qmd_logs{};
+        if (inline_qmd_logs++ < 32) {
+            LOG_WARNING(HW_GPU, "Native inline QMD: address={:#x}, program={:#x}, control={:#x}, grid={}/{}/{}",
+                address, program, control, native_registers[0xc8 + 12],
+                native_registers[0xc8 + 13] & 0xffff, native_registers[0xc8 + 14] & 0xffff);
+        }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
             std::ofstream dump("native-inline-qmd.bin", std::ios::binary);
             dump.write(reinterpret_cast<const char*>(native_registers.data() + 0xc8), 256);
@@ -299,9 +305,12 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    const GPUVAddr program = regs.code_loc.Address();
+    if (failed_native_programs.contains(program)) return false;
     try {
         rasterizer->DispatchCompute();
     } catch (const Shader::Exception& error) {
+        failed_native_programs.insert(program);
         LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
         return false;
     }

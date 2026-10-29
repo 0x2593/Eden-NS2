@@ -215,12 +215,26 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
 
     // Call the macro when there are no more parameters in the command buffer
     if (is_last_call) {
+        if (GetNativeMacroEngine().native_turing) {
+            native_macro_pending = true;
+            return;
+        }
         ConsumeSink(system);
         CallMacroMethod(system, executing_macro, macro_params);
         macro_params.clear();
         macro_segments.clear();
         current_macro_dirty = false;
     }
+}
+
+void Maxwell3D::FlushPendingNativeMacro(Core::System& system) {
+    if (!native_macro_pending) return;
+    native_macro_pending = false;
+    ConsumeSink(system);
+    CallMacroMethod(system, executing_macro, macro_params);
+    macro_params.clear();
+    macro_segments.clear();
+    current_macro_dirty = false;
 }
 
 void Maxwell3D::RefreshParametersImpl() {
@@ -310,7 +324,13 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
-        LOG_INFO(HW_GPU, "Native GPU surface clear: value={:#x}", argument);
+        static u32 clear_logs{};
+        if (clear_logs++ < 64 || clear_logs % 512 == 0) {
+            LOG_INFO(HW_GPU, "Native GPU surface clear: value={:#x}, color={}/{}/{}/{}, rt0={:#x} format={} {}x{}",
+                     argument, regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                     regs.clear_color[3], regs.rt[0].Address(), static_cast<u32>(regs.rt[0].format),
+                     regs.rt[0].width, regs.rt[0].height);
+        }
     }
     switch (method) {
     case MAXWELL3D_REG_INDEX(wait_for_idle):

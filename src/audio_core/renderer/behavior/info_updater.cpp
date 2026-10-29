@@ -583,12 +583,16 @@ Result InfoUpdater::UpdatePerformanceBuffer(std::span<u8> performance_output,
 
 Result InfoUpdater::UpdateBehaviorInfo(BehaviorInfo& behaviour_) {
     const auto in_params{reinterpret_cast<const BehaviorInfo::InParameter*>(input)};
+    LOG_DEBUG(Service_Audio, "revision={:#x}, user_revision={:#x}, behaviour_size={:#x}",
+              in_params->revision, behaviour_.GetUserRevision(), in_header->behaviour_size);
 
     if (!CheckValidRevision(in_params->revision)) {
         return Service::Audio::ResultInvalidUpdateInfo;
     }
 
-    if (in_params->revision != behaviour_.GetUserRevision()) {
+    // Newer SDKs set bit 21 of the magic ("Rev" instead of "REV") in per-update parameters, so
+    // only the revision number itself has to match the one the renderer was opened with.
+    if (GetRevisionNum(in_params->revision) != GetRevisionNum(behaviour_.GetUserRevision())) {
         return Service::Audio::ResultInvalidUpdateInfo;
     }
 

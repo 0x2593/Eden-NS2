@@ -803,7 +803,9 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
     if (it == page_table.end()) {
         return {};
     }
-    const auto view_format = [&]() {
+    // Debug: EDEN_NATIVE_DISPLAY_OVERRIDE shows an arbitrary render target, in its own format.
+    static const bool any_format = std::getenv("EDEN_NATIVE_DISPLAY_OVERRIDE") != nullptr;
+    auto view_format = [&]() {
         switch (config.pixel_format) {
         case Service::android::PixelFormat::Rgb565:
             return PixelFormat::R5G6B5_UNORM;
@@ -824,6 +826,9 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         }
         if (image.image_view_ids.empty()) {
             continue;
+        }
+        if (any_format && valid_image_ids.empty()) {
+            view_format = image.info.format;
         }
         if (!VideoCore::Surface::IsViewCompatible(image.info.format, view_format, false, true)) {
             static u32 rejected_alias_count{};
@@ -1215,6 +1220,17 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const TICEntry config = TextureViewHeader(raw_config, native);
     const ImageInfo info(config);
+    static const bool tic_trace = std::getenv("EDEN_NATIVE_TIC_TRACE") != nullptr;
+    static u32 tic_traces{};
+    if (native && tic_trace && tic_traces++ < 20000) {
+        LOG_INFO(HW_GPU, "Native TIC: address={:#x}, {}x{}x{}, type={}, format={}, swizzle={}{}{}{}, header={}, levels={}, raw={:016x}/{:016x}/{:016x}/{:016x}",
+                 config.Address(), config.Width(), config.Height(), config.Depth(),
+                 static_cast<u32>(config.texture_type.Value()), info.format,
+                 static_cast<u32>(config.x_source.Value()), static_cast<u32>(config.y_source.Value()),
+                 static_cast<u32>(config.z_source.Value()), static_cast<u32>(config.w_source.Value()),
+                 static_cast<u32>(config.header_version.Value()), config.max_mip_level.Value(),
+                 config.raw[0], config.raw[1], config.raw[2], config.raw[3]);
+    }
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
@@ -1223,6 +1239,11 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
     const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
     if (!image_id) {
+        if (native && tic_trace) {
+            LOG_WARNING(HW_GPU, "Native TIC has no image: address={:#x}, mapped={}, format={}, type={}",
+                        image_gpu_addr, gpu_memory->GpuToCpuAddress(image_gpu_addr).has_value(),
+                        info.format, static_cast<u32>(info.type));
+        }
         return NULL_IMAGE_VIEW_ID;
     }
     ImageBase& image = slot_images[image_id];
@@ -2550,6 +2571,12 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             TrackImage(image, image_id);
         }
     } else {
+        // Debug: re-upload pitch-linear images from guest memory on every use.
+        static const bool force_linear = std::getenv("EDEN_NATIVE_FORCE_LINEAR_UPLOAD") != nullptr;
+        if (force_linear && image.info.type == ImageType::Linear &&
+            False(image.flags & ImageFlagBits::GpuModified)) {
+            image.flags |= ImageFlagBits::CpuModified;
+        }
         RefreshContents(image, image_id);
         if (!image.aliased_images.empty()) {
             SynchronizeAliases(image_id);

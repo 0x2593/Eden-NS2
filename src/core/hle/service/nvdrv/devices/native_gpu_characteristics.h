@@ -43,11 +43,17 @@ inline std::array<u8, NativeGpuCharacteristicsSize> MakeNativeGpuCharacteristics
     // Native SDK class enumeration filters 2D/3D/compute/inline families
     // with bits 40..43 before selecting context identities from its profile.
     // The native SDK gates ModifyKind (AS ioctl 12) on capability bit 34.
-    flags = static_cast<u64>(flags) | (1ULL << 8) | (1ULL << 26) | (1ULL << 34) | (0xfULL << 40);
+    // Bit 22 advertises TSG subcontexts; without it NvRm allows one subcontext per TSG,
+    // and titles that create several subcontext queues fail nvnQueueInitialize.
+    flags = static_cast<u64>(flags) | (1ULL << 8) | (1ULL << 22) | (1ULL << 26) | (1ULL << 34) |
+            (0xfULL << 40);
     std::memcpy(result.data() + 0x50, &flags, sizeof(flags));
+    // Subcontexts (VEIDs) per TSG, read by NvRm when bit 22 is set. Ampere exposes 64.
+    const u32_le max_veid_count_per_tsg{64};
+    std::memcpy(result.data() + 0xb4, &max_veid_count_per_tsg, sizeof(max_veid_count_per_tsg));
     constexpr std::array<s16, 9> levels{
         0x1c, // GPU control: GetGpuTime
-        2,    // TSG: bind/unbind channel
+        0xb,  // TSG: bind/unbind channel, scheduling controls, bind with subcontext
         -1,   // GPU debugger device is unavailable
         0x1d, // Channel: SetTimeslice
         0x14, // Address space: Remap

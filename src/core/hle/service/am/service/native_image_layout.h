@@ -19,8 +19,9 @@ struct NativeImageRequirements {
 inline std::optional<NativeImageRequirements> CalculateNativeImageRequirements(
     std::span<const u32> preference, u32 count) {
     if (preference.size() != 16 || count != 1 || preference[0] != 0 ||
-        (preference[1] != 1 && preference[1] != 2) || preference[3] != 0 || preference[6] != 1 ||
-        preference[7] != 1 || preference[4] < 3 || preference[4] > 8) {
+        (preference[1] != 1 && preference[1] != 2) || preference[3] != 0 || preference[6] == 0 ||
+        preference[6] > 64 || preference[7] == 0 || preference[7] > 64 || preference[4] < 3 ||
+        preference[4] > 8) {
         return std::nullopt;
     }
     for (size_t i = 8; i < preference.size(); ++i) {
@@ -34,7 +35,9 @@ inline std::optional<NativeImageRequirements> CalculateNativeImageRequirements(
     }
     const u64 block_height = 1ULL << preference[4];
     const u64 aligned_height = (height + block_height - 1) & ~(block_height - 1);
-    return NativeImageRequirements{pitch_gobs * 64 * aligned_height, 64 * block_height};
+    // Words 6 and 7 are unconfirmed (layers or mip levels); scaling by both never under-allocates.
+    const u64 surfaces = u64{preference[6]} * preference[7];
+    return NativeImageRequirements{pitch_gobs * 64 * aligned_height * surfaces, 64 * block_height};
 }
 
 } // namespace Service::AM

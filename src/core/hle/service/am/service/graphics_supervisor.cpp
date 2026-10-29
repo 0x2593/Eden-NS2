@@ -6,6 +6,7 @@
 #include <bit>
 #include <array>
 #include "common/alignment.h"
+#include "common/settings.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -101,7 +102,8 @@ public:
                   fmt::join(std::span<const u32>(ctx.CommandBuffer() + 2, std::min<u32>(ctx.CommandBuffer()[1], 32)), ","));
         InvokeRequestTipc(ctx);
         IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(Kernel::ResultNotImplemented.raw);
+        rb.Push(Settings::values.use_auto_stub ? ResultSuccess.raw
+                                               : Kernel::ResultNotImplemented.raw);
         return system.IsPoweredOn() ? ctx.WriteToOutgoingCommandBuffer() : ResultSuccess;
     }
 
@@ -173,6 +175,7 @@ public:
             {11, &IVi2Session::GetNotificationEvent, "GetNotificationEvent"},
             {13, &IVi2Session::ReleaseNotificationEvent, "ReleaseNotificationEvent"},
             {21, &IVi2Session::GetNotifications, "GetNotifications"},
+            {31, &IVi2Session::GetUnknown31Event, "Unknown31"},
             {3, &IVi2Session::GetSessionLimit, "GetSessionLimit"},
             {5, &IVi2Session::GetSessionLimit, "GetRequestGroupLimit"},
             {51, &IVi2Session::ConfigureRequestGroups, "ConfigureRequestGroups"},
@@ -201,6 +204,7 @@ public:
         }
         if (m_default_display) { m_display_service->CloseDisplay(*m_default_display); }
         m_context.CloseEvent(m_event);
+        if (m_unknown31_event) m_context.CloseEvent(m_unknown31_event);
     }
 
     Result HandleSyncRequest(Kernel::KServerSession& session, HLERequestContext& ctx) override {
@@ -212,7 +216,8 @@ public:
                   fmt::join(std::span<const u32>(ctx.CommandBuffer() + 2, std::min<u32>(ctx.CommandBuffer()[1], 32)), ","));
         InvokeRequestTipc(ctx);
         IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(Kernel::ResultNotImplemented.raw);
+        rb.Push(Settings::values.use_auto_stub ? ResultSuccess.raw
+                                               : Kernel::ResultNotImplemented.raw);
         return system.IsPoweredOn() ? ctx.WriteToOutgoingCommandBuffer() : ResultSuccess;
     }
 private:
@@ -685,6 +690,23 @@ private:
         rb.Push(result.raw);
         ctx.AddMoveObject(readable);
     }
+    // Purpose unknown; the SDK expects an event handle in the same shape as command 11.
+    void GetUnknown31Event(HLERequestContext& ctx) {
+        const auto* packet = ctx.CommandBuffer();
+        LOG_DEBUG(Service_AM, "VI2 command 31, header={:#x}, size={}, arg={:#x}", packet[0],
+                  packet[1], packet[2]);
+        if (!m_unknown31_event) {
+            m_unknown31_event = m_context.CreateEvent("Vi2Unknown31");
+        }
+        Kernel::KReadableEvent* readable{};
+        if (m_unknown31_event) {
+            readable = &m_unknown31_event->GetReadableEvent();
+            readable->Open(kernel);
+        }
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(m_unknown31_event ? ResultSuccess.raw : Kernel::ResultOutOfResource.raw);
+        ctx.AddMoveObject(readable);
+    }
 
     std::shared_ptr<NativeImageRegistry> m_images;
     std::shared_ptr<Core::Timing::EventType> m_release_poll;
@@ -703,6 +725,7 @@ private:
     const u64 m_aruid;
     KernelHelpers::ServiceContext m_context;
     Kernel::KEvent* m_event{};
+    Kernel::KEvent* m_unknown31_event{};
 };
 
 } // namespace
@@ -1186,6 +1209,10 @@ void IGraphicsSupervisor::CalculateImageRequirements(HLERequestContext& ctx) {
         if (m_phase == Phase::Ready && m_image_formats_initialized) {
             requirements = CalculateNativeImageRequirements(std::span{packet + 2, 16}, packet[18]);
             result = requirements ? ResultSuccess : Kernel::ResultNotImplemented;
+            if (!requirements) {
+                LOG_DEBUG(Service_AM, "unsupported image preference={:08x}, count={}",
+                          fmt::join(std::span{packet + 2, 16}, ","), packet[18]);
+            }
         }
     }
     LOG_DEBUG(Service_AM, "native image requirements dimensions={:#x}, block={}, pitch={}, size={:#x}, alignment={:#x}, result={:#x}",

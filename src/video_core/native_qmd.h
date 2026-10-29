@@ -73,8 +73,13 @@ public:
                         return "unsupported QMD reduction callback";
                 }
             }
-            if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff) && !dispatch(qmd))
-                return "native shader dispatch required";
+            if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff) && !dispatch(qmd)) {
+                // Without a real dispatch backend, refuse the QMD entirely.
+                if constexpr (std::is_same_v<Dispatch, RejectShaderDispatch>)
+                    return "native shader dispatch required";
+                // A rejected shader skips only the work; its releases and dependent QMDs
+                // still run so that queues waiting on them make progress.
+            }
             state.completed = true;
             for (Word slot = 0; slot < 2; ++slot) {
                 const Word flags = qmd[25 + slot * 4];

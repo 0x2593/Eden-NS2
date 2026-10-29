@@ -157,11 +157,11 @@ else()
 
     if (ENABLE_WERROR)
         add_compile_options(
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=all>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=extra>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=missing-declarations>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=shadow>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=unused>)
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=all>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=extra>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=missing-declarations>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=shadow>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=unused>)
     else()
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>

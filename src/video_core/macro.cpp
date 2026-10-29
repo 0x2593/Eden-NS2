@@ -29,6 +29,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
+#include "video_core/memory_manager.h"
 
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -1351,10 +1352,27 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
         LOG_DEBUG(HW_GPU, "Native MME context={:#x}", context);
         LOG_DEBUG(HW_GPU, "Native MME start={:#x}, parameters={}, data={:08x}", method, parameters.size(), fmt::join(parameters, ","));
-        const auto result = native_interpreter.Execute(native_code, method, parameters,
+        std::vector<u32> fifo(parameters.begin(), parameters.end());
+        u64 dma_address{};
+        const auto result = native_interpreter.Execute(native_code, method, fifo,
             [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
             [&](u32 address, u32 value) {
                 if (address >= 0xe00) return false;
+                // SET_MME_MEM_ADDRESS_A/B and MME_DMA_READ_FIFOED feed memory into the
+                // parameter FIFO; the following load barrier waits for that data.
+                if (address == 0x154) {
+                    dma_address = (dma_address & 0xffffffffULL) | (u64{value & 0xff} << 32);
+                } else if (address == 0x155) {
+                    dma_address = (dma_address & ~0xffffffffULL) | value;
+                } else if (address == 0x158) {
+                    if (value > 0x10000 || !maxwell3d.GetMemoryManager().IsFullyMappedRange(dma_address, value * sizeof(u32))) {
+                        return false;
+                    }
+                    const size_t offset = fifo.size();
+                    fifo.resize(offset + value);
+                    maxwell3d.GetMemoryManager().ReadBlock(dma_address, fifo.data() + offset, value * sizeof(u32));
+                    return true;
+                }
                 maxwell3d.CallMethod(system, address, value, true);
                 return true;
             });

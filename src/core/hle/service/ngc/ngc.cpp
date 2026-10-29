@@ -211,7 +211,7 @@ public:
 
     Result GetRequiredMemorySize(Out<u32> out_size, u8 type, u8 mode, s32 guest_count) {
         LOG_INFO(Service_NGC, "GameShare work memory query type={}, mode={}, guests={}", type, mode, guest_count);
-        R_UNLESS(type <= 1 && mode == 1 && guest_count >= 0 && guest_count <= 3,
+        R_UNLESS(type <= 1 && mode <= 1 && guest_count >= 0 && guest_count <= 3,
                  IPC::ResultNotSupported);
         // The disconnected implementation reserves one page for its session
         // control state. Streaming/encoding work is not implemented.

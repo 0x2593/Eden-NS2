@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdlib>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -111,8 +112,9 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         if (dma_pusher.channel_state.native_abi) {
             const auto& context = dma_pusher.channel_state.native_macro_context;
             if (context && (context->engine.native_execution_failed || context->compute_engine.native_execution_failed)) {
-                LOG_ERROR(HW_GPU, "Native submission completion blocked by failed GPU work: syncpoint={}", regs.fence_action.syncpoint_id.Value());
-                break;
+                LOG_WARNING(HW_GPU, "Native submission completed with skipped GPU work: syncpoint={}", regs.fence_action.syncpoint_id.Value());
+                context->engine.native_execution_failed = false;
+                context->compute_engine.native_execution_failed = false;
             }
         }
         dma_pusher.rasterizer->SignalSyncPoint(regs.fence_action.syncpoint_id);
@@ -268,7 +270,9 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     }
     case BufferMethods::MemOpA: {
-        LOG_ERROR(HW_GPU, "Memory Operation A");
+        // Native titles issue these cache operations every frame; report them once.
+        static bool reported{};
+        if (!std::exchange(reported, true)) LOG_ERROR(HW_GPU, "Memory Operation A");
         break;
     }
     case BufferMethods::MemOpB: {
@@ -278,7 +282,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::MemOpC:
     case BufferMethods::MemOpD: {
-        LOG_ERROR(HW_GPU, "Memory Operation C,D");
+        static bool reported{};
+        if (!std::exchange(reported, true)) LOG_ERROR(HW_GPU, "Memory Operation C,D");
         break;
     }
     case BufferMethods::SemaphoreAcquire: {

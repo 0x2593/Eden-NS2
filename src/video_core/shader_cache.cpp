@@ -76,9 +76,19 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
         const ShaderInfo* shader_info{TryGet(*cpu_shader_addr)};
         if (!shader_info) {
+            if (native && failed_native_shaders.contains(*cpu_shader_addr)) {
+                last_shaders_valid = false;
+                return false;
+            }
             const u32 start_address{native ? 0 : shader_config.offset};
-            GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
-            shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+            try {
+                // Native environments capture and lower the program while being constructed.
+                GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
+                shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+            } catch (const Shader::Exception&) {
+                if (native) failed_native_shaders.insert(*cpu_shader_addr);
+                throw;
+            }
         }
         shader_infos[index] = shader_info;
         unique_hashes[index] = shader_info->unique_hash;
@@ -88,7 +98,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
 } catch (const Shader::Exception& error) {
     auto& native = maxwell3d->GetNativeMacroEngine();
     if (!native.native_turing) throw;
-    native.native_execution_failed = true;
+    // Draws using this shader are skipped; failing the whole channel would deadlock on its fence.
     last_shaders_valid = false;
     LOG_ERROR(HW_GPU, "Native graphics shader rejected: {}", error.what());
     return false;

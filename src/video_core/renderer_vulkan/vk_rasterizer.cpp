@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <string>
+#include <unordered_map>
 #include <memory>
 #include <cstdlib>
 #include <fstream>
@@ -243,11 +246,24 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         gpu.TickWork();
     };
     bool submitted = false;
+    const char* skip_reason = "unknown";
     SCOPE_EXIT {
         auto& native = maxwell3d->GetNativeMacroEngine();
         if (native.native_turing && !submitted) {
-            native.native_execution_failed = true;
-            LOG_ERROR(HW_GPU, "Native graphics draw failed; refusing submission completion");
+            // Withholding completion deadlocks the title on its fence; skip only this draw.
+            std::string programs;
+            for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
+                if (!maxwell3d->regs.IsShaderConfigEnabled(stage)) continue;
+                const auto& config = maxwell3d->regs.pipelines[stage];
+                programs += fmt::format(" {}:{:#x}", stage,
+                                        (u64{config.reserved[0] & 0xff} << 32) | config.reserved[1]);
+            }
+            static std::unordered_map<std::string, u32> skipped;
+            const u32 count = ++skipped[fmt::format("{}{}", skip_reason, programs)];
+            if (count == 1 || std::has_single_bit(count)) {
+                LOG_ERROR(HW_GPU, "Native graphics draw skipped ({}), programs{}, count={}",
+                          skip_reason, programs, count);
+            }
         }
     };
     FlushWork();
@@ -255,13 +271,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
     if (!pipeline) {
+        skip_reason = "no pipeline";
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
-    if (!pipeline->Configure(is_indexed))
+    if (!pipeline->Configure(is_indexed)) {
+        skip_reason = "configure failed";
         return;
+    }
 
     UpdateDynamicStates();
 
@@ -270,6 +289,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
     draw_func();
     submitted = true;
+    ++frame_stats.draws;
+    RecordFrameTarget();
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
         std::getenv("EDEN_NATIVE_DRAW_CAPTURE") && native_capture_count < 16) {
@@ -448,9 +469,21 @@ void RasterizerVulkan::DrawTexture() {
                          sampler->Handle(), dst_region, src_region, src_size);
 }
 
+void RasterizerVulkan::RecordFrameTarget() {
+    // Device addresses, so they compare directly with the displayed framebuffer.
+    const GPUVAddr target = gpu_memory->GpuToCpuAddress(maxwell3d->regs.rt[0].Address()).value_or(0);
+    auto& stats = frame_stats;
+    const auto end = stats.targets.begin() + stats.target_count;
+    if (std::find(stats.targets.begin(), end, target) == end && stats.target_count < stats.targets.size()) {
+        stats.targets[stats.target_count++] = target;
+    }
+}
+
 void RasterizerVulkan::Clear(u32 layer_count) {
     FlushWork();
     gpu_memory->FlushCaching();
+    ++frame_stats.clears;
+    RecordFrameTarget();
 
     auto& regs = maxwell3d->regs;
     const bool use_color = regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
@@ -636,6 +669,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 void RasterizerVulkan::DispatchCompute() {
     FlushWork();
     gpu_memory->FlushCaching();
+    ++frame_stats.dispatches;
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
     if (!pipeline) {
@@ -1025,10 +1059,26 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     if (!framebuffer_addr) {
         return {};
     }
+    if (static const char* override_address = std::getenv("EDEN_NATIVE_DISPLAY_OVERRIDE"); override_address) {
+        framebuffer_addr = std::strtoull(override_address, nullptr, 16);
+        // Values above 4 GiB are GPU virtual addresses.
+        if (framebuffer_addr >= 0x100000000ULL) {
+            framebuffer_addr = gpu_memory->GpuToCpuAddress(framebuffer_addr).value_or(0);
+        }
+    }
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
     static u32 display_trace_count{};
+    static const bool frame_stats_enabled = std::getenv("EDEN_NATIVE_FRAME_STATS") != nullptr;
+    static u32 frame_stats_count{};
+    if (frame_stats_enabled && (frame_stats_count++ % 30) == 0) {
+        LOG_INFO(HW_GPU, "Native frame stats: display={:#x}, accelerated={}, draws={}, clears={}, dispatches={}, targets={:#x}",
+                 framebuffer_addr, image_view != nullptr, frame_stats.draws, frame_stats.clears,
+                 frame_stats.dispatches,
+                 fmt::join(std::span{frame_stats.targets.data(), frame_stats.target_count}, ","));
+    }
+    frame_stats = {};
     if (std::getenv("EDEN_NATIVE_FRAME_CAPTURE") && display_trace_count++ < 64) {
         LOG_INFO(HW_GPU, "Native display source: address={:#x}, offset={:#x}, dimensions={}x{}, stride={}, accelerated={}, mask={:#x}",
                  framebuffer_addr, config.offset, config.width, config.height, pixel_stride,

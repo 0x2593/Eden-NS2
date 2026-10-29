@@ -359,6 +359,13 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
         system.GPU().InitChannel(*channel_state, channel_state->program_id);
     }
 
+    if (UsesNativeAbi() && std::getenv("EDEN_NATIVE_SUBMIT_TRACE")) {
+        LOG_INFO(Service_NVDRV, "native submit trace channel={}, entries={}, flags={:#x}, fence={}:{}, first={:#x}/{}",
+                 channel_state->bind_id, entries.command_lists.size(), params.flags.raw, params.fence.id,
+                 params.fence.value,
+                 entries.command_lists.empty() ? 0 : static_cast<u64>(entries.command_lists[0].addr),
+                 entries.command_lists.empty() ? 0 : static_cast<u64>(entries.command_lists[0].size));
+    }
     if (UsesNativeAbi() && native_submit_logs++ < 8) {
         LOG_DEBUG(Service_NVDRV, "native submit channel={}, initialized={}, entries={}, flags={:#x}, fence={}:{}",
                   channel_state->bind_id, channel_state->initialized, entries.command_lists.size(),

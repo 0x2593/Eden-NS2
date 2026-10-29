@@ -80,7 +80,7 @@ set(YUZU_QT_MIRROR "" CACHE STRING "What mirror to use for downloading the bundl
 cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSVC}" "ENABLE_QT" OFF)
 
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
-option(ENABLE_WERROR "Enable -Wno-error diagnostics" ON)
+option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
 
 # Lossless Scaling frame generation. Only Android.
 cmake_dependent_option(ENABLE_LSFG "Enable Lossless Scaling frame generation" ON "ANDROID" OFF)

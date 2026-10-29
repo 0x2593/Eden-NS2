@@ -5,8 +5,14 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include <optional>
 #include "common/swap.h"
 #include "common/alignment.h"
+#include "common/scope_exit.h"
+#include "core/hle/kernel/k_memory_manager.h"
+#include "core/hle/kernel/k_page_group.h"
+#include "core/hle/kernel/k_system_resource.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_client_session.h"
@@ -58,6 +64,7 @@ public:
             {211, &IGpuWorker::NormalMapGpuMemory4K, "NormalMapGpuMemory4K"},
             {212, &IGpuWorker::NormalModifyGpuMemory4K, "NormalModifyGpuMemory4K"},
             {213, &IGpuWorker::NormalUnmapGpuMemory4K, "NormalUnmapGpuMemory4K"},
+            {214, &IGpuWorker::Unknown214, "Unknown214"},
         };
         RegisterHandlersTipc(functions);
     }
@@ -149,6 +156,125 @@ private:
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(result.raw);
         rb.Push<u32>(selected_kind);
+    }
+    // Maps freshly allocated pages as Insecure memory in a free block of the alias-code region that
+    // lies outside the heap and alias regions (the whole region is not a valid Insecure range).
+    Result MapSystemPages(u64 size, u64& out_address) {
+        auto& page_table = m_process->GetPageTable();
+        const u64 region_begin = GetInteger(page_table.GetAliasCodeRegionStart());
+        const u64 region_end = region_begin + page_table.GetAliasCodeRegionSize();
+        const std::array<std::pair<u64, u64>, 2> excluded{{
+            {GetInteger(page_table.GetHeapRegionStart()),
+             GetInteger(page_table.GetHeapRegionStart()) + page_table.GetHeapRegionSize()},
+            {GetInteger(page_table.GetAliasRegionStart()),
+             GetInteger(page_table.GetAliasRegionStart()) + page_table.GetAliasRegionSize()},
+        }};
+        constexpr u64 Guard = 0x10000;
+        std::optional<u64> found;
+        for (u64 address = region_begin; address < region_end && !found;) {
+            Kernel::KMemoryInfo info{};
+            Kernel::Svc::PageInfo page{};
+            R_TRY(page_table.QueryInfo(&info, &page, address));
+            const u64 block_end = std::min<u64>(info.m_address + info.m_size, region_end);
+            if (info.m_state == Kernel::KMemoryState::Free) {
+                u64 candidate = Common::AlignUp(std::max<u64>(info.m_address, region_begin) + Guard, Guard);
+                for (bool moved = true; moved && candidate + size + Guard <= block_end;) {
+                    moved = false;
+                    for (const auto& [begin, end] : excluded) {
+                        if (begin != end && candidate < end && candidate + size + Guard > begin) {
+                            candidate = Common::AlignUp(end + Guard, Guard);
+                            moved = true;
+                        }
+                    }
+                }
+                if (candidate + size + Guard <= block_end) found = candidate;
+            }
+            R_UNLESS(info.m_address + info.m_size > address, Kernel::ResultInvalidCurrentMemory);
+            address = info.m_address + info.m_size;
+        }
+        R_UNLESS(found, Kernel::ResultOutOfMemory);
+        // Taking this from the system pool starves HLE services (emulation hangs), so it comes
+        // from the application pool even though the SDK does not budget for it there.
+        Kernel::KPageGroup pg(kernel, kernel.GetSystemSystemResource().GetBlockInfoManagerPointer());
+        R_TRY(kernel.MemoryManager().AllocateAndOpen(&pg, size / Kernel::PageSize,
+                                                     m_process->GetAllocateOption()));
+        SCOPE_EXIT { pg.Close(kernel); };
+        R_TRY(page_table.MapPageGroup(*found, pg, Kernel::KMemoryState::Insecure,
+                                      Kernel::KMemoryPermission::UserReadWrite));
+        out_address = *found;
+        R_SUCCEED();
+    }
+    // Commits system-allocated memory behind a GPU VA range. The SDK places render targets in
+    // these ranges without mapping any memory object of its own there.
+    Result BackGpuRange(u32 as_id, u64 begin, u64 end) {
+        R_UNLESS(OwnsAddressSpace(as_id), Kernel::ResultNotFound);
+        R_UNLESS(end >= begin && end != ~u64{0}, Kernel::ResultInvalidSize);
+        const u64 size = end - begin + 1;
+        R_UNLESS(Common::IsAligned(begin, Kernel::PageSize) && Common::IsAligned(size, Kernel::PageSize),
+                 Kernel::ResultInvalidSize);
+        R_UNLESS(m_memory.size() < 1024 && m_mappings.size() < 1024, Kernel::ResultOutOfResource);
+        const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(as_id);
+        R_UNLESS(as, Kernel::ResultNotFound);
+        auto& page_table = m_process->GetPageTable();
+        u64 address{};
+        R_TRY(MapSystemPages(size, address));
+        const Kernel::KProcessAddress backing{address};
+        if (!m_nv_session) {
+            m_nv_session = m_module->GetContainer().OpenSession(m_process).id;
+        }
+        auto& nvmap = m_module->GetContainer().GetNvMapFile();
+        std::shared_ptr<Nvidia::NvCore::NvMap::Handle> handle;
+        if (nvmap.CreateHandle(size, handle) != Nvidia::NvResult::Success) {
+            page_table.UnmapPages(backing, size / Kernel::PageSize, Kernel::KMemoryState::Insecure);
+            R_THROW(Kernel::ResultOutOfResource);
+        }
+        bool is_io{};
+        if (const auto lock = page_table.LockForMapDeviceAddressSpace(
+                &is_io, address, size, Kernel::KMemoryPermission::None, true, true);
+            lock.IsError()) {
+            LOG_WARNING(Service_AM, "GPU range backing lock failed: backing={:#x}, result={:#x}", address, lock.raw);
+            nvmap.FreeHandle(handle->id, false);
+            page_table.UnmapPages(backing, size / Kernel::PageSize, Kernel::KMemoryState::Insecure);
+            R_RETURN(lock);
+        }
+        const auto alloc = handle->Alloc({}, Kernel::PageSize, 0, address, Nvidia::NvCore::SessionId{*m_nv_session});
+        const auto mapped = alloc == Nvidia::NvResult::Success
+            ? as->MapNative4K(handle->id, begin, 0, size, static_cast<u8>(Tegra::PTEKind::GENERIC_16BX2))
+            : alloc;
+        if (mapped != Nvidia::NvResult::Success) {
+            LOG_WARNING(Service_AM, "GPU range backing failed: backing={:#x}, alloc={}, map={}", address,
+                        static_cast<u32>(alloc), static_cast<u32>(mapped));
+            page_table.UnlockForDeviceAddressSpace(address, size);
+            nvmap.FreeHandle(handle->id, false);
+            page_table.UnmapPages(backing, size / Kernel::PageSize, Kernel::KMemoryState::Insecure);
+            R_THROW(Kernel::ResultInvalidCurrentMemory);
+        }
+        m_memory.push_back(handle->id);
+        m_mappings.push_back({as_id, begin, size, handle->id});
+        R_SUCCEED();
+    }
+    void Unknown214(HLERequestContext& ctx) {
+        const auto* packet = ctx.CommandBuffer();
+        const std::scoped_lock device_lock{m_devices->mutex};
+        Result result = Kernel::ResultInvalidCombination;
+        u32 kind{};
+        if (packet[0] == 0xe6 && packet[1] == 10 && packet[11] < m_devices->events.size() &&
+            m_devices->events[packet[11]]) {
+            kind = packet[7] & 0xff;
+            result = ResultSuccess;
+            if (const auto backed = BackGpuRange(packet[2], ReadPair(packet, 3), ReadPair(packet, 5));
+                backed.IsError()) {
+                // Keep the previous behaviour (an unbacked reservation) if no memory is available.
+                LOG_WARNING(Service_AM, "GPU command 214 range left unbacked: {:#x}", backed.raw);
+            }
+            m_devices->events[packet[11]]->Signal(kernel);
+        }
+        LOG_DEBUG(Service_AM, "GPU command 214 as={}, VA={:#x}..{:#x}, words={:08x}, result={:#x}",
+                  packet[2], ReadPair(packet, 3), ReadPair(packet, 5),
+                  fmt::join(std::span{packet + 7, 5}, ","), result.raw);
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(result.raw);
+        rb.Push<u32>(kind);
     }
     void NormalModifyGpuMemory4K(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();

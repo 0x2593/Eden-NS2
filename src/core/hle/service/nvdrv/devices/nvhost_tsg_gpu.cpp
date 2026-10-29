@@ -44,10 +44,21 @@ NvResult nvhost_tsg_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> 
     LOG_DEBUG(Service_NVDRV, "native TSG ioctl={:#x}, input={}, output={}, words={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
               command.raw, input.size(), output.size(), words[0], words[1], words[2], words[3],
               words[4], words[5], words[6], words[7]);
-    if (command.raw != 0xc0045401 && command.raw != 0xc0045402) { return NvResult::NotImplemented; }
-    if (!process || input.size() != 4 || output.size() != 4) { return NvResult::BadParameter; }
+    if (command.group != 'T' || command.cmd < 1 || command.cmd > 0xb) { return NvResult::NotImplemented; }
+    if (command.cmd >= 3 && command.cmd <= 0xa) {
+        // Enable/disable/preempt and scheduling controls have no effect on the emulated GPU.
+        std::fill(output.begin(), output.end(), u8{0});
+        std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
+        return NvResult::Success;
+    }
+    const bool bind_ex = command.cmd == 0xb;
+    if (!process || (bind_ex ? input.size() < 8 : input.size() != 4) ||
+        output.size() > input.size()) {
+        return NvResult::BadParameter;
+    }
     const DeviceFD channel_fd = static_cast<s32>(words[0]);
-    if (command.cmd == 1) {
+    // BIND_CHANNEL_EX carries a subcontext (VEID) after the fd; all subcontexts share one context here.
+    if (command.cmd == 1 || bind_ex) {
         if (channels.contains(channel_fd)) { return NvResult::Busy; }
         if (channels.size() >= 64) { return NvResult::InsufficientMemory; }
         const auto device = module.GetDevice<nvdevice>(channel_fd);
@@ -62,7 +73,7 @@ NvResult nvhost_tsg_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> 
         it->second->UnbindFromTsg(fd);
         channels.erase(it);
     }
-    std::copy(input.begin(), input.end(), output.begin());
+    std::copy_n(input.begin(), output.size(), output.begin());
     return NvResult::Success;
 }
 

@@ -3213,6 +3213,13 @@ public:
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
+    /// Native macros keep reading parameters across pushbuffer packets, so their call waits
+    /// until a method other than the macro's argument register arrives.
+    bool HasPendingNativeMacro() const { return native_macro_pending; }
+    MemoryManager& GetMemoryManager() { return memory_manager; }
+    bool IsPendingMacroArgument(u32 method) const { return method == executing_macro + 1; }
+    void FlushPendingNativeMacro(Core::System& system);
+
 private:
     void InitializeRegisterDefaults();
 
@@ -3279,6 +3286,7 @@ private:
     u32 executing_macro = 0;
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
+    bool native_macro_pending{};
 
     /// Interpreter for the macro codes uploaded to the GPU.
     std::shared_ptr<NativeMacroContext> native_macro_context;

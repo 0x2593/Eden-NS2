@@ -24,9 +24,11 @@ public:
         std::string_view error;
     };
 
-    template <typename Read, typename Emit>
+    // Parameters are read through size()/operator[] on every load, so emit may append data
+    // that the macro requested with MME_DMA_READ_FIFOED.
+    template <typename Parameters, typename Read, typename Emit>
     Result Execute(std::span<const Word> code, Word start,
-                   std::span<const Word> parameters, Read read, Emit emit) {
+                   const Parameters& parameters, Read read, Emit emit) {
         std::array<Word, 24> regs{};
         Word initialized{}, carry{}, method{}, increment{};
         Word pc = start, loop_count{}, loop_start{}, loop_end{};
@@ -120,7 +122,9 @@ public:
                     value = Word(product); carry = Word(product >> 32); break;
                 }
                 case 5: value = carry; break;
-                case 7: fail("unsupported extended operation"); break;
+                case 7: // EXTENDED; 0x1000/1 is the load barrier, which only orders input loads.
+                    if (x != 0x1000 || y != 1) fail("unsupported extended operation (not a load barrier)");
+                    break;
                 case 8: value = Word(std::countl_zero(x)); break;
                 case 9: value = x << (y & 31); break;
                 case 10: value = x >> (y & 31); break;

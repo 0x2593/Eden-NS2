@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <iterator>
 #include <utility>
 #include "common/assert.h"
@@ -34,6 +35,21 @@ namespace FS = Common::FS;
 namespace {
 
 constexpr size_t MaxOpenFiles = 8192;
+
+// The frontend raises the C runtime's stream limit, but MSVCRT (MinGW) caps it at 2048. Keep the
+// cache below whatever limit is in effect, leaving room for logs, configs and save data.
+size_t OpenFileLimit() {
+#ifdef _WIN32
+    static const size_t limit = [] {
+        const int streams = _getmaxstdio();
+        return streams > 512 ? std::min<size_t>(MaxOpenFiles, static_cast<size_t>(streams) - 256)
+                             : size_t{256};
+    }();
+    return limit;
+#else
+    return MaxOpenFiles;
+#endif
+}
 
 bool IsWithinRoot(std::string_view root, std::string_view full_path) {
     if (root.empty())
@@ -251,7 +267,7 @@ void RealVfsFilesystem::DropReference(std::unique_ptr<FileReference>&& reference
 }
 
 void RealVfsFilesystem::EvictSingleReferenceLocked() {
-    if (num_open_files < MaxOpenFiles || open_references.empty()) {
+    if (num_open_files < OpenFileLimit() || open_references.empty()) {
         return;
     }
 

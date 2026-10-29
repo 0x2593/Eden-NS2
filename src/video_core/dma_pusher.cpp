@@ -36,14 +36,36 @@ void DmaPusher::DispatchCalls() {
             break;
         }
     }
+    FlushPendingNativeMacro(true);
     system.GPU().FlushCommands();
     system.GPU().OnCommandListEnd();
 }
 
+void DmaPusher::FlushPendingNativeMacro(bool force) {
+    for (size_t index = 0; index < max_subchannels; ++index) {
+        if (!subchannels[index] || subchannel_type[index] != Engines::EngineTypes::Maxwell3D) continue;
+        auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[index]);
+        if (!maxwell3d->HasPendingNativeMacro()) continue;
+        if (!force && dma_state.method >= non_puller_methods &&
+            subchannels[dma_state.subchannel] == subchannels[index] &&
+            maxwell3d->IsPendingMacroArgument(dma_state.method)) {
+            continue;
+        }
+        maxwell3d->FlushPendingNativeMacro(system);
+    }
+}
+
 bool DmaPusher::HasFailedNativeWork() const {
     const auto& context = channel_state.native_macro_context;
-    return channel_state.native_abi && context &&
-           (context->engine.native_execution_failed || context->compute_engine.native_execution_failed);
+    if (channel_state.native_abi && context &&
+        (context->engine.native_execution_failed || context->compute_engine.native_execution_failed)) {
+        // The failed operation was already skipped. Halting the channel would leave the title
+        // waiting on fences that never signal, so continue with the remaining work.
+        LOG_WARNING(HW_GPU, "Continuing native channel after skipped GPU work");
+        context->engine.native_execution_failed = false;
+        context->compute_engine.native_execution_failed = false;
+    }
+    return false;
 }
 
 bool DmaPusher::Step() {
@@ -192,6 +214,7 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
 }
 
 void DmaPusher::CallMethod(u32 argument) {
+    FlushPendingNativeMacro(false);
     if (dma_state.method < non_puller_methods) {
         puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
             dma_state.method,
@@ -212,6 +235,7 @@ void DmaPusher::CallMethod(u32 argument) {
 }
 
 void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+    FlushPendingNativeMacro(false);
     if (dma_state.method < non_puller_methods) {
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
     } else {

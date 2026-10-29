@@ -6,6 +6,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -28,6 +30,7 @@
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -610,6 +613,17 @@ struct Memory::Impl {
             []() {});
     }
 
+    /// Logs a guest backtrace for the first few unmapped accesses (opt-in: EDEN_UNMAPPED_BACKTRACE).
+    void LogUnmappedBacktrace() const {
+        static const bool enabled = std::getenv("EDEN_UNMAPPED_BACKTRACE") != nullptr;
+        static std::atomic<u32> logged{};
+        thread_local bool active{};
+        if (!enabled || active || logged.fetch_add(1) >= 4) return;
+        active = true;
+        system.CurrentPhysicalCore().LogBacktrace(system.Kernel());
+        active = false;
+    }
+
     [[nodiscard]] u8* GetPointerSilent(const Common::ProcessAddress vaddr) const {
         return GetPointerImpl(
             GetInteger(vaddr), []() {}, []() {});
@@ -622,8 +636,9 @@ struct Memory::Impl {
     template <typename T>
     inline T Read(Common::ProcessAddress vaddr) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [addr]() {
+        if (auto const ptr = GetPointerImpl(addr, [this, addr]() {
             LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x}", sizeof(T) * 8, addr);
+            LogUnmappedBacktrace();
         }, [&]() {
             HandleRasterizerDownload(addr, sizeof(T));
         }); ptr) [[likely]] {
@@ -643,8 +658,9 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
+        if (auto const ptr = GetPointerImpl(addr, [this, addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
+            LogUnmappedBacktrace();
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
             std::memcpy(ptr, &data, sizeof(T));
     }

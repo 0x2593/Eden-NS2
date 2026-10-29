@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <unordered_set>
 #include "common/container/unordered_map.h"
 #include <utility>
 #include <vector>
@@ -98,6 +99,7 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
+    std::unordered_set<VAddr> failed_native_shaders;
 
 private:
     /// @brief Tries to obtain a cached shader starting in a given address

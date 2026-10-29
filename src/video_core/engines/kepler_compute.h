@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
@@ -235,10 +236,14 @@ private:
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
+    std::unordered_set<GPUVAddr> failed_native_programs;
     bool native_mode{};
     NativeMacroContext* native_context{};
     bool native_compute_uploaded{};
     MacroEngine* native_macro{};
+    // Macro code is shared by the channel group, but the macro data RAM holds per-channel
+    // state (the SDK keeps each queue's QMD ring there), so every channel executes with its own.
+    TuringMacroInterpreter native_interpreter;
     std::array<u32, 0x1000> native_registers{};
     std::span<u32> native_macro_positions;
     std::vector<u32> native_parameters;

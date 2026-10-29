@@ -153,6 +153,8 @@ private:
 
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
+    /// Runs a deferred native 3D macro unless the current method continues its arguments.
+    void FlushPendingNativeMacro(bool force);
 
 public:
     Common::ScratchBuffer<CommandHeader> command_headers; ///< Buffer for list of commands fetched at once

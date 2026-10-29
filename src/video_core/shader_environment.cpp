@@ -330,7 +330,14 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
     for (u32 index = 0; index < maximum_instructions; ++index) {
         const GPUVAddr address = program_base + native_header_size + index * sizeof(Instruction);
         if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) {
-            throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
+            // A program placed at the end of its pool can end in a form the capture does not
+            // recognize; nothing past the mapping can belong to it.
+            if (native.empty()) {
+                throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
+            }
+            LOG_WARNING(Shader, "Native shader capture stopped at pool end {:#x} after {} instructions",
+                        address, native.size());
+            break;
         }
         auto& instruction = native.emplace_back();
         gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
@@ -341,6 +348,19 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
     }
     auto lowered = Shader::Ampere::LowerToMaxwell(native);
     if (!lowered) {
+        if (const size_t failed = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
+            failed < native.size()) {
+            const auto& words = native[failed].words;
+            LOG_ERROR(Shader, "Native shader {:#x} lowering failed at {:#x} ({}): {:08x} {:08x} {:08x} {:08x}",
+                      program_base, lowered.error_offset, lowered.error, words[0], words[1], words[2],
+                      words[3]);
+            for (size_t i = failed > 0 ? failed - 1 : 0; i < std::min(native.size(), failed + 3); ++i) {
+                if (i == failed) continue;
+                const auto& near = native[i].words;
+                LOG_ERROR(Shader, "  [{:+}] {:08x} {:08x} {:08x} {:08x}", static_cast<s64>(i) - static_cast<s64>(failed),
+                          near[0], near[1], near[2], near[3]);
+            }
+        }
         if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
             const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
             const auto folder = std::filesystem::path{directory};

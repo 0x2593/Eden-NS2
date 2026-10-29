@@ -37,6 +37,7 @@ inline void TraceNativeQuery(u32 event, u64 asid, u64 gpu, u64 cpu, u32 type, u6
         state.file << event << ',' << asid << ',' << std::hex << gpu << ',' << cpu << ','
                    << type << ',' << value << ',' << flags << std::dec << '\n';
     }
-    if (event == 4 || event == 5) state.file.flush();
+    // Inline writes are bulk traffic; everything else is flushed so a hang keeps its tail.
+    if (event != 11 && event != 12) state.file.flush();
 }
 } // namespace VideoCommon
