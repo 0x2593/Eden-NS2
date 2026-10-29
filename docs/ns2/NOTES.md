@@ -28,7 +28,8 @@ Tool output (screenshots, logs, dumps) goes to `tools/ns2/out/`, which is not co
 
 ## Eden config (%APPDATA%\eden\config\qt-config.ini)
 
-User-requested: `memory_layout_mode=4` (12 GB), `use_multi_core=false`, `backend=1` (Vulkan).
+User-requested: `memory_layout_mode=4` (12 GB), `backend=1` (Vulkan). `use_multi_core=true` is
+required since the fourth round (single-core livelocks at the menu, see item 26).
 Debug settings added: `use_auto_stub=true`, `rng_seed_enabled=true`/`rng_seed=0`
 (fixed load addresses: rtld 0x80000000, main 0x80020000, sdk 0x82830000), `log_filter="*:Info"`,
 `use_gdbstub=false` (was toggled on for GDB sessions).
@@ -173,3 +174,45 @@ Config note: multi-core CPU mode was used for most of the above.
 25. Still open: geometry shaders are rejected by the native path (draws skipped); intermittent guest
     memory corruption crash right after Normal Mode is chosen, only seen when A is pressed again during
     the transition (unattended runs use `EDEN_AUTO_PRESS_A=58,4,70`).
+
+## Fourth round (2026-10-29): 3D world in gameplay
+
+26. Freeze at the menu after ~60 s in single-core mode: SDK spinlocks use a TLS preemption protocol
+    (+0x100/+0x102) that never makes progress with one host thread. Multi-core mode avoids it.
+27. Multi-core crash on entering gameplay (`ExceptionRaised` at 0x80219D40, ~1800 times): the Switch 2
+    CPU has ARMv8.1 LSE atomics and Dynarmic only decoded LDADD/LDCLR/LDSET. All eight LDxxx
+    register atomics (ADD, CLR, EOR, SET, SMAX, SMIN, UMAX, UMIN) are now one decoder entry
+    (`LDATOMIC`) with every size and acquire/release form.
+28. Abort 2001-0033, then 2001-0114, at gameplay start: the video codec
+    (`nn::codec::video::detail::ipc`) talks to the graphics supervisor. Found by disassembling
+    `Initialize` (sdk 0x82b113f0) and `CreateVideoDecoderService` (0x82b11f10):
+    - 901 and 1001 return only a result.
+    - 902 (905 for system callers) returns the decoder root session; 1002 the encoder root. TIPC
+      command 1 on a root creates the decoder/encoder service session.
+    - On the service, command 3 returns a copy-handle event before the result; the rest
+      (6, 101, 109, 200, 311, ...) are answered with success and zeroed words.
+    - 991 is the decoder image pool size query (same request shape as 435/1510).
+    - Syncpoint supervisor command 22 returns an event.
+    The stand-in decodes nothing (the tutorial video panel stays a flat colour), but the game no
+    longer aborts. Unknown supervisor commands are stubbed when `use_auto_stub` is set.
+    Handle-0 SVC failures are logged (`returned InvalidHandle`) because a stub handing out handle 0
+    caused both aborts.
+29. Geometry shaders: the native path now accepts the geometry stage. Lowering added for OUT
+    (emit/cut), ISBERD map reads (a copy in Eden's translator), S2R of SR_INVOCATION_ID/INFO, and
+    the LEPC + opcode 0x357 prologue (its address result is unused after lowering, so LEPC reads as
+    zero and 0x357 is dropped). Maxwell PRMT was not implemented in Eden's translator at all; it is
+    now (default mode, all four operand forms).
+30. More lowering for gameplay shaders: FSET with a combine predicate; LOP3 with predicate output and
+    imm/cbuf/uniform operands; ULOP3 with UPn output; IMNMX with a cbuf operand; I2FP rounding; LEA.HI;
+    IMAD negated addend forms and IMAD.X with a zero product; uniform IMAD (0x8a4); F2I to 16 bits and
+    rounded 32-bit forms (the Maxwell translator now accepts 8-bit F2I destinations); LDC widths 0-5;
+    IADD3 with a uniform operand; SHF.L.HI with a register shift; PRMT with any byte selector; TMML;
+    TEX 2D-array depth compare with LOD zero. Offline corpus (shaders dumped with
+    `EDEN_NATIVE_SHADER_DUMP_DIR`): 390 of 394 lower; the rest are one ATOM form and three shaders
+    reading constant buffer 24.
+31. Result: the 3D world renders in gameplay (mining tunnel, DK, rocks). It runs at 5-8 FPS; three
+    host threads are saturated and the guest main thread spends most samples waiting on a critical
+    section, so the limit looks like CPU emulation throughput.
+32. Still open: performance; video decoding; an intermittent fault during the menu-to-loading
+    transition (a guest pointer into unmapped space, seen once in five runs); the four remaining
+    shader forms.

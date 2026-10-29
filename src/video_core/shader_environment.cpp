@@ -346,6 +346,17 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
             throw Shader::RuntimeError("Native shader branch outside capture bounds");
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
+    static const char* const dump_directory = std::getenv("EDEN_NATIVE_SHADER_DUMP_DIR");
+    if (dump_directory) {
+        // Every captured program, for offline lowering tests. Named by content key.
+        const auto folder = std::filesystem::path{dump_directory};
+        std::filesystem::create_directories(folder);
+        const auto path = folder / fmt::format("{:016x}.source.bin", Shader::Ampere::NativeProgramKey(native));
+        if (!std::filesystem::exists(path)) {
+            std::ofstream dump(path, std::ios::binary);
+            dump.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Instruction));
+        }
+    }
     auto lowered = Shader::Ampere::LowerToMaxwell(native);
     if (!lowered) {
         if (const size_t failed = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
@@ -448,11 +459,14 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     initial_offset = sizeof(sph);
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
     if (maxwell3d->GetNativeMacroEngine().native_turing) {
-        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel) {
+        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Geometry &&
+            program != Maxwell::ShaderType::Pixel) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
-            const u32 native_stage = program == Maxwell::ShaderType::Pixel ? 4 : 0;
+            const u32 native_stage = program == Maxwell::ShaderType::Pixel      ? 4
+                                     : program == Maxwell::ShaderType::Geometry ? 3
+                                                                                : 0;
             const auto& table = maxwell3d->state.shader_stages[native_stage].const_buffers[1];
             if (table.enabled && table.size && table.size <= Tegra::Engines::Maxwell3D::Regs::MaxConstBufferSize) {
                 std::vector<u8> bytes(table.size);

@@ -41,6 +41,9 @@ private:
     void CompleteBootstrap(HLERequestContext& ctx);
     void InitializeImageContext(HLERequestContext& ctx);
     void GetNvidiaDriver(HLERequestContext& ctx);
+    void UnknownQuery(HLERequestContext& ctx);
+    void CalculateDecoderImageRequirements(HLERequestContext& ctx);
+    void OpenVideoCodecRoot(HLERequestContext& ctx);
     void CalculateImageRequirements(HLERequestContext& ctx);
     void CreateNativeMemory(HLERequestContext& ctx);
     void CreateNativeImage(HLERequestContext& ctx);

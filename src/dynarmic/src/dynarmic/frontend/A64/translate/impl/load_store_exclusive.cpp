@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <array>
 #include <optional>
 
 #include "dynarmic/frontend/A64/translate/impl/impl.h"
@@ -50,7 +51,7 @@ bool TranslatorVisitor::LDAPR(Imm<2> size, Reg Rn, Reg Rt) {
     return LDAR(size, Rn, Rt);
 }
 
-enum class AtomicRegisterOperation { Add, Set, Clear, Swap };
+enum class AtomicRegisterOperation { Add, Clear, Eor, Set, SMax, SMin, UMax, UMin, Swap };
 
 static bool AtomicRegisterOperationImpl(TranslatorVisitor& v, size_t bits, bool A, bool R,
                                         Reg Rs, Reg Rn, Reg Rt, AtomicRegisterOperation operation) {
@@ -60,9 +61,29 @@ static bool AtomicRegisterOperationImpl(TranslatorVisitor& v, size_t bits, bool 
     const IR::U32U64 operand = v.ZeroExtend(v.X(bits, Rs), reg_bits);
     const auto flags = v.ir.GetNZCVRaw();
     const auto access = A || R ? IR::AccType::ORDERED : IR::AccType::ATOMIC;
-    const auto observed = v.ZeroExtend(v.ExclusiveMem(address, bits / 8, access), reg_bits);
+    const auto loaded = v.ExclusiveMem(address, bits / 8, access);
+    const auto observed = v.ZeroExtend(loaded, reg_bits);
     auto replacement = operand;
     switch (operation) {
+    case AtomicRegisterOperation::Eor:
+        replacement = v.ir.Eor(observed, operand);
+        break;
+    case AtomicRegisterOperation::SMax:
+    case AtomicRegisterOperation::SMin: {
+        // Compare at the access width; the stored value is truncated back to it below.
+        const auto signed_observed = v.SignExtend(loaded, reg_bits);
+        const auto signed_operand = v.SignExtend(v.X(bits, Rs), reg_bits);
+        replacement = operation == AtomicRegisterOperation::SMax
+            ? v.ir.MaxSigned(signed_observed, signed_operand)
+            : v.ir.MinSigned(signed_observed, signed_operand);
+        break;
+    }
+    case AtomicRegisterOperation::UMax:
+        replacement = v.ir.MaxUnsigned(observed, operand);
+        break;
+    case AtomicRegisterOperation::UMin:
+        replacement = v.ir.MinUnsigned(observed, operand);
+        break;
     case AtomicRegisterOperation::Add:
         replacement = v.ir.Add(observed, operand);
         break;
@@ -103,6 +124,16 @@ bool TranslatorVisitor::LDCLR(bool sz, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
 
 bool TranslatorVisitor::LDSET(bool sz, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
     return AtomicRegisterOperationImpl(*this, sz ? 64 : 32, A, R, Rs, Rn, Rt, AtomicRegisterOperation::Set);
+}
+
+// LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN at every size (and their ST* aliases).
+bool TranslatorVisitor::LDATOMIC(Imm<2> size, bool A, bool R, Reg Rs, Imm<3> opc, Reg Rn, Reg Rt) {
+    static constexpr std::array operations{
+        AtomicRegisterOperation::Add, AtomicRegisterOperation::Clear, AtomicRegisterOperation::Eor,
+        AtomicRegisterOperation::Set, AtomicRegisterOperation::SMax, AtomicRegisterOperation::SMin,
+        AtomicRegisterOperation::UMax, AtomicRegisterOperation::UMin};
+    return AtomicRegisterOperationImpl(*this, 8U << size.ZeroExtend<size_t>(), A, R, Rs, Rn, Rt,
+                                       operations[opc.ZeroExtend<size_t>()]);
 }
 
 bool TranslatorVisitor::SWPB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {

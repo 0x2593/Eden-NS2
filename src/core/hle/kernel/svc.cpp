@@ -2509,10 +2509,19 @@ void Call(Core::System& system, u32 imm) {
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
+    const std::array<uint64_t, 8> inputs = args;
     if (process.Is64Bit()) {
         Call64(system, imm, args);
     } else {
         Call32(system, imm, args);
+    }
+    // Invalid handles are almost always an emulation gap (a stubbed service handing out handle 0).
+    if (static_cast<u32>(args[0]) == ResultInvalidHandle.raw) {
+        static u32 reported{};
+        if (reported++ < 32) {
+            LOG_WARNING(Kernel_SVC, "SVC {:#x} returned InvalidHandle: args={:#x},{:#x},{:#x},{:#x}",
+                        imm, inputs[0], inputs[1], inputs[2], inputs[3]);
+        }
     }
     //kernel.ExitSVCProfile();
     kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);

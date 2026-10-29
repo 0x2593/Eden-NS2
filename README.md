@@ -3,8 +3,10 @@
 An experimental fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator,
 built on top of a community "Switch 2 support" patch, with a set of fixes that get
 **Donkey Kong Bananza** (title `040074A01BF12000`, update v7.0.0) from a black screen, through its
-mode-select menu (60 FPS) and first load, **into gameplay on Windows**. In gameplay the HUD
-renders but the 3D world does not yet, and it runs slowly (about 5 FPS).
+mode-select menu (60 FPS) and first load, **into gameplay with the 3D world rendering, on
+Windows**. Gameplay is slow (5-8 FPS) and in-game videos are not decoded yet.
+
+![Gameplay with the 3D world rendering](docs/ns2/screenshots/gameplay-3d.png)
 
 ![Mode-select menu](docs/ns2/screenshots/mode-select-menu.png)
 
@@ -20,18 +22,22 @@ renders but the 3D world does not yet, and it runs slowly (about 5 FPS).
 | Mode-select menu ("Normal Mode / Assist Mode / Options") | **Working, 60 FPS, text readable** |
 | Selecting Normal Mode → loading screen ("Golden Bananas?!") | Working |
 | Finishing the first load | Working |
-| Gameplay ("Explore the mining tunnel") | **Reached**: HUD renders, 3D world does not; ~5 FPS |
+| Gameplay ("Explore the mining tunnel") | **3D world and HUD render**; 5-8 FPS |
+| In-game video (tutorial panel) | Not decoded (stand-in codec service) |
 
-Tested on Windows 11 with an NVIDIA Turing-class GPU, in single-core and multi-core CPU modes.
+Tested on Windows 11 with an NVIDIA Turing-class GPU. **Multi-core CPU mode is required**
+(`use_multi_core=true`); single-core mode freezes at the menu.
 
 ### Known issues
 
-- **3D world not drawn in gameplay.** Geometry-shader stages are not supported by the native shader
-  path yet (`Unsupported native graphics shader stage 4`), so those draws are skipped, and the
-  remaining rendering still needs work.
-- **Slow in gameplay** (~5 FPS, ~20% speed).
-- **Occasional crash right after Normal Mode is chosen** (guest memory corruption, `PC=4`). It was
-  only seen when A was pressed again during the menu-to-loading transition.
+- **Slow in gameplay** (5-8 FPS). Three host threads are saturated; it looks CPU-bound.
+- **Videos are not decoded.** The video codec service is a stand-in that accepts every request, so
+  video panels show a flat colour.
+- **Occasional fault during the menu-to-loading transition** (a bad guest pointer; the loading
+  screen then never finishes). Seen in about one run in five, mostly when A is pressed again during
+  the transition.
+- Four rare shader forms still fail to lower (one ATOM form, three shaders reading constant
+  buffer 24); those draws are skipped.
 
 ## Reaching gameplay
 
@@ -66,6 +72,15 @@ Highlights; [docs/ns2/NOTES.md](docs/ns2/NOTES.md) lists every fix with the reas
   table, BREAK out of a reconvergence scope (PBK/BRK), RET without the copied link, TLD4 with a
   partial mask, TEX on 2D arrays with explicit LOD, AST of RZ, texture descriptors in any constant
   buffer, and uniform registers UR0–UR22.
+- **Multi-core gameplay:** Dynarmic now decodes all ARMv8.1 LSE register atomics (LDADD, LDCLR,
+  LDEOR, LDSET, LDSMAX, LDSMIN, LDUMAX, LDUMIN); the game uses LDSETH and crashed without it.
+- **Gameplay start aborts (2001-0033 / 2001-0114):** the video codec's supervisor commands (901,
+  902/905, 991, 1001, 1002) and its root/service sessions are answered by a stand-in, including the
+  completion event it waits on; the syncpoint supervisor's event query (22) is implemented.
+- **3D world:** geometry shaders are accepted by the native path (OUT, ISBERD, invocation special
+  registers, the LEPC prologue), Eden's Maxwell translator gained PRMT and 8-bit F2I, and more forms
+  are lowered (LOP3/ULOP3 with predicate output, TMML, IMNMX with constant buffers, SHF.L.HI, PRMT
+  selectors, 16-bit F2I, array depth-compare TEX with LOD zero, ...).
 - **Buffer cache:** up to 32 storage buffers per stage, and storage buffers with no size in the
   constant buffer stop at the end of their native mapping instead of spanning neighbouring pools.
 - Opt-in diagnostics (environment variables): `EDEN_NATIVE_FRAME_STATS`, `EDEN_NATIVE_TIC_TRACE`,
@@ -73,8 +88,9 @@ Highlights; [docs/ns2/NOTES.md](docs/ns2/NOTES.md) lists every fix with the reas
   `EDEN_UNMAPPED_BACKTRACE`, `EDEN_NATIVE_SEM_WATCH=<page,...>` (semaphore writers and waiters),
   `EDEN_NATIVE_STALL_WATCH=<addr,...>` (report parked channels after 8 s idle),
   `EDEN_NATIVE_METHOD_TRACE` (recent methods per channel at a watched wait),
-  `EDEN_NATIVE_NO_SSBO_WRITEBACK`, `EDEN_AUTO_PRESS_A=<start>,<interval>,<end>` (taps A for unattended
-  runs), plus the existing `EDEN_NATIVE_FRAME_CAPTURE` / `_DRAW_DIAGNOSTICS`.
+  `EDEN_NATIVE_NO_SSBO_WRITEBACK`, `EDEN_NATIVE_SHADER_DUMP_DIR=<dir>` (save every captured native
+  shader for offline lowering tests), `EDEN_AUTO_PRESS_A=<start>,<interval>,<end>[;...]` (taps A for
+  unattended runs; several windows separated by `;`), plus the existing `EDEN_NATIVE_FRAME_CAPTURE` / `_DRAW_DIAGNOSTICS`.
 
 ## Repository layout
 
@@ -146,7 +162,8 @@ build/bin/eden.exe -g "<dump>/updates/458752/exefs/main"   # Windows
 build/bin/eden -g "<dump>/updates/458752/exefs/main"       # Linux
 ```
 
-Settings used: Vulkan, 12 GB memory layout (`memory_layout_mode=4`), GPU accuracy High.
+Settings used: Vulkan, 12 GB memory layout (`memory_layout_mode=4`), GPU accuracy High, multi-core
+CPU (`use_multi_core=true`).
 The menu appears about 70–80 s after launch on the first run (shader cache cold).
 Default keyboard: A = `C`, B = `X`, + = `M`, − = `N`, left stick = W/A/S/D.
 

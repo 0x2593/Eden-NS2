@@ -81,16 +81,77 @@ namespace {
 
 // TIPC payloads follow a 32-bit result, so these handlers push result.raw.
 
+// Sessions of the video codec (nn::codec::video::detail::ipc). Supervisor commands 902/905 return
+// the decoder root and 1002 the encoder root; TIPC command 1 on a root creates the decoder or
+// encoder service. The service protocol is unknown: every request is logged and answered with
+// success and zeroed output words, except service command 3, which returns the completion event
+// (copy handle before the result). Each later request signals it, as if the work were done.
+class IVideoCodecSession final : public ServiceFramework<IVideoCodecSession> {
+public:
+    explicit IVideoCodecSession(Core::System& system, bool root)
+        : ServiceFramework{system, root ? "IVideoCodecRoot" : "IVideoCodecService"}, m_root{root},
+          m_context{system, "VideoCodec"} {}
+
+    ~IVideoCodecSession() override {
+        if (m_event) m_context.CloseEvent(m_event);
+    }
+
+    Result HandleSyncRequest(Kernel::KServerSession& session, HLERequestContext& ctx) override {
+        const auto guard = LockService();
+        static u32 logged{};
+        if (logged++ < 64) {
+            LOG_WARNING(Service_AM, "Video codec {} command {}, words={:08x}", m_root ? "root" : "service",
+                        ctx.GetCommand(), fmt::join(std::span<const u32>(ctx.CommandBuffer(), 8), ","));
+        }
+        if (m_root && ctx.GetCommand() == 1) {
+            Kernel::KClientSession* client{};
+            const Result result =
+                CreateGraphicsSession(system, ctx, std::make_shared<IVideoCodecSession>(system, false), &client);
+            IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+            rb.Push(result.raw);
+            ctx.AddMoveObject(client);
+        } else if (!m_root && ctx.GetCommand() == 3) {
+            if (!m_event) m_event = m_context.CreateEvent("VideoCodecEvent");
+            Kernel::KReadableEvent* readable{};
+            if (m_event) {
+                readable = &m_event->GetReadableEvent();
+                readable->Open(system.Kernel());
+            }
+            IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+            rb.Push(m_event ? ResultSuccess.raw : Kernel::ResultOutOfResource.raw);
+            ctx.AddMoveObject(readable);
+        } else {
+            if (m_event) m_event->Signal(system.Kernel());
+            IPC::ResponseBuilder rb{ctx, 6};
+            rb.Push(ResultSuccess.raw);
+            for (u32 i = 0; i < 4; ++i) rb.Push<u32>(0);
+        }
+        return system.IsPoweredOn() ? ctx.WriteToOutgoingCommandBuffer() : ResultSuccess;
+    }
+
+private:
+    const bool m_root;
+    KernelHelpers::ServiceContext m_context;
+    Kernel::KEvent* m_event{};
+};
+
 class ISyncpointSupervisor final : public ServiceFramework<ISyncpointSupervisor> {
 public:
     ISyncpointSupervisor(Core::System& system, std::shared_ptr<Nvidia::Module> module)
-        : ServiceFramework{system, "ISyncpointSupervisor"}, m_module{std::move(module)} {
+        : ServiceFramework{system, "ISyncpointSupervisor"}, m_module{std::move(module)},
+          m_context{system, "SyncpointSupervisor"} {
         static const FunctionInfo functions[] = {
             {1, &ISyncpointSupervisor::GetMaximumEventCount, "GetMaximumEventCount"},
             {21, &ISyncpointSupervisor::SetEventCount, "SetEventCount"},
+            {22, &ISyncpointSupervisor::GetEvent, "GetEvent"},
             {103, &ISyncpointSupervisor::QueryCounter, "QueryCounter"},
         };
         RegisterHandlersTipc(functions);
+    }
+    ~ISyncpointSupervisor() override {
+        for (auto* event : m_events) {
+            if (event) m_context.CloseEvent(event);
+        }
     }
 
     Result HandleSyncRequest(Kernel::KServerSession& session, HLERequestContext& ctx) override {
@@ -132,6 +193,27 @@ private:
         LOG_DEBUG(Service_AM, "syncpoint event count={}, result={:#x}", m_event_count, result.raw);
     }
 
+    // Handle of event `index` (below the count set with command 21). Used by the video decoder
+    // path; nothing signals these yet.
+    void GetEvent(HLERequestContext& ctx) {
+        const auto* packet = ctx.CommandBuffer();
+        Result result = Kernel::ResultInvalidCombination;
+        Kernel::KReadableEvent* readable{};
+        if (packet[0] == 0x26 && packet[1] == 1 && packet[2] < m_events.size()) {
+            auto*& event = m_events[packet[2]];
+            if (!event) event = m_context.CreateEvent("SyncpointSupervisorEvent");
+            result = event ? ResultSuccess : Kernel::ResultOutOfResource;
+            if (event) {
+                readable = &event->GetReadableEvent();
+                readable->Open(kernel);
+            }
+        }
+        LOG_DEBUG(Service_AM, "syncpoint event index={}, result={:#x}", packet[2], result.raw);
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(result.raw);
+        ctx.AddMoveObject(readable);
+    }
+
     void QueryCounter(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();
         Result result = Kernel::ResultInvalidCombination;
@@ -151,6 +233,8 @@ private:
 
     std::shared_ptr<Nvidia::Module> m_module;
     u32 m_event_count{};
+    KernelHelpers::ServiceContext m_context;
+    std::array<Kernel::KEvent*, MaximumEventCount + 1> m_events{};
 };
 
 class IVi2Session final : public ServiceFramework<IVi2Session> {
@@ -761,6 +845,12 @@ IGraphicsSupervisor::IGraphicsSupervisor(Core::System& system, Kernel::KProcess*
         {1101, &IGraphicsSupervisor::InitializeFrameContext, "InitializeFrameContext"},
         {1102, &IGraphicsSupervisor::InitializeFrameContext, "ActivateFrameContext"},
         {1402, &IGraphicsSupervisor::GetNvidiaDriver, "GetNvidiaDriver"},
+        {901, &IGraphicsSupervisor::UnknownQuery, "Unknown901"},
+        {902, &IGraphicsSupervisor::OpenVideoCodecRoot, "OpenVideoDecoderRoot"},
+        {905, &IGraphicsSupervisor::OpenVideoCodecRoot, "OpenVideoDecoderRootForSystem"},
+        {1001, &IGraphicsSupervisor::UnknownQuery, "Unknown1001"},
+        {1002, &IGraphicsSupervisor::OpenVideoCodecRoot, "OpenVideoEncoderRoot"},
+        {991, &IGraphicsSupervisor::CalculateDecoderImageRequirements, "CalculateDecoderImageRequirements"},
         {1501, &IGraphicsSupervisor::InitializeImageContext, "InitializeImageContext1501"},
         {435, &IGraphicsSupervisor::CalculateImageRequirements, "CalculateNativeImageSize"},
         {1510, &IGraphicsSupervisor::CalculateImageRequirements, "CalculateImageRequirements"},
@@ -799,10 +889,79 @@ Result IGraphicsSupervisor::HandleSyncRequest(Kernel::KServerSession& session,
     }
     const auto guard = LockService();
     InvokeRequestTipc(ctx);
-    // Unsupported TIPC must return an error instead of leaving request data as a reply.
-    IPC::ResponseBuilder rb{ctx, 2};
-    rb.Push(Kernel::ResultNotImplemented.raw);
+    // Unsupported TIPC must return a reply instead of leaving request data in place. With auto
+    // stubs enabled report success with zeroed output: the title aborts on an error here.
+    if (Settings::values.use_auto_stub) {
+        LOG_WARNING(Service_AM, "Graphics supervisor stubbed command {}, words={:08x}", ctx.GetCommand(),
+                    fmt::join(std::span<const u32>(ctx.CommandBuffer(), 8), ","));
+        IPC::ResponseBuilder rb{ctx, 6};
+        rb.Push(ResultSuccess.raw);
+        for (u32 i = 0; i < 4; ++i) rb.Push<u32>(0);
+    } else {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(Kernel::ResultNotImplemented.raw);
+    }
     return system.IsPoweredOn() ? ctx.WriteToOutgoingCommandBuffer() : ResultSuccess;
+}
+
+// Commands 901 and 1001 are issued by the video codec setup once gameplay starts; a failure makes
+// the title abort with 2001-0033. Report success until their meaning is known.
+void IGraphicsSupervisor::UnknownQuery(HLERequestContext& ctx) {
+    static u32 logged{};
+    if (logged++ < 12) {
+        LOG_WARNING(Service_AM, "Graphics supervisor command {}, words={:08x}", ctx.GetCommand(),
+                    fmt::join(std::span<const u32>(ctx.CommandBuffer(), 8), ","));
+    }
+    IPC::ResponseBuilder rb{ctx, 6};
+    rb.Push(ResultSuccess.raw);
+    rb.Push<u32>(0);
+    rb.Push<u32>(0);
+    rb.Push<u32>(0);
+    rb.Push<u32>(0);
+}
+
+void IGraphicsSupervisor::OpenVideoCodecRoot(HLERequestContext& ctx) {
+    Kernel::KClientSession* client{};
+    const Result result =
+        CreateGraphicsSession(system, ctx, std::make_shared<IVideoCodecSession>(system, true), &client);
+    LOG_WARNING(Service_AM, "Video codec root opened by command {}, result={:#x}", ctx.GetCommand(),
+                result.raw);
+    IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+    rb.Push(result.raw);
+    ctx.AddMoveObject(client);
+}
+
+// Video decoder image pool size (nn::codec::CalculateDecoderImagePoolBuffer). Same request shape
+// as 435/1510: a 16-word image preference (word 2 of it holds height - 1 << 16 | width - 1) and a
+// count; replies with size and alignment. Decoder formats the native image code does not know
+// fall back to NV12 (12 bits per pixel) per image.
+void IGraphicsSupervisor::CalculateDecoderImageRequirements(HLERequestContext& ctx) {
+    const auto* packet = ctx.CommandBuffer();
+    Result result = Kernel::ResultInvalidCombination;
+    u64 size{}, alignment{};
+    if (packet[0] == 0x3ef && packet[1] == 17) {
+        const u32 count = std::max<u32>(packet[18], 1);
+        std::optional<NativeImageRequirements> requirements;
+        if (m_phase == Phase::Ready && m_image_formats_initialized) {
+            requirements = CalculateNativeImageRequirements(std::span{packet + 2, 16}, count);
+        }
+        if (requirements) {
+            size = requirements->size;
+            alignment = requirements->alignment;
+        } else {
+            const u64 width = Common::AlignUp(u64{(packet[4] & 0xffff) + 1}, 256);
+            const u64 height = Common::AlignUp(u64{(packet[4] >> 16) + 1}, 64);
+            alignment = 0x10000;
+            size = Common::AlignUp(width * height * 3 / 2, alignment) * count;
+        }
+        result = ResultSuccess;
+    }
+    LOG_WARNING(Service_AM, "Decoder image requirements words={:08x}, size={:#x}, alignment={:#x}",
+                fmt::join(std::span<const u32>(packet + 2, 17), ","), size, alignment);
+    IPC::ResponseBuilder rb{ctx, 6};
+    rb.Push(result.raw);
+    rb.Push<u64>(size);
+    rb.Push<u64>(alignment);
 }
 
 void IGraphicsSupervisor::Initialize(HLERequestContext& ctx) {
