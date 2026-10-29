@@ -83,12 +83,43 @@ these fixes.
 3. Copy the MinGW runtime DLLs (Qt and its dependencies) next to `build/bin/eden.exe` and add a
    `build/bin/qt.conf` containing `[Paths]` / `Plugins = plugins` (see [docs/ns2/NOTES.md](docs/ns2/NOTES.md)).
 
+## Building (Linux)
+
+Not tested yet, but nothing in the changes is Windows-only (the open-file limit fix is behind
+`#ifdef _WIN32`), and the original NS2 patch was Linux-first.
+
+1. Install the dependencies for your distribution; [docs/Deps.md](docs/Deps.md) has full commands for
+   Arch, Debian/Ubuntu/Mint, Fedora, Gentoo and others. For example:
+
+   ```sh
+   # Arch
+   sudo pacman -Syu --needed base-devel boost catch2 cmake enet ffmpeg fmt git glslang libzip lz4 ninja \
+        nlohmann-json openssl opus qt6-base qt6-multimedia qt6-charts sdl3 zlib zstd zip unzip \
+        vulkan-headers vulkan-utility-libraries libusb spirv-tools spirv-headers
+   ```
+
+   Debian/Ubuntu needs Ubuntu 26.04, Mint 22.3 or Debian 13 or later; the `apt-get` line is in
+   [docs/Deps.md](docs/Deps.md).
+2. Configure and build from the repository root:
+
+   ```sh
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
+         -DENABLE_WERROR=OFF
+   ninja -C build yuzu
+   ```
+
+   If CMake cannot find a package your distribution doesn't ship (enet, libusb,
+   VulkanMemoryAllocator, ...), add the matching `-D<name>_FORCE_BUNDLED=ON` flag from the Windows
+   command above.
+3. The binary is `build/bin/eden`; no DLL copying is needed.
+
 ## Running
 
 You need your own legally dumped game, keys and firmware. The game is loaded from an extracted dump:
 
 ```sh
-build/bin/eden.exe -g "<dump>/updates/458752/exefs/main"
+build/bin/eden.exe -g "<dump>/updates/458752/exefs/main"   # Windows
+build/bin/eden -g "<dump>/updates/458752/exefs/main"       # Linux
 ```
 
 Settings used: Vulkan, 12 GB memory layout (`memory_layout_mode=4`), GPU accuracy High.
