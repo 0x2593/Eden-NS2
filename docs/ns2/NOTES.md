@@ -1,0 +1,147 @@
+# Eden + NS2 patch — work log
+
+Goal: Eden (yuzu fork) with the Switch 2 support patch `NS2_old.patch`, built on Windows, running
+Donkey Kong Bananza (title 040074A01BF12000, update v7.0.0 = `458752`) to its main menu.
+
+Tool output (screenshots, logs, dumps) goes to `tools/ns2/out/`, which is not committed.
+
+## Environment and decisions
+
+- Checkout: this folder, extracted from the master archive (no .git originally).
+- Local git repo created with a baseline commit `1ed3ddd` = pristine upstream master, so every change
+  is diffable/revertible.
+- Toolchain: no MSVC/Qt on this PC, MSYS2 was installed but empty. Chose MSYS2 MINGW64 (GCC 16.2,
+  CMake 4.4, Ninja, Qt 6.12 from pacman) because it is the fastest supported route.
+  - pacman mirrors rate-limited (HTTP 429); retried in a loop. enet/libusb/VMA are not packaged:
+    forced CPM bundled copies (`-Denet_FORCE_BUNDLED=ON -Dlibusb_FORCE_BUNDLED=ON
+    -DVulkanMemoryAllocator_FORCE_BUNDLED=ON`). Added ffmpeg + autotools packages.
+  - libusb's bundled autotools build fails under MSYS2 (aclocal path) -> `-DENABLE_LIBUSB=OFF`
+    (only GameCube-adapter passthrough is lost).
+- Configure: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+  -DYUZU_TESTS=OFF -DENABLE_WERROR=OFF -DYUZU_ROOM=OFF -DYUZU_CMD=OFF ... -DENABLE_LIBUSB=OFF`.
+- Build: `ninja yuzu` inside `build/` from an MSYS2 MINGW64 shell -> `build/bin/eden.exe`.
+- Runtime deps: copied MinGW DLLs next to eden.exe (incl. Qt's own deps: icu, pcre2-16, md4c,
+  double-conversion, b2) and wrote `build/bin/qt.conf` (`Plugins = plugins`) — without it Qt
+  reported "no Qt platform plugin".
+- Game launch: `build/bin/eden.exe -g "<DK>\updates\458752\exefs\main"` (update romfs is the full
+  merged romfs; the base game v1.0 fails at its first AM call with proxy flags=0x2, not pursued).
+
+## Eden config (%APPDATA%\eden\config\qt-config.ini)
+
+User-requested: `memory_layout_mode=4` (12 GB), `use_multi_core=false`, `backend=1` (Vulkan).
+Debug settings added: `use_auto_stub=true`, `rng_seed_enabled=true`/`rng_seed=0`
+(fixed load addresses: rtld 0x80000000, main 0x80020000, sdk 0x82830000), `log_filter="*:Info"`,
+`use_gdbstub=false` (was toggled on for GDB sessions).
+
+## Patch application
+
+`git apply --reject`: 152/154 files clean; 2 hunks hand-merged (context drift only):
+- `src/core/hle/service/service.cpp`: added `<limits>` and `k_thread.h` includes.
+- `src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`: `native_turing` early-return in
+  `BuiltPipeline`.
+
+## Fixes made on top of the patch (chronological)
+
+Each was found from the Eden log, GDB (Eden's gdbstub + gdb-multiarch) and disassembly of the
+game's `sdk` NSO (capstone; symbols from its dynsym/PLT).
+
+1. VI2 cmd 31: returns an event handle (game expected a handle; got 2001-0114 InvalidHandle).
+2. Unknown VI2/syncpoint commands honor `use_auto_stub` instead of always NotImplemented.
+3. `native_image_layout.h`: image size scaled by preference words 6/7 (layer/mip count).
+4. IGpuWorker cmd 214: unbacked (sparse) VA reservation; signals notification, returns kind.
+5. GameShare `GetRequiredMemorySize`: accept mode 0 (was HIPC NotSupported -> abort 2011-0001).
+6. Subcontexts: NvRm only allowed 1 subcontext per TSG, so the game's 2nd subcontext queue failed
+   `nvnQueueInitialize` (ignored by the game -> null command buffer -> crash). Root cause traced
+   with GDB to `count = (flags bit22 && TSG ioctl level > 0xa) ? characteristics[0xb4] : 1`.
+   Fixed in `native_gpu_characteristics.h` (flag bit 22, VEIDs=64 at 0xb4, TSG level 0xb) and
+   `nvhost_tsg_gpu.cpp` (TSG ioctl 0xb BIND_CHANNEL_EX + no-op 3..10).
+7. Shader capture stops at the end of a mapped pool instead of throwing.
+8. Failed native draws/shaders/compute/MME no longer poison the channel (DmaPusher halted forever
+   and fences never signaled -> game freeze). Failing work is skipped, completion still signals.
+9. Failed native shaders/compute programs are cached and skipped (was re-capturing 44k
+   instructions per draw).
+10. QMD scheduler: a rejected compute dispatch still performs its semaphore releases and
+    dependent QMDs (channel 1 was stuck waiting on a semaphore 70 -> 210).
+11. Ampere->Maxwell shader lowering additions: UMOV from URZ, UISETP signed (bit 73 -> bit 48),
+    MUFU UR/imm forms, FFMA UR form, R2P byte select, STG 64/128-bit, new LDG (0x381/0x981),
+    predicated CALL.REL.NOINC loop exit without BSYNC.
+12. Turing MME: EXTENDED 0x1000/1 = load barrier; `MME_DMA_READ_FIFOED` (methods 0x154/0x155/
+    0x158) now reads guest memory into the macro parameter FIFO. MME failures went 4898 -> 0.
+13. Native macros deferred until a non-argument method arrives (harmless, kept).
+14. Diagnostics: failing shader instruction + neighbors logged; audio BehaviorInfo values logged.
+
+## Status at 2026-10-28 19:30
+
+- Game boots, all 5 GPU channels/queues create, game loop runs, ~190 frames presented per run,
+  Eden FPS counter shows ~4 FPS, screen is BLACK.
+- 86 native shaders lower OK; 5 still fail (texture forms 0xb60 cube-LOD/descriptor, 0xb63,
+  0x526, predicate LUT). ~500 draws per run are skipped.
+- Audio renderer rejects every update (BehaviorInfo, error 0x29) — not yet investigated.
+
+## Later log
+
+- 19:31 Screenshot capture tool `tools/ns2/screenshot.ps1` verified (desktop capture readable).
+
+## Second round of fixes (2026-10-28, from 20:30)
+
+Fixes, in order (each verified with tools/ns2/run.ps1; logs in tools/ns2/out/dumps/log-<tag>.txt):
+
+15. Audio renderer: per-update BehaviorInfo magic is "Rev?" (bit 21 set) on the new SDK, init uses
+    "REV?". Compare revision numbers, not raw magics. Removed ~600k error lines/run (6% -> 38% speed).
+16. Shader lowering: PLOP3 copy from any UPn (bit 6-n of R239), TEX 3D 1-2 component (TEXS 3D/3D.LZ),
+    non-scalar TEX ARRAY_CUBE.LL (bit 60 = "scalar"; non-scalar layout {layer,x,y,z}+{lod} per Mesa
+    NAK), TLD4 2D -> TLD4S, IPA with multiplier register (0x526 -> Maxwell IPA.MULTIPLY), generic RED
+    (0x98e, all ops/types), SHF.R low word with RZ high word. 0 lowering failures / skipped draws.
+17. Hang at ~40s: compute macro data RAM (MME DRAM) was shared by every channel of the TSG, so
+    channel 2's QMD-ring state was clobbered by channel 3 and its sync object never reached 4.
+    KeplerCompute now owns its own TuringMacroInterpreter (code stays shared).
+18. Black screen: GPU command 214 reserves the VA ranges where the SDK places render targets
+    (6 x 200 MB at 0x81_0249_0000+). They were left unbacked, so every RT there had no device
+    address and all clears/draws went nowhere. 214 now allocates a page group, maps it Insecure in
+    the alias-code region (outside heap/alias), wraps it in an nvmap handle and maps it at the VA.
+    RESULT: first visible UI frames, 60 FPS. Screenshot: docs/ns2/screenshots/first-ui-frame.png
+    Text glyphs render as solid blocks (font texture sampling still wrong).
+
+Diagnostics added (all opt-in env vars): EDEN_NATIVE_FRAME_STATS (draws/clears/dispatches/targets per
+30 displays), EDEN_NATIVE_SUBMIT_TRACE (every GPFIFO submit), EDEN_NATIVE_DISPLAY_OVERRIDE=<hex DAddr>
+(present any RT), trace event 13 (compute macro calls), query trace now flushed (keeps the tail on hang).
+Tools (tools/ns2/): run.ps1 (build+run+capture without killing other processes), wincap.ps1 (PrintWindow
+capture), threadprof.ps1, rsp.py (GDB-remote client: dump guest threads/memory/disasm at a hang),
+pbdecode.py (pushbuffer decoder), setcfg.py (sets qt-config keys incl. the \default flag).
+Config note: multi-core CPU mode was used for most of the above.
+19. Text/icons drew as solid quads: TEX/TLD/TLD4 bit 79 is .F16 (results packed as half2 pairs, then
+    unpacked by HADD2.F32). The lowering ignored it and wrote 32-bit floats, so alpha read as huge.
+    Mapped to the Maxwell swizzled forms' precision bit (TEXS/TLDS: bit 59 = 1 means F32, so XOR it
+    off; TLD4S: bit 55 = 1 means F16).
+    RESULT (23:03): the game shows its mode-select menu - "Normal Mode / Assist Mode / The standard way
+    to play. / (+) Options" - at 60 FPS. Screenshot: docs/ns2/screenshots/mode-select-menu.png
+    Pressing A (keyboard C) on it moves on to a loading screen with tips.
+20. Loading after "Normal Mode" failed with "Too many open files": the VFS keeps up to 8192 host
+    files open, but this MinGW build links msvcrt.dll, whose _setmaxstdio caps at 2048. The VFS cache
+    now evicts below _getmaxstdio() - 256. Also rate-limited the per-dispatch "Native inline QMD"
+    warning and the per-frame puller MemOp errors (log spam).
+    Open issue: during the first load (~20 s after selecting Normal Mode) a SparseLargeVector page
+    fault ("likely a Dynarmic error") is followed by null-pointer accesses and a guest jump to 0.
+
+## State at 2026-10-28 23:45
+
+- Boots to the mode-select menu ("Normal Mode / Assist Mode / (+) Options") at 100% speed, 60 FPS,
+  in single-core mode (multi-core also works). Verified 6+ times.
+- Keyboard: A = C, B = X, + = M, - = N, left stick = W/A/S/D.
+- Selecting Normal Mode shows the loading screen ("Golden Bananas?!"), but ~15 s into loading a guest
+  thread dereferences null in a name-table lookup (main module, PC ~0x808DCDE4 / 0x80869E18,
+  caller 0x808DD84C), floods "Unmapped Read/Write", and later jumps to 0. Ruled out: open-file limit
+  (fixed), missing romfs files, page-pool exhaustion (no allocation failures), DMA/sync accuracy
+  settings, rejected compute shaders, stubbed service calls. Next step would be reverse engineering
+  what produced the empty table (EDEN_UNMAPPED_BACKTRACE=1 logs guest backtraces).
+- Tried and reverted: backing GPU command 214 from the system pool (starves HLE services, hangs).
+- Later narrowing of the load crash (via the GDB stub and breakpoints):
+  - The null object is an nn::vfx2 shader program; the crash is in the uniform-block lookup
+    (0x80869d40) called from the shader-binding init (0x808dd3fc), whose callers choose one of up
+    to three shader variants per effect (0x808e8200 / 0x808e82e0).
+  - Exactly one variant check fails, on the loader thread: 0x80869060 returns 3 at 0x80869684
+    because nvnProgramSetShaders returns false.
+  - The rejected call passes two stages whose GPU code addresses are 0x0 and 0x3600, i.e. raw
+    offsets: the memory pool holding that effect's shader code has GPU address 0. The game then
+    uses the uninitialised program and dereferences NULL.
+  - Next step: find which memory pool that is and why it never gets a GPU mapping.
