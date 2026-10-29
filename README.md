@@ -1,8 +1,7 @@
 # Eden NS2 — Donkey Kong Bananza progress build
 
 An experimental fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator,
-built on top of the community "Switch 2 support" patch
-([ShadyHero/Eden-NS2](https://github.com/ShadyHero/Eden-NS2)), with a set of fixes that get
+built on top of a community "Switch 2 support" patch, with a set of fixes that get
 **Donkey Kong Bananza** (title `040074A01BF12000`, update v7.0.0) from a black screen to its
 **mode-select menu at full speed (60 FPS) on Windows**.
 
@@ -129,7 +128,8 @@ Default keyboard: A = `C`, B = `X`, + = `M`, − = `N`, left stick = W/A/S/D.
 ## Credits and licence
 
 - [Eden](https://git.eden-emu.dev/eden-emu/eden) and the yuzu/Citra projects it derives from.
-- The Switch 2 support patch by ShadyHero ([Eden-NS2](https://github.com/ShadyHero/Eden-NS2)).
+- The Switch 2 support patch, by an unknown author; it was originally shared on a social media
+  account that has since been deleted.
 - Instruction encodings cross-checked against Mesa's NAK compiler (MIT).
 
 The code is licensed like Eden: **GPL-3.0-or-later** (see [LICENSE.txt](LICENSE.txt)).
