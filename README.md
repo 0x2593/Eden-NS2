@@ -3,7 +3,7 @@
 A fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator that runs
 Nintendo Switch 2 games.
 
-![Donkey Kong Bananza gameplay](docs/ns2/screenshots/bananza-gameplay.png)
+![Donkey Kong Bananza gameplay](docs/ns2/screenshots/bananza-ingame.png)
 
 ![Mario Kart World title screen](docs/ns2/screenshots/mario-kart-world-title.png)
 
