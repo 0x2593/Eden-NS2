@@ -1,0 +1,27 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Configure Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Build with MSVC Script
+      run: |
+        call build-eden-msvc.bat
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Eden-NS2-Windows
+        path: build/bin/
