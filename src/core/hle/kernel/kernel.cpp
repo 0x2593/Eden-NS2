@@ -23,6 +23,7 @@
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/device_memory.h"
 #include "core/cpu_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/init/init_slab_setup.h"
@@ -138,8 +139,20 @@ struct KernelCore::Impl {
         CloseServices();
 
         if (application_process) {
+            // A process still referenced here is never finalized, so its memory stays mapped in
+            // the fastmem arena and the next game's mappings at the same addresses fail (it runs
+            // on the old game's memory and crashes or hangs at boot). Detach the process from the
+            // arena, so a late finalize can't unmap the next game's memory, and clear the arena.
+            const u32 references = application_process->GetReferenceCount();
+            application_process->GetPageTable().GetImpl().fastmem_arena = nullptr;
             application_process->Close(system.Kernel());
             application_process = nullptr;
+            if (references > 1) {
+                LOG_WARNING(Kernel, "Application process still had {} references at shutdown",
+                            references);
+            }
+            auto& arena = system.DeviceMemory().buffer;
+            arena.Unmap(0, arena.VirtualSize(), false);
         }
 
         next_object_id = 0;

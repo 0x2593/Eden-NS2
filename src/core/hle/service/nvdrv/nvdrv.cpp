@@ -32,6 +32,7 @@
 #include "core/hle/service/server_manager.h"
 #include "frontend_common/firmware_manager.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2.h"
 
 namespace Service::Nvidia {
 
@@ -127,6 +128,10 @@ void LoopProcess(Core::System& system) {
 
 Module::Module(Core::System& system)
     : container{system.Host1x()}, service_context{system, "nvdrv"}, events_interface{*this} {
+    // Switch 2 GPU flags are globals and belong to one emulation session: a game started after
+    // another in the same window inherited them.
+    Tegra::g_nx2_ampere = false;
+    Tegra::g_native_channels = false;
     builders["/dev/nvhost-as-gpu"] = [this, &system](DeviceFD fd) {
         auto device = std::make_shared<Devices::nvhost_as_gpu>(system, *this, container);
         return open_files.emplace(fd, std::move(device)).first;

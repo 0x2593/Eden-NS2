@@ -195,8 +195,9 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
 }
 
 u64 DynarmicCallbacks64::GetCNTPCT() {
+    const bool native_abi = m_process && m_process->UsesPAuthReturns();
     const u64 ticks = Timing::GetGuestCounterTicks(m_parent.m_system.CoreTiming().GetClockTicks(),
-                                                   m_process && m_process->UsesPAuthReturns());
+                                                   native_abi);
     // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
     // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
     // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
@@ -206,7 +207,9 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
         const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
         return value == nullptr || value[0] != '0';
     }();
-    if (pause_spins && ticks - m_last_cntpct < 32) {
+    // ~1.7 us in guest ticks: 32 at 19.2 MHz, 52 at the Switch 2's 31.25 MHz.
+    const u64 spin_ticks = Timing::GetGuestCounterFrequency(native_abi) / 600'000;
+    if (pause_spins && ticks - m_last_cntpct < spin_ticks) {
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();

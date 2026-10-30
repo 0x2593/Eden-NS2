@@ -104,6 +104,9 @@ struct ImageBase {
     std::vector<u32> partial_dirty_pages;
     /// Byte ranges (from the image start) whose GPU mapping changed; re-uploaded like the pages.
     std::vector<std::pair<u64, u64>> partial_remapped;
+    /// Large GPU-decoded arrays: one bit per layer the CPU wrote since the last upload while the
+    /// image stays tracked (CpuModified). Empty while CpuModified means the whole image.
+    std::vector<u64> dirty_layers;
     u64 scale_tick = 0;
     bool has_scaled = false;
 

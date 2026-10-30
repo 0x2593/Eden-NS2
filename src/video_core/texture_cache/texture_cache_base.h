@@ -128,6 +128,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
     u64 async_decodes_queued{};
     u64 images_created{};
+    u64 images_uploaded{}; ///< Image contents uploaded from guest memory
+    u64 uploaded_bytes{};  ///< Guest bytes those uploads read
+    u64 largest_upload{};  ///< Largest of them
+    u64 layer_uploads{};   ///< Of them, uploads of only the written layers of an array
     bool native_thresholds_applied{};
     u64 native_critical_memory{};
     u64 native_expected_memory{};
@@ -410,6 +414,19 @@ private:
 
     /// Uploads a large plain 2D image in chunks; false if it does not qualify.
     bool UploadInChunks(Image& image);
+
+    static constexpr u32 LayerUploadMinSize = 64U << 20;
+    static constexpr size_t LargeScratchCapacity = 64U << 20;
+
+    /// Large GPU-decoded ASTC arrays, whose refresh can decode only the layers written since the
+    /// last one (the image stays tracked meanwhile).
+    [[nodiscard]] bool UploadsByLayer(const Image& image) const noexcept;
+
+    /// Records the layers a CPU write of [cpu_addr, +size) touches.
+    void MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size);
+
+    /// Uploads the image's dirty layers. False when it needs a whole upload instead.
+    bool UploadWrittenLayers(Image& image);
 
     /// Records a GPU remap of a small part of a large 2D image for a partial re-upload instead of
     /// marking the whole image remapped (which replaces it). False if the image does not qualify.

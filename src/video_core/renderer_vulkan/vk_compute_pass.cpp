@@ -583,6 +583,24 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
                  swizzles);
 }
 
+void ASTCDecoderPass::AssembleLayers(Image& image, const StagingBufferRef& map,
+                                     std::span<const VideoCommon::SwizzleParameters> swizzles,
+                                     std::span<const u32> layers) {
+    const Target target{
+        .image = image.Handle(),
+        .aspect_mask = image.AspectMask(),
+        .initialized = image.ExchangeInitialization(),
+        .level_view = [&image](s32 host_level) { return image.StorageImageView(host_level); },
+        .wait = true,
+        .layers = layers,
+        .layer_view = [&image](s32 host_level, u32 layer) {
+            return image.StorageImageLayerView(host_level, layer);
+        },
+    };
+    AssembleInto(image.info, image.host_level_offset, image.guest_size_bytes, target, map,
+                 swizzles);
+}
+
 void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                                    size_t guest_size_bytes, const Target& target,
                                    const StagingBufferRef& map,
@@ -632,17 +650,9 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     const size_t input_size = skip != 0 ? size_t{input_layer_stride} * info.resources.layers
                                         : guest_size_bytes;
     for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
-        const size_t input_offset = swizzle.buffer_offset + map.offset;
         const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
         const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
-        const u32 num_dispatches_z = info.resources.layers;
-
-        compute_pass_descriptor_queue.Acquire(scheduler, 2);
-        compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset,
-                                                input_size - swizzle.buffer_offset);
-        compute_pass_descriptor_queue.AddImage(
-            target.level_view(swizzle.level - static_cast<s32>(skip)));
-        const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+        const s32 host_level = swizzle.level - static_cast<s32>(skip);
 
         // To unswizzle the ASTC data
         auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
@@ -650,23 +660,41 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         ASSERT(params.origin == (std::array<u32, 3>{0, 0, 0}));
         ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
         ASSERT(params.bytes_per_block_log2 == 4);
-        scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
-                          params, descriptor_data](vk::CommandBuffer cmdbuf) {
-            const AstcPushConstants uniforms{
-                .blocks_dims = block_dims,
-                .layer_stride = params.layer_stride,
-                .block_size = params.block_size,
-                .x_shift = params.x_shift,
-                .block_height = params.block_height,
-                .block_height_mask = params.block_height_mask,
-                .native_tiling = params.native_tiling,
-            };
-            const VkDescriptorSet set = descriptor_allocator.Commit();
-            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
-            cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
-            cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
-        });
+
+        // Only some layers: the input holds them one after another, each decoded by its own
+        // dispatch into a view of its layer. Otherwise one dispatch covers every layer.
+        const size_t num_inputs = target.layers.empty() ? 1 : target.layers.size();
+        for (size_t i = 0; i < num_inputs; ++i) {
+            const bool all_layers = target.layers.empty();
+            const size_t input_offset = map.offset + i * input_layer_stride + swizzle.buffer_offset;
+            const size_t input_range = (all_layers ? input_size : input_layer_stride) - swizzle.buffer_offset;
+            const u32 num_dispatches_z = all_layers ? static_cast<u32>(info.resources.layers) : 1U;
+
+            compute_pass_descriptor_queue.Acquire(scheduler, 2);
+            compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset, input_range);
+            compute_pass_descriptor_queue.AddImage(all_layers
+                                                       ? target.level_view(host_level)
+                                                       : target.layer_view(host_level, target.layers[i]));
+            const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+
+            scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
+                              params, descriptor_data](vk::CommandBuffer cmdbuf) {
+                const AstcPushConstants uniforms{
+                    .blocks_dims = block_dims,
+                    .layer_stride = params.layer_stride,
+                    .block_size = params.block_size,
+                    .x_shift = params.x_shift,
+                    .block_height = params.block_height,
+                    .block_height_mask = params.block_height_mask,
+                    .native_tiling = params.native_tiling,
+                };
+                const VkDescriptorSet set = descriptor_allocator.Commit();
+                device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+                cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
+                cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
+            });
+        }
     }
     scheduler.Record([vk_image, aspect_mask](vk::CommandBuffer cmdbuf) {
         const VkImageMemoryBarrier image_barrier{

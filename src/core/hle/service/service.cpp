@@ -24,6 +24,7 @@
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/sm/sm.h"
+#include "core/hle/service/switch2_stub_interface.h"
 #include "core/reporter.h"
 
 namespace Service {
@@ -143,6 +144,15 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
                                                        const FunctionInfoBase* info) {
     auto cmd_buf = ctx.CommandBuffer();
     std::string function_name = info == nullptr ? "<unknown>" : info->name;
+
+    if (std::string_view{service_name}.starts_with(Switch2StubPrefix)) {
+        // A placeholder for Switch 2 IPC Eden does not implement: every command succeeds.
+        LOG_WARNING(Service, "(STUBBED) {} command {} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x}",
+                    service_name, ctx.GetCommand(), cmd_buf[1], cmd_buf[2], cmd_buf[3], cmd_buf[4]);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+        return;
+    }
 
     fmt::memory_buffer buf;
     fmt::format_to(std::back_inserter(buf), "function '{}({})': port='{}' cmd_buf={{[0]={:#x}", ctx.GetCommand(), function_name, service_name, cmd_buf[0]);

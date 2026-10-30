@@ -6,6 +6,7 @@
 
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/guest_clock.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
@@ -221,7 +222,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             out_ticks = core_timing.GetClockTicks() - prev_ctx_ticks;
         }
 
-        *result = out_ticks;
+        // In guest counter ticks, like svcGetSystemTick (31.25 MHz for Switch 2 programs).
+        *result = Core::Timing::GetGuestCounterTicks(
+            out_ticks, GetCurrentProcess(system.Kernel()).UsesPAuthReturns());
         R_SUCCEED();
     }
     case InfoType::IdleTickCount: {
@@ -235,7 +238,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         R_UNLESS(handle == InvalidHandle, ResultInvalidHandle);
 
         // Get the idle tick count.
-        *result = system.Kernel().CurrentScheduler()->GetIdleThread()->GetCpuTime();
+        *result = Core::Timing::GetGuestCounterTicks(
+            system.Kernel().CurrentScheduler()->GetIdleThread()->GetCpuTime(),
+            GetCurrentProcess(system.Kernel()).UsesPAuthReturns());
         R_SUCCEED();
     }
     case InfoType::Unknown37:

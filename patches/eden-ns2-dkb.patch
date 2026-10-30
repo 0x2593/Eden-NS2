@@ -1406,6 +1406,22 @@ index a88eae9..a8fbcf9 100644
          return Service::Audio::ResultInvalidUpdateInfo;
      }
  
+diff --git a/src/audio_core/renderer/system.cpp b/src/audio_core/renderer/system.cpp
+index b7675ff..2e3e741 100644
+--- a/src/audio_core/renderer/system.cpp
++++ b/src/audio_core/renderer/system.cpp
+@@ -444,7 +444,10 @@ void System::Stop() {
+     }
+ 
+     if (execution_mode == ExecutionMode::Auto) {
+-        terminate_event.Wait();
++        // The system manager thread signals this; it may already be gone during shutdown.
++        if (!terminate_event.WaitFor(std::chrono::seconds(1))) {
++            LOG_WARNING(Service_Audio, "Timed out waiting for the renderer to terminate");
++        }
+     }
+ }
+ 
 diff --git a/src/audio_core/sink/sink_stream.cpp b/src/audio_core/sink/sink_stream.cpp
 index c70020e..9dfd3bf 100644
 --- a/src/audio_core/sink/sink_stream.cpp
@@ -1553,6 +1569,21 @@ index 8ccb684..52fd003 100644
      if (max_std_fn >= 0x16) {
          __cpuid(cpu_id, 0x16);
          caps.base_frequency = cpu_id[0];
+diff --git a/src/common/host_memory.h b/src/common/host_memory.h
+index a7fd053..8747a18 100644
+--- a/src/common/host_memory.h
++++ b/src/common/host_memory.h
+@@ -68,6 +68,10 @@ public:
+         return virtual_base;
+     }
+ 
++    [[nodiscard]] size_t VirtualSize() const noexcept {
++        return virtual_size;
++    }
++
+     bool IsInVirtualRange(void* address) const noexcept {
+         return address >= virtual_base && address < virtual_base + virtual_size;
+     }
 diff --git a/src/common/range_sets.h b/src/common/range_sets.h
 index f8fcee4..e5cb53b 100644
 --- a/src/common/range_sets.h
@@ -1634,6 +1665,24 @@ index 3edd8c8..aeda7bc 100644
  template <typename AddressType>
  template <typename Func>
  void RangeSet<AddressType>::ForEach(Func&& func) const {
+diff --git a/src/common/scratch_buffer.h b/src/common/scratch_buffer.h
+index 929a656..cad1506 100644
+--- a/src/common/scratch_buffer.h
++++ b/src/common/scratch_buffer.h
+@@ -122,6 +122,13 @@ public:
+         return buffer_capacity;
+     }
+ 
++    /// Frees the buffer; the next resize allocates it again.
++    void release() noexcept {
++        buffer.reset();
++        buffer_capacity = 0;
++        last_requested_size = 0;
++    }
++
+     void swap(ScratchBuffer& other) noexcept {
+         std::swap(last_requested_size, other.last_requested_size);
+         std::swap(buffer_capacity, other.buffer_capacity);
 diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
 index eee8ff6..b963409 100644
 --- a/src/common/sparse_large_vector.cpp
@@ -1773,7 +1822,7 @@ index 5e0e4d9..a298c6f 100644
  namespace Common::Compression {
  
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index 1b578f6..c5c4011 100644
+index 1b578f6..951347f 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
 @@ -347,6 +347,10 @@ add_library(core STATIC
@@ -1818,7 +1867,15 @@ index 1b578f6..c5c4011 100644
      hle/service/nvdrv/devices/nvhost_nvdec.cpp
      hle/service/nvdrv/devices/nvhost_nvdec.h
      hle/service/nvdrv/devices/nvhost_nvdec_common.cpp
-@@ -1178,6 +1199,8 @@ endif()
+@@ -1033,6 +1054,7 @@ add_library(core STATIC
+     hle/service/server_manager.h
+     hle/service/service.cpp
+     hle/service/service.h
++    hle/service/switch2_stub_interface.h
+     hle/service/services.cpp
+     hle/service/services.h
+     hle/service/set/factory_settings_server.cpp
+@@ -1178,6 +1200,8 @@ endif()
  
  if (WIN32)
      target_compile_definitions(core PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
@@ -1827,7 +1884,7 @@ index 1b578f6..c5c4011 100644
  
      if(TARGET iw)
          target_link_libraries(core PRIVATE iw)
-@@ -1217,7 +1240,11 @@ else()
+@@ -1217,7 +1241,11 @@ else()
      target_link_libraries(core PUBLIC Boost::headers)
  endif()
  
@@ -1854,7 +1911,7 @@ index a59aa3c..f6523ba 100644
      amortized_ticks = std::max<u64>(amortized_ticks, 1);
      m_parent.m_system.CoreTiming().AddTicks(amortized_ticks);
 diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
-index 894857a..14f36e4 100644
+index 894857a..0ec3f6b 100644
 --- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
 +++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
 @@ -4,11 +4,18 @@
@@ -1975,13 +2032,14 @@ index 894857a..14f36e4 100644
      // Always execute at least one tick.
      amortized_ticks = std::max<u64>(amortized_ticks, 1);
      m_parent.m_system.CoreTiming().AddTicks(amortized_ticks);
-@@ -154,7 +195,27 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
+@@ -154,7 +195,30 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
  }
  
  u64 DynarmicCallbacks64::GetCNTPCT() {
 -    return m_parent.m_system.CoreTiming().GetClockTicks();
++    const bool native_abi = m_process && m_process->UsesPAuthReturns();
 +    const u64 ticks = Timing::GetGuestCounterTicks(m_parent.m_system.CoreTiming().GetClockTicks(),
-+                                                   m_process && m_process->UsesPAuthReturns());
++                                                   native_abi);
 +    // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
 +    // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
 +    // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
@@ -1991,7 +2049,9 @@ index 894857a..14f36e4 100644
 +        const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
 +        return value == nullptr || value[0] != '0';
 +    }();
-+    if (pause_spins && ticks - m_last_cntpct < 32) {
++    // ~1.7 us in guest ticks: 32 at 19.2 MHz, 52 at the Switch 2's 31.25 MHz.
++    const u64 spin_ticks = Timing::GetGuestCounterFrequency(native_abi) / 600'000;
++    if (pause_spins && ticks - m_last_cntpct < spin_ticks) {
 +#if defined(_M_X64) || defined(__x86_64__)
 +        _mm_pause();
 +        _mm_pause();
@@ -2004,7 +2064,7 @@ index 894857a..14f36e4 100644
  }
  
  bool DynarmicCallbacks64::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
-@@ -194,6 +255,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+@@ -194,6 +258,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
  
      // Callbacks
      config.callbacks = std::addressof(*m_cb);
@@ -2012,7 +2072,7 @@ index 894857a..14f36e4 100644
  
      // Memory
      if (page_table) {
-@@ -234,7 +296,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+@@ -234,7 +299,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
      config.tpidr_el0 = &m_cb->m_tpidr_el0;
      config.dczid_el0 = 4;
      config.ctr_el0 = 0x8444c004;
@@ -2021,7 +2081,7 @@ index 894857a..14f36e4 100644
  
      // Unpredictable instructions
      config.define_unpredictable_behaviour = true;
-@@ -345,6 +407,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+@@ -345,6 +410,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
          config.fastmem_pointer = std::nullopt;
          config.fastmem_exclusive_access = false;
      }
@@ -2033,7 +2093,7 @@ index 894857a..14f36e4 100644
      m_jit.emplace(config);
  }
  
-@@ -444,6 +511,8 @@ void ArmDynarmic64::ClearInstructionCache() {
+@@ -444,6 +514,8 @@ void ArmDynarmic64::ClearInstructionCache() {
  }
  
  void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
@@ -2055,7 +2115,7 @@ index 5ea5dde..acd1fe7 100644
      const bool m_debugger_enabled{};
      const bool m_check_memory_access{};
 diff --git a/src/core/core.cpp b/src/core/core.cpp
-index 06543b0..f3d224b 100644
+index 06543b0..d2b262d 100644
 --- a/src/core/core.cpp
 +++ b/src/core/core.cpp
 @@ -24,6 +24,7 @@
@@ -2112,6 +2172,16 @@ index 06543b0..f3d224b 100644
          InitializeKernel(system);
  
          if (params.applet_type == Service::AM::AppletType::Application) {
+@@ -451,6 +477,9 @@ struct System::Impl {
+     }
+ 
+     PerfStatsResults GetAndResetPerfStats() {
++        if (!perf_stats) {
++            return {};
++        }
+         return perf_stats->GetAndResetStats(core_timing.GetGlobalTimeUs());
+     }
+ 
 diff --git a/src/core/core.h b/src/core/core.h
 index d88ed64..0276679 100644
 --- a/src/core/core.h
@@ -2134,6 +2204,26 @@ index d88ed64..0276679 100644
  class CpuManager;
  class Debugger;
  class DeviceMemory;
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index d2ee676..453d249 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -304,10 +304,14 @@ std::optional<s64> CoreTiming::Advance() {
+ 
+ void CoreTiming::Reset() {
+     paused = true;
++    // Request the stop before waking the thread: woken first, it could take the wake-up, see no
++    // stop request yet and wait on pause_event again, and the join below would hang.
++    if (timer_thread.joinable()) {
++        timer_thread.request_stop();
++    }
+     pause_event.Set();
+     event.Set();
+     if (timer_thread.joinable()) {
+-        timer_thread.request_stop();
+         timer_thread.join();
+     }
+     has_started = false;
 diff --git a/src/core/cpu_manager.cpp b/src/core/cpu_manager.cpp
 index 23d5ac3..9404388 100644
 --- a/src/core/cpu_manager.cpp
@@ -2271,7 +2361,7 @@ index b4b3b46..f441d0a 100644
      using CounterAtomicType = std::atomic_uint8_t;
      static constexpr size_t subentries = 8 / sizeof(CounterType);
 diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
-index 97c2706..8424c24 100644
+index 97c2706..8cb8625 100644
 --- a/src/core/device_memory_manager.inc
 +++ b/src/core/device_memory_manager.inc
 @@ -21,7 +21,9 @@
@@ -2369,15 +2459,46 @@ index 97c2706..8424c24 100644
              std::memcpy(dest_pointer, mem_ptr + page_offset, size);
              return;
          }
-@@ -449,6 +466,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
-                 current_vaddr, address, size);
+@@ -424,10 +441,13 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
+     WalkBlock(
+         address, size,
+         [&](size_t copy_amount, DAddr current_vaddr) {
+-            LOG_ERROR(
+-                HW_Memory,
+-                "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
+-                current_vaddr, address, size);
++            static std::atomic<u32> reported{};
++            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                LOG_ERROR(
++                    HW_Memory,
++                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
++                    current_vaddr, address, size);
++            }
+             std::memset(dest_pointer, 0, copy_amount);
+         },
+         [&](size_t copy_amount, const u8* const src_ptr) {
+@@ -443,12 +463,16 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
+     WalkBlock(
+         address, size,
+         [&](size_t copy_amount, DAddr current_vaddr) {
+-            LOG_ERROR(
+-                HW_Memory,
+-                "Unmapped Device WriteBlock @ {:#016x} (start address = {:#016x}, size = {})",
+-                current_vaddr, address, size);
++            static std::atomic<u32> reported{};
++            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                LOG_ERROR(
++                    HW_Memory,
++                    "Unmapped Device WriteBlock @ {:#016x} (start address = {:#016x}, size = {})",
++                    current_vaddr, address, size);
++            }
          },
          [&](size_t copy_amount, u8* const dst_ptr) {
 +            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
              std::memcpy(dst_ptr, src_pointer, copy_amount);
          },
          [&](const std::size_t copy_amount) {
-@@ -462,9 +480,10 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+@@ -462,9 +486,10 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
      const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
      if (size <= Memory::YUZU_PAGESIZE - page_offset) {
          const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -2391,7 +2512,7 @@ index 97c2706..8424c24 100644
                  return;
              }
          }
-@@ -473,8 +492,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+@@ -473,8 +498,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
          const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
          if (phys_addr != 0) {
              auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
@@ -2402,8 +2523,39 @@ index 97c2706..8424c24 100644
              std::memcpy(dest_pointer, mem_ptr + page_offset, size);
              return;
          }
-@@ -508,6 +527,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
-                 current_vaddr, address, size);
+@@ -482,10 +507,13 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+     WalkBlock(
+         address, size,
+         [&](size_t copy_amount, DAddr current_vaddr) {
+-            LOG_ERROR(
+-                HW_Memory,
+-                "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
+-                current_vaddr, address, size);
++            static std::atomic<u32> reported{};
++            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                LOG_ERROR(
++                    HW_Memory,
++                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
++                    current_vaddr, address, size);
++            }
+             std::memset(dest_pointer, 0, copy_amount);
+         },
+         [&](size_t copy_amount, const u8* const src_ptr) {
+@@ -502,12 +530,16 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
+     WalkBlock(
+         address, size,
+         [&](size_t copy_amount, DAddr current_vaddr) {
+-            LOG_ERROR(
+-                HW_Memory,
+-                "Unmapped Device WriteBlock @ {:#016x} (start address = {:#016x}, size = {})",
+-                current_vaddr, address, size);
++            static std::atomic<u32> reported{};
++            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                LOG_ERROR(
++                    HW_Memory,
++                    "Unmapped Device WriteBlock @ {:#016x} (start address = {:#016x}, size = {})",
++                    current_vaddr, address, size);
++            }
          },
          [&](size_t copy_amount, u8* const dst_ptr) {
 +            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
@@ -2574,7 +2726,7 @@ index 115e6d6..074c6f7 100644
      FileAccessControl acid_file_access{};
      FileAccessHeader aci_file_access{};
 diff --git a/src/core/file_sys/vfs/vfs_real.cpp b/src/core/file_sys/vfs/vfs_real.cpp
-index 14e0caa..cc5f7ff 100644
+index 14e0caa..5fa73bc 100644
 --- a/src/core/file_sys/vfs/vfs_real.cpp
 +++ b/src/core/file_sys/vfs/vfs_real.cpp
 @@ -6,6 +6,7 @@
@@ -2585,18 +2737,20 @@ index 14e0caa..cc5f7ff 100644
  #include <iterator>
  #include <utility>
  #include "common/assert.h"
-@@ -19,6 +20,10 @@
+@@ -19,6 +20,12 @@
  // For FileTimeStampRaw
  #include <sys/stat.h>
  
 +#ifdef _WIN32
 +#include <cstdio> // _getmaxstdio
++#else
++#include <sys/resource.h> // getrlimit
 +#endif
 +
  #ifdef _MSC_VER
  #define stat _stat64
  #endif
-@@ -33,7 +38,15 @@ namespace FS = Common::FS;
+@@ -33,7 +40,23 @@ namespace FS = Common::FS;
  
  namespace {
  
@@ -2607,13 +2761,21 @@ index 14e0caa..cc5f7ff 100644
 +    const size_t limit = static_cast<size_t>(_getmaxstdio());
 +    return std::min(size_t{8192}, limit > 64 ? limit - 64 : size_t{1});
 +#else
-+    return 8192;
++    // Below RLIMIT_NOFILE with room for files opened outside the VFS cache.
++    static const size_t limit = [] {
++        struct rlimit rl;
++        if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY) {
++            return size_t{8192};
++        }
++        return static_cast<size_t>(std::max<rlim_t>(rl.rlim_cur, 576) - 512);
++    }();
++    return std::min(size_t{8192}, limit);
 +#endif
 +}
  
  bool IsWithinRoot(std::string_view root, std::string_view full_path) {
      if (root.empty())
-@@ -251,7 +264,7 @@ void RealVfsFilesystem::DropReference(std::unique_ptr<FileReference>&& reference
+@@ -251,7 +274,7 @@ void RealVfsFilesystem::DropReference(std::unique_ptr<FileReference>&& reference
  }
  
  void RealVfsFilesystem::EvictSingleReferenceLocked() {
@@ -3764,10 +3926,18 @@ index b499bd4..66b74fe 100644
  
              // If we haven't disabled migration, perform an affinity change.
 diff --git a/src/core/hle/kernel/kernel.cpp b/src/core/hle/kernel/kernel.cpp
-index 4f1d849..b445a5c 100644
+index 4f1d849..bd34375 100644
 --- a/src/core/hle/kernel/kernel.cpp
 +++ b/src/core/hle/kernel/kernel.cpp
-@@ -120,13 +120,13 @@ struct KernelCore::Impl {
+@@ -23,6 +23,7 @@
+ #include "core/arm/exclusive_monitor.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
++#include "core/device_memory.h"
+ #include "core/cpu_manager.h"
+ #include "core/hardware_properties.h"
+ #include "core/hle/kernel/init/init_slab_setup.h"
+@@ -120,13 +121,13 @@ struct KernelCore::Impl {
      }
  
      void TerminateAllProcesses() {
@@ -3787,7 +3957,28 @@ index 4f1d849..b445a5c 100644
      }
  
      void Shutdown(KernelCore& kernel) {
-@@ -171,7 +171,7 @@ struct KernelCore::Impl {
+@@ -138,8 +139,20 @@ struct KernelCore::Impl {
+         CloseServices();
+ 
+         if (application_process) {
++            // A process still referenced here is never finalized, so its memory stays mapped in
++            // the fastmem arena and the next game's mappings at the same addresses fail (it runs
++            // on the old game's memory and crashes or hangs at boot). Detach the process from the
++            // arena, so a late finalize can't unmap the next game's memory, and clear the arena.
++            const u32 references = application_process->GetReferenceCount();
++            application_process->GetPageTable().GetImpl().fastmem_arena = nullptr;
+             application_process->Close(system.Kernel());
+             application_process = nullptr;
++            if (references > 1) {
++                LOG_WARNING(Kernel, "Application process still had {} references at shutdown",
++                            references);
++            }
++            auto& arena = system.DeviceMemory().buffer;
++            arena.Unmap(0, arena.VirtualSize(), false);
+         }
+ 
+         next_object_id = 0;
+@@ -171,7 +184,7 @@ struct KernelCore::Impl {
              schedulers[core_id].reset();
          }
  
@@ -3796,7 +3987,7 @@ index 4f1d849..b445a5c 100644
          next_host_thread_id = Core::Hardware::NUM_CPU_CORES;
  
          // Close kernel objects that were not freed on shutdown
-@@ -369,7 +369,7 @@ struct KernelCore::Impl {
+@@ -369,7 +382,7 @@ struct KernelCore::Impl {
          // This should only be called during core init.
          ASSERT(tls_data.host_thread_id == UINT8_MAX);
  
@@ -3805,7 +3996,7 @@ index 4f1d849..b445a5c 100644
          ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
          tls_data.host_thread_id = u8(core_id);
          return tls_data.host_thread_id;
-@@ -801,7 +801,7 @@ struct KernelCore::Impl {
+@@ -801,7 +814,7 @@ struct KernelCore::Impl {
  
      std::array<std::optional<Kernel::PhysicalCore>, Core::Hardware::NUM_CPU_CORES> cores;
  
@@ -3814,7 +4005,7 @@ index 4f1d849..b445a5c 100644
      std::atomic<u32> next_host_thread_id{Core::Hardware::NUM_CPU_CORES};
  
      // Kernel memory management
-@@ -944,7 +944,8 @@ const Kernel::PhysicalCore& KernelCore::PhysicalCore(std::size_t id) const {
+@@ -944,7 +957,8 @@ const Kernel::PhysicalCore& KernelCore::PhysicalCore(std::size_t id) const {
  size_t KernelCore::CurrentPhysicalCoreIndex() const {
      const u32 core_id = impl->GetCurrentHostThreadID();
      if (core_id >= Core::Hardware::NUM_CPU_CORES) {
@@ -4096,10 +4287,18 @@ index 356c1c1..ce8939b 100644
  void Call(Core::System& system, u32 imm);
  
 diff --git a/src/core/hle/kernel/svc/svc_info.cpp b/src/core/hle/kernel/svc/svc_info.cpp
-index 863bb58..1dab730 100644
+index 863bb58..489b037 100644
 --- a/src/core/hle/kernel/svc/svc_info.cpp
 +++ b/src/core/hle/kernel/svc/svc_info.cpp
-@@ -14,11 +14,32 @@
+@@ -6,6 +6,7 @@
+ 
+ #include "core/core.h"
+ #include "core/core_timing.h"
++#include "core/guest_clock.h"
+ #include "core/hle/kernel/k_memory_manager.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/k_resource_limit.h"
+@@ -14,11 +15,32 @@
  #include "core/hle/kernel/svc_version.h"
  
  namespace Kernel::Svc {
@@ -4132,7 +4331,7 @@ index 863bb58..1dab730 100644
      switch (info_id_type) {
      case InfoType::CoreMask:
      case InfoType::PriorityMask:
-@@ -80,9 +101,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
+@@ -80,9 +102,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
              R_SUCCEED();
          case InfoType::TotalMemorySize:
              *result = process->GetTotalUserPhysicalMemorySize(system.Kernel());
@@ -4144,7 +4343,7 @@ index 863bb58..1dab730 100644
              R_SUCCEED();
          case InfoType::SystemResourceSizeTotal:
              *result = process->GetTotalSystemResourceSize();
-@@ -98,9 +121,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
+@@ -98,9 +122,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
              R_SUCCEED();
          case InfoType::TotalNonSystemMemorySize:
              *result = process->GetTotalNonSystemUserPhysicalMemorySize(system.Kernel());
@@ -4156,7 +4355,7 @@ index 863bb58..1dab730 100644
              R_SUCCEED();
          case InfoType::IsApplication:
              *result = process->IsApplication();
-@@ -124,7 +149,8 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
+@@ -124,7 +150,8 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
          default:
              break;
          }
@@ -4166,7 +4365,7 @@ index 863bb58..1dab730 100644
          R_THROW(ResultInvalidEnumValue);
      }
      case InfoType::DebuggerAttached:
-@@ -165,7 +191,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
+@@ -165,7 +192,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
          }
      }
      case InfoType::ThreadTickCount: {
@@ -4177,7 +4376,29 @@ index 863bb58..1dab730 100644
          if (info_sub_id != 0xFFFFFFFFFFFFFFFF && info_sub_id >= num_cpus) {
              LOG_ERROR(Kernel_SVC, "Core count is out of range, expected {} but got {}", num_cpus, info_sub_id);
              R_THROW(ResultInvalidCombination);
-@@ -258,7 +286,8 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
+@@ -193,7 +222,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
+             out_ticks = core_timing.GetClockTicks() - prev_ctx_ticks;
+         }
+ 
+-        *result = out_ticks;
++        // In guest counter ticks, like svcGetSystemTick (31.25 MHz for Switch 2 programs).
++        *result = Core::Timing::GetGuestCounterTicks(
++            out_ticks, GetCurrentProcess(system.Kernel()).UsesPAuthReturns());
+         R_SUCCEED();
+     }
+     case InfoType::IdleTickCount: {
+@@ -207,7 +238,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
+         R_UNLESS(handle == InvalidHandle, ResultInvalidHandle);
+ 
+         // Get the idle tick count.
+-        *result = system.Kernel().CurrentScheduler()->GetIdleThread()->GetCpuTime();
++        *result = Core::Timing::GetGuestCounterTicks(
++            system.Kernel().CurrentScheduler()->GetIdleThread()->GetCpuTime(),
++            GetCurrentProcess(system.Kernel()).UsesPAuthReturns());
+         R_SUCCEED();
+     }
+     case InfoType::Unknown37:
+@@ -258,7 +291,8 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle
          R_SUCCEED();
      }
      default:
@@ -10655,6 +10876,86 @@ index f6c12fb..3d58656 100644
  };
  
  } // namespace Service::Audio
+diff --git a/src/core/hle/service/audio/audio_renderer.cpp b/src/core/hle/service/audio/audio_renderer.cpp
+index dd76544..49ca3c4 100644
+--- a/src/core/hle/service/audio/audio_renderer.cpp
++++ b/src/core/hle/service/audio/audio_renderer.cpp
+@@ -10,14 +10,14 @@
+ namespace Service::Audio {
+ using namespace AudioCore::Renderer;
+ 
+-IAudioRenderer::IAudioRenderer(Core::System& system_, Manager& manager_,
++IAudioRenderer::IAudioRenderer(Core::System& system_, std::shared_ptr<Manager> manager_,
+                                AudioCore::AudioRendererParameterInternal& params,
+                                Kernel::KTransferMemory* transfer_memory, u64 transfer_memory_size,
+                                Kernel::KProcess* process_handle_, u64 applet_resource_user_id,
+                                s32 session_id)
+     : ServiceFramework{system_, "IAudioRenderer"}, service_context{system_, "IAudioRenderer"},
+-      rendered_event{service_context.CreateEvent("IAudioRendererEvent")}, manager{manager_},
+-      impl{std::make_unique<Renderer>(system_, manager, rendered_event)}, process_handle{
++      rendered_event{service_context.CreateEvent("IAudioRendererEvent")}, manager{std::move(manager_)},
++      impl{std::make_unique<Renderer>(system_, *manager, rendered_event)}, process_handle{
+                                                                               process_handle_} {
+     // clang-format off
+     static const FunctionInfo functions[] = {
+diff --git a/src/core/hle/service/audio/audio_renderer.h b/src/core/hle/service/audio/audio_renderer.h
+index 7f4ea9a..d7fb1da 100644
+--- a/src/core/hle/service/audio/audio_renderer.h
++++ b/src/core/hle/service/audio/audio_renderer.h
+@@ -19,7 +19,7 @@ namespace Service::Audio {
+ 
+ class IAudioRenderer final : public ServiceFramework<IAudioRenderer> {
+ public:
+-    explicit IAudioRenderer(Core::System& system_, AudioCore::Renderer::Manager& manager_,
++    explicit IAudioRenderer(Core::System& system_, std::shared_ptr<AudioCore::Renderer::Manager> manager_,
+                             AudioCore::AudioRendererParameterInternal& params,
+                             Kernel::KTransferMemory* transfer_memory, u64 transfer_memory_size,
+                             Kernel::KProcess* process_handle_, u64 applet_resource_user_id,
+@@ -47,7 +47,8 @@ private:
+ 
+     KernelHelpers::ServiceContext service_context;
+     Kernel::KEvent* rendered_event;
+-    AudioCore::Renderer::Manager& manager;
++    // Keeps the manager alive for as long as this renderer session exists.
++    std::shared_ptr<AudioCore::Renderer::Manager> manager;
+     std::unique_ptr<AudioCore::Renderer::Renderer> impl;
+     Kernel::KProcess* process_handle;
+     Common::ScratchBuffer<u8> output_buffer;
+diff --git a/src/core/hle/service/audio/audio_renderer_manager.cpp b/src/core/hle/service/audio/audio_renderer_manager.cpp
+index 4756802..97d9f44 100644
+--- a/src/core/hle/service/audio/audio_renderer_manager.cpp
++++ b/src/core/hle/service/audio/audio_renderer_manager.cpp
+@@ -20,7 +20,7 @@ using namespace AudioCore::Renderer;
+ 
+ IAudioRendererManager::IAudioRendererManager(Core::System& system_)
+     : ServiceFramework{system_, "audren:u"}
+-    , impl(system_)
++    , impl(std::make_shared<AudioCore::Renderer::Manager>(system_))
+ {
+     // clang-format off
+     static const FunctionInfo functions[] = {
+@@ -64,7 +64,7 @@ Result IAudioRendererManager::OpenAudioRenderer(
+               impl->GetSessionCount());
+ 
+     *out_audio_renderer =
+-        std::make_shared<IAudioRenderer>(system, *impl, parameter, tmem_handle.Get(), tmem_size,
++        std::make_shared<IAudioRenderer>(system, impl, parameter, tmem_handle.Get(), tmem_size,
+                                          process_handle.Get(), aruid.pid, session_id);
+     R_SUCCEED();
+ }
+diff --git a/src/core/hle/service/audio/audio_renderer_manager.h b/src/core/hle/service/audio/audio_renderer_manager.h
+index fdce8b6..f23691d 100644
+--- a/src/core/hle/service/audio/audio_renderer_manager.h
++++ b/src/core/hle/service/audio/audio_renderer_manager.h
+@@ -33,7 +33,7 @@ private:
+     Result GetAudioDeviceServiceWithRevisionInfo(Out<SharedPointer<IAudioDevice>> out_audio_device,
+                                                  u32 revision, ClientAppletResourceUserId aruid);
+ 
+-    std::optional<AudioCore::Renderer::Manager> impl;
++    std::shared_ptr<AudioCore::Renderer::Manager> impl;
+     u32 num_audio_devices{0};
+ };
+ 
 diff --git a/src/core/hle/service/hid/hid_server.cpp b/src/core/hle/service/hid/hid_server.cpp
 index 9689bce..775a55d 100644
 --- a/src/core/hle/service/hid/hid_server.cpp
@@ -13262,7 +13563,7 @@ index 0000000..12adc24
 +
 +} // namespace Service::Nvidia::Devices
 diff --git a/src/core/hle/service/nvdrv/nvdrv.cpp b/src/core/hle/service/nvdrv/nvdrv.cpp
-index b252a2e..9873d07 100644
+index b252a2e..fa6952b 100644
 --- a/src/core/hle/service/nvdrv/nvdrv.cpp
 +++ b/src/core/hle/service/nvdrv/nvdrv.cpp
 @@ -18,6 +18,8 @@
@@ -13274,7 +13575,26 @@ index b252a2e..9873d07 100644
  #include "core/hle/service/nvdrv/devices/nvhost_nvdec.h"
  #include "core/hle/service/nvdrv/devices/nvhost_nvdec_common.h"
  #include "core/hle/service/nvdrv/devices/nvhost_nvjpg.h"
-@@ -133,6 +135,10 @@ Module::Module(Core::System& system)
+@@ -30,6 +32,7 @@
+ #include "core/hle/service/server_manager.h"
+ #include "frontend_common/firmware_manager.h"
+ #include "video_core/gpu.h"
++#include "video_core/nx2.h"
+ 
+ namespace Service::Nvidia {
+ 
+@@ -125,6 +128,10 @@ void LoopProcess(Core::System& system) {
+ 
+ Module::Module(Core::System& system)
+     : container{system.Host1x()}, service_context{system, "nvdrv"}, events_interface{*this} {
++    // Switch 2 GPU flags are globals and belong to one emulation session: a game started after
++    // another in the same window inherited them.
++    Tegra::g_nx2_ampere = false;
++    Tegra::g_native_channels = false;
+     builders["/dev/nvhost-as-gpu"] = [this, &system](DeviceFD fd) {
+         auto device = std::make_shared<Devices::nvhost_as_gpu>(system, *this, container);
+         return open_files.emplace(fd, std::move(device)).first;
+@@ -133,6 +140,10 @@ Module::Module(Core::System& system)
          auto device = std::make_shared<Devices::nvhost_gpu>(system, events_interface, container);
          return open_files.emplace(fd, std::move(device)).first;
      };
@@ -13285,7 +13605,7 @@ index b252a2e..9873d07 100644
      builders["/dev/nvhost-ctrl-gpu"] = [this, &system](DeviceFD fd) {
          auto device = std::make_shared<Devices::nvhost_ctrl_gpu>(system, events_interface);
          return open_files.emplace(fd, std::move(device)).first;
-@@ -163,7 +169,12 @@ Module::Module(Core::System& system)
+@@ -163,7 +174,12 @@ Module::Module(Core::System& system)
      };
  }
  
@@ -13299,7 +13619,7 @@ index b252a2e..9873d07 100644
  
  NvResult Module::VerifyFD(DeviceFD fd) const {
      if (fd < 0) {
-@@ -180,6 +191,12 @@ NvResult Module::VerifyFD(DeviceFD fd) const {
+@@ -180,6 +196,12 @@ NvResult Module::VerifyFD(DeviceFD fd) const {
  }
  
  DeviceFD Module::Open(const std::string& device_name, NvCore::SessionId session_id) {
@@ -13600,10 +13920,10 @@ index 335efa3..ac30e88 100644
          R_RETURN(m_ro->RegisterProcess(system.Kernel(), std::addressof(m_context_id), process.Get(), *client_pid));
      }
 diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
-index b4fe2b3..97a94e2 100644
+index b4fe2b3..56c6e3d 100644
 --- a/src/core/hle/service/service.cpp
 +++ b/src/core/hle/service/service.cpp
-@@ -4,12 +4,22 @@
+@@ -4,20 +4,104 @@
  // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
  // SPDX-License-Identifier: GPL-2.0-or-later
  
@@ -13626,7 +13946,9 @@ index b4fe2b3..97a94e2 100644
  #include "core/hle/kernel/kernel.h"
  #include "core/hle/service/ipc_helpers.h"
  #include "core/hle/service/service.h"
-@@ -18,6 +28,79 @@
+ #include "core/hle/service/sm/sm.h"
++#include "core/hle/service/switch2_stub_interface.h"
+ #include "core/reporter.h"
  
  namespace Service {
  
@@ -13706,7 +14028,22 @@ index b4fe2b3..97a94e2 100644
  /// @brief Creates a function string for logging, complete with the name (or header code, depending
  /// on what's passed in) the port name, and all the cmd_buf arguments.
  [[maybe_unused]] static std::string MakeFunctionString(std::string_view name, std::string_view port_name, const u32* cmd_buf) {
-@@ -67,6 +150,26 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
+@@ -61,12 +145,41 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
+     auto cmd_buf = ctx.CommandBuffer();
+     std::string function_name = info == nullptr ? "<unknown>" : info->name;
+ 
++    if (std::string_view{service_name}.starts_with(Switch2StubPrefix)) {
++        // A placeholder for Switch 2 IPC Eden does not implement: every command succeeds.
++        LOG_WARNING(Service, "(STUBBED) {} command {} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x}",
++                    service_name, ctx.GetCommand(), cmd_buf[1], cmd_buf[2], cmd_buf[3], cmd_buf[4]);
++        IPC::ResponseBuilder rb{ctx, 2};
++        rb.Push(ResultSuccess);
++        return;
++    }
++
+     fmt::memory_buffer buf;
+     fmt::format_to(std::back_inserter(buf), "function '{}({})': port='{}' cmd_buf={{[0]={:#x}", ctx.GetCommand(), function_name, service_name, cmd_buf[0]);
+     for (int i = 1; i <= 8; ++i)
          fmt::format_to(std::back_inserter(buf), ", [{}]={:#x}", i, cmd_buf[i]);
      buf.push_back('}');
  
@@ -13733,7 +14070,7 @@ index b4fe2b3..97a94e2 100644
      system.GetReporter().SaveUnimplementedFunctionReport(ctx, ctx.GetCommand(), function_name, service_name);
      UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
      if (Settings::values.use_auto_stub) {
-@@ -98,7 +201,9 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
+@@ -98,7 +211,9 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
  
  Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                 HLERequestContext& ctx) {
@@ -13766,6 +14103,81 @@ index 68b0d63..3b31b33 100644
  namespace FileSystem {
  class FileSystemController;
  }
+diff --git a/src/core/hle/service/sm/sm.cpp b/src/core/hle/service/sm/sm.cpp
+index c75c543..9eed247 100644
+--- a/src/core/hle/service/sm/sm.cpp
++++ b/src/core/hle/service/sm/sm.cpp
+@@ -11,14 +11,22 @@
+ #include "core/hle/kernel/k_client_port.h"
+ #include "core/hle/kernel/k_client_session.h"
+ #include "core/hle/kernel/k_port.h"
++#include "core/hle/kernel/k_process.h"
++#include "core/hle/kernel/k_resource_limit.h"
+ #include "core/hle/kernel/k_scoped_resource_reservation.h"
+ #include "core/hle/kernel/k_server_port.h"
++#include "core/hle/kernel/k_server_session.h"
++#include "core/hle/kernel/k_session.h"
++#include "core/hle/kernel/k_thread.h"
++#include "core/hle/kernel/kernel.h"
+ #include "core/hle/result.h"
+ #include "core/hle/service/cmif_types.h"
++#include "core/hle/service/hle_ipc.h"
+ #include "core/hle/service/ipc_helpers.h"
+ #include "core/hle/service/server_manager.h"
+ #include "core/hle/service/sm/sm.h"
+ #include "core/hle/service/sm/sm_controller.h"
++#include "core/hle/service/switch2_stub_interface.h"
+ 
+ namespace Service::SM {
+ 
+@@ -170,6 +178,30 @@ static std::string PopServiceName(IPC::RequestParser& rp) {
+     return result;
+ }
+ 
++namespace {
++
++// A session served by a placeholder interface named after the missing service, set up like a
++// session handed out by a service.
++Kernel::KClientSession* CreateStubSession(Core::System& system, HLERequestContext& ctx,
++                                          const std::string& name) {
++    auto& kernel = system.Kernel();
++    ASSERT(Kernel::GetCurrentProcess(kernel).GetResourceLimit()->Reserve(
++        kernel, Kernel::LimitableResource::SessionCountMax, 1));
++
++    auto* session = Kernel::KSession::Create(kernel);
++    session->Initialize(kernel, nullptr, 0);
++    Kernel::KSession::Register(kernel, session);
++
++    auto manager =
++        std::make_shared<SessionRequestManager>(kernel, ctx.GetManager()->GetServerManager());
++    manager->SetSessionHandler(std::make_shared<ISwitch2StubInterface>(
++        system, ISwitch2StubInterface::InternName(fmt::format("{}{}", Switch2StubPrefix, name))));
++    ctx.GetManager()->GetServerManager().RegisterSession(&session->GetServerSession(), manager);
++    return &session->GetClientSession();
++}
++
++} // namespace
++
+ Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLERequestContext& ctx) {
+     if (!ctx.GetManager()->GetIsInitializedForSm()) {
+         return Service::SM::ResultInvalidClient;
+@@ -187,6 +219,16 @@ Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLEReques
+     }
+ 
+     if (port_result != ResultSuccess) {
++        // Switch 2 programs also ask for services Eden does not have at all. Nothing ever
++        // registers those, so waiting would hang them for good: hand out a placeholder whose
++        // commands all succeed. (Eden's own services register before a game starts.)
++        const auto* const caller = ctx.GetThread().GetOwnerProcess();
++        if (caller != nullptr && caller->IsSwitch2()) {
++            LOG_WARNING(Service_SM, "(STUBBED) Switch 2 service {} does not exist, returning a stub",
++                        name);
++            *out_client_session = CreateStubSession(system, ctx, name);
++            return ResultSuccess;
++        }
+         LOG_INFO(Service_SM, "Waiting for service {} to become available", name);
+         ctx.SetIsDeferred();
+         return Service::SM::ResultNotRegistered;
 diff --git a/src/core/hle/service/sockets/bsd.cpp b/src/core/hle/service/sockets/bsd.cpp
 index 0137a3b..4f7e113 100644
 --- a/src/core/hle/service/sockets/bsd.cpp
@@ -13838,6 +14250,51 @@ index 2837ce7..09d82e9 100644
      MSGSIZE = 90,
      CONNABORTED = 103,
      CONNRESET = 104,
+diff --git a/src/core/hle/service/switch2_stub_interface.h b/src/core/hle/service/switch2_stub_interface.h
+new file mode 100644
+index 0000000..9013d8e
+--- /dev/null
++++ b/src/core/hle/service/switch2_stub_interface.h
+@@ -0,0 +1,39 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <deque>
++#include <mutex>
++#include <string>
++#include <string_view>
++
++#include "core/hle/service/service.h"
++
++namespace Service {
++
++// Prefix of placeholder interfaces for Switch 2 IPC that Eden does not implement.
++// ReportUnimplementedFunction answers every unknown command on such an interface with an empty
++// success, so boot can go on while the log shows which commands are used.
++inline constexpr std::string_view Switch2StubPrefix = "switch2-stub:";
++
++class ISwitch2StubInterface final : public ServiceFramework<ISwitch2StubInterface> {
++public:
++    explicit ISwitch2StubInterface(Core::System& system_, const char* name)
++        : ServiceFramework{system_, name} {}
++
++    // Names must outlive the interface, so they are interned here.
++    static const char* InternName(std::string name) {
++        static std::mutex mutex;
++        static std::deque<std::string> names;
++        std::scoped_lock lk{mutex};
++        for (const auto& n : names) {
++            if (n == name) {
++                return n.c_str();
++            }
++        }
++        return names.emplace_back(std::move(name)).c_str();
++    }
++};
++
++} // namespace Service
 diff --git a/src/core/launch_params.cpp b/src/core/launch_params.cpp
 index a048322..814a2cb 100644
 --- a/src/core/launch_params.cpp
@@ -13852,7 +14309,7 @@ index a048322..814a2cb 100644
                  if (!argument_ok) {
                      // try to look it up by username, only finds the first username that matches.
 diff --git a/src/core/loader/deconstructed_rom_directory.cpp b/src/core/loader/deconstructed_rom_directory.cpp
-index 5e2ec7e..6a4f4a0 100644
+index 5e2ec7e..367e051 100644
 --- a/src/core/loader/deconstructed_rom_directory.cpp
 +++ b/src/core/loader/deconstructed_rom_directory.cpp
 @@ -13,9 +13,12 @@
@@ -13898,7 +14355,7 @@ index 5e2ec7e..6a4f4a0 100644
  
      const std::array static_modules = {"rtld",    "main",    "subsdk0", "subsdk1", "subsdk2",
                                         "subsdk3", "subsdk4", "subsdk5", "subsdk6", "subsdk7",
-@@ -264,14 +271,49 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
+@@ -264,14 +271,59 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
          next_load_addr = *tentative_next_load_addr;
          modules.insert_or_assign(load_addr, module);
          LOG_DEBUG(Loader, "loaded module {} @ {:#x}", module, load_addr);
@@ -13914,6 +14371,16 @@ index 5e2ec7e..6a4f4a0 100644
      is_loaded = true;
 +    if (standalone) {
 +        title_id = metadata.GetTitleID();
++        // Loose-ExeFS loads bypass the NCA/NSP loaders, which are the ones that apply LayeredFS
++        // to the RomFS; apply it here so mods in load/<titleid>/ work too (no update is applied
++        // without a base NCA).
++        if (FileSys::VirtualFile base; ReadRomFS(base) == ResultStatus::Success) {
++            const FileSys::PatchManager patch_manager(title_id, system.GetFileSystemController(),
++                                                      system.GetContentProvider());
++            if (auto patched = patch_manager.PatchRomFS(nullptr, base); patched != nullptr) {
++                romfs = std::move(patched);
++            }
++        }
 +        system.GetFileSystemController().RegisterProcess(
 +            process.GetProcessId(), {},
 +            std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
@@ -42643,7 +43110,7 @@ index c2ecc12..e6856aa 100644
                    VertexBuffers);
      }
 diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
-index 2c0ba00..1758653 100644
+index 2c0ba00..d41a70a 100644
 --- a/src/video_core/dma_pusher.cpp
 +++ b/src/video_core/dma_pusher.cpp
 @@ -4,11 +4,18 @@
@@ -42748,7 +43215,7 @@ index 2c0ba00..1758653 100644
          dma_pushbuffer.pop();
          return true;
      }
-@@ -80,19 +137,32 @@ bool DmaPusher::Step() {
+@@ -80,19 +137,35 @@ bool DmaPusher::Step() {
              const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
              if (kepler_payload || macro_payload) {
                  const size_t words = std::min<size_t>(dma_state.method_count, header.size);
@@ -42765,7 +43232,11 @@ index 2c0ba00..1758653 100644
 +                }
              }
          }
-         const bool use_safe = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
+-        const bool use_safe = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
++        // A safe read flushes the caches, which belong to the split's back thread while it runs
++        // (the split only starts with unsafe reads; the settings can change mid-game).
++        const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
++                              (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
          if (use_safe) {
              Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
 -            ProcessCommands(headers);
@@ -42784,7 +43255,7 @@ index 2c0ba00..1758653 100644
      if (++dma_pushbuffer_subindex >= command_list_size) {
          dma_pushbuffer.pop();
          dma_pushbuffer_subindex = 0;
-@@ -101,6 +171,7 @@ bool DmaPusher::Step() {
+@@ -101,6 +174,7 @@ bool DmaPusher::Step() {
      }
  
      if (signal_sync) {
@@ -42792,7 +43263,7 @@ index 2c0ba00..1758653 100644
          rasterizer->SignalFence([this]() {
              std::scoped_lock lk(sync_mutex);
              synced = true;
-@@ -111,20 +182,21 @@ bool DmaPusher::Step() {
+@@ -111,20 +185,21 @@ bool DmaPusher::Step() {
      return true;
  }
  
@@ -42818,7 +43289,7 @@ index 2c0ba00..1758653 100644
              dma_state.is_last_call = dma_state.method_count <= 1;
              CallMethod(command_header.argument);
              dma_state.method += !dma_state.non_incrementing ? 1 : 0;
-@@ -163,7 +235,9 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+@@ -163,7 +238,9 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
              }
              index++;
          }
@@ -42828,7 +43299,7 @@ index 2c0ba00..1758653 100644
  }
  
  void DmaPusher::SetState(const CommandHeader& command_header) {
-@@ -182,6 +256,30 @@ void DmaPusher::CallMethod(u32 argument) {
+@@ -182,6 +259,30 @@ void DmaPusher::CallMethod(u32 argument) {
          });
      } else {
          auto subchannel = subchannels[dma_state.subchannel];
@@ -42859,7 +43330,7 @@ index 2c0ba00..1758653 100644
          if (!subchannel->execution_mask[dma_state.method]) {
              subchannel->method_sink.emplace_back(dma_state.method, argument);
          } else {
-@@ -197,12 +295,43 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+@@ -197,12 +298,43 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
          puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
      } else {
          auto subchannel = subchannels[dma_state.subchannel];
@@ -46006,10 +46477,10 @@ index 974d214..47f50cd 100644
  
 diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
 new file mode 100644
-index 0000000..264f5ba
+index 0000000..9ce9276
 --- /dev/null
 +++ b/src/video_core/gpu_split.cpp
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,378 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -46100,8 +46571,8 @@ index 0000000..264f5ba
 +        return value != nullptr ? value[0] : '2';
 +    }();
 +    const bool wanted = mode == '1' || mode == '2';
-+    if (active || !wanted || !(Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
-+                               Tegra::g_native_channels.load(std::memory_order_relaxed))) {
++    if (!wanted || !(Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
++                     Tegra::g_native_channels.load(std::memory_order_relaxed))) {
 +        return;
 +    }
 +    // EDEN_NATIVE_STRICT stalls a channel on failed native work, which only the thread that
@@ -46111,11 +46582,19 @@ index 0000000..264f5ba
 +        return;
 +    }
 +    // The front reads command lists straight from guest memory; a read that flushes the caches
-+    // first (safe DMA, accurate GPU) would touch back-owned state.
++    // first (safe DMA, accurate GPU) would touch back-owned state. The settings can change
++    // mid-game: hand the engines back to the front (and start again when they allow it).
 +    const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
 +                                                          : Settings::IsDMALevelSafe();
-+    if (safe_reads || Settings::IsGPULevelHigh() ||
-+        Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
++    const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
++                         Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
++    if (active && !allowed) {
++        Drain();
++        Stop();
++        LOG_INFO(HW_GPU, "GPU thread split: stopped, the accuracy settings need the caches on the front");
++        return;
++    }
++    if (active || !allowed) {
 +        return;
 +    }
 +    system = &system_;
@@ -46141,6 +46620,25 @@ index 0000000..264f5ba
 +    wake.notify_one();
 +    back_thread.join();
 +    active = false;
++    // The split is static and outlives the emulation session. The next session's back thread
++    // starts reading at 0: with the old positions kept it skipped through the new, empty ring and
++    // never reached the old write position (the next game's first GPU work never ran), and the
++    // engines it held were freed.
++    ring.reset();
++    write_position = 0;
++    published_local = 0;
++    consumed_cache = 0;
++    publish_every = PublishEvery;
++    front_engine = nullptr;
++    front_after_method = nullptr;
++    front_after_context = nullptr;
++    back_engine = nullptr;
++    after_method = nullptr;
++    after_method_context = nullptr;
++    front_macros = false;
++    published.store(0, std::memory_order_relaxed);
++    consumed.store(0, std::memory_order_relaxed);
++    back_waiting.store(false, std::memory_order_relaxed);
 +}
 +
 +u64* GpuSplit::ReserveSlow(size_t words) {
@@ -48631,7 +49129,7 @@ index 0000000..d0f2408
 +
 +} // namespace Tegra
 diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
-index 8ffdcb6..d13efc7 100644
+index 8ffdcb6..7c32a6f 100644
 --- a/src/video_core/memory_manager.cpp
 +++ b/src/video_core/memory_manager.cpp
 @@ -16,12 +16,18 @@
@@ -48693,7 +49191,7 @@ index 8ffdcb6..d13efc7 100644
          }
          if (entry_type == EntryType::Mapped) {
              const DAddr current_dev_addr = dev_addr + offset;
-@@ -126,6 +151,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
+@@ -126,18 +151,33 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
          }
          remaining_size -= page_size;
      }
@@ -48701,7 +49199,42 @@ index 8ffdcb6..d13efc7 100644
      kind_map.Map(gpu_addr, gpu_addr + size, kind);
      return gpu_addr;
  }
-@@ -191,12 +217,15 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
+ 
+ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
+     [[maybe_unused]] u64 remaining_size{size};
++    // Reported in contiguous runs, as in PageTableOp.
++    GPUVAddr run_start{};
++    u64 run_size{};
++    const auto flush_run = [&] {
++        if (run_size != 0) {
++            rasterizer->ModifyGPUMemory(unique_identifier, run_start, run_size);
++            run_size = 0;
++        }
++    };
+     for (u64 offset{}; offset < size; offset += big_page_size) {
+         const GPUVAddr current_gpu_addr = gpu_addr + offset;
+         [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, true);
+         SetEntry(current_gpu_addr, entry_type, true);
+         if (current_entry_type != entry_type) {
+-            rasterizer->ModifyGPUMemory(unique_identifier, current_gpu_addr, big_page_size);
++            if (run_size == 0) {
++                run_start = current_gpu_addr;
++            }
++            run_size += big_page_size;
++        } else {
++            flush_run();
+         }
+         if (entry_type == EntryType::Mapped) {
+             const DAddr current_dev_addr = dev_addr + offset;
+@@ -164,6 +204,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
+         }
+         remaining_size -= big_page_size;
+     }
++    flush_run();
+     {
+         std::unique_lock<std::mutex> lock(guard);
+         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+@@ -191,12 +232,15 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
      if (size == 0) {
          return;
      }
@@ -48720,7 +49253,7 @@ index 8ffdcb6..d13efc7 100644
  
      BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
      PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
-@@ -231,6 +260,15 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
+@@ -231,6 +275,15 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
  
  template <typename T>
  T MemoryManager::Read(GPUVAddr addr) const {
@@ -48736,7 +49269,7 @@ index 8ffdcb6..d13efc7 100644
      if (auto page_pointer{GetPointer(addr)}; page_pointer) {
          // NOTE: Avoid adding any extra logic to this fast-path block
          T value;
-@@ -238,7 +276,10 @@ T MemoryManager::Read(GPUVAddr addr) const {
+@@ -238,7 +291,10 @@ T MemoryManager::Read(GPUVAddr addr) const {
          return value;
      }
  
@@ -48748,7 +49281,7 @@ index 8ffdcb6..d13efc7 100644
  
      return {};
  }
-@@ -247,6 +288,7 @@ template <typename T>
+@@ -247,6 +303,7 @@ template <typename T>
  void MemoryManager::Write(GPUVAddr addr, T data) {
      if (auto page_pointer{GetPointer(addr)}; page_pointer) {
          // NOTE: Avoid adding any extra logic to this fast-path block
@@ -48756,7 +49289,7 @@ index 8ffdcb6..d13efc7 100644
          std::memcpy(page_pointer, &data, sizeof(T));
          return;
      }
-@@ -390,6 +432,16 @@ void MemoryManager::ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::siz
+@@ -390,6 +447,16 @@ void MemoryManager::ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::siz
  }
  
  void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, const std::size_t size) const {
@@ -48773,7 +49306,7 @@ index 8ffdcb6..d13efc7 100644
      ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
  }
  
-@@ -403,6 +455,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+@@ -403,6 +470,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
              rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
          }
          u8* physical = memory.GetPointer<u8>(dev_addr_base);
@@ -48781,7 +49314,7 @@ index 8ffdcb6..d13efc7 100644
          std::memcpy(physical, src_buffer, copy_amount);
          src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
      };
-@@ -415,7 +468,8 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+@@ -415,7 +483,8 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
              memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
          } else {
              u8* physical = memory.GetPointer<u8>(dev_addr_base);
@@ -48791,7 +49324,7 @@ index 8ffdcb6..d13efc7 100644
          }
          src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
      };
-@@ -710,11 +764,11 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
+@@ -710,11 +779,11 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
  
  void MemoryManager::FlushCaching() {
      // Flush from the invalidate accumulator
@@ -50280,7 +50813,7 @@ index fff1f81..5fcd896 100644
      boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
      VkDeviceSize multi_range_total{};
 diff --git a/src/video_core/renderer_vulkan/vk_compute_pass.cpp b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
-index ab58560..773ab1a 100644
+index ab58560..bce23b3 100644
 --- a/src/video_core/renderer_vulkan/vk_compute_pass.cpp
 +++ b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
 @@ -5,6 +5,8 @@
@@ -50365,7 +50898,7 @@ index ab58560..773ab1a 100644
  };
  
  struct QueriesPrefixScanPushConstants {
-@@ -521,16 +572,31 @@ ASTCDecoderPass::~ASTCDecoderPass() = default;
+@@ -521,16 +572,49 @@ ASTCDecoderPass::~ASTCDecoderPass() = default;
  
  void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
                                 std::span<const VideoCommon::SwizzleParameters> swizzles) {
@@ -50375,6 +50908,24 @@ index ab58560..773ab1a 100644
 +        .initialized = image.ExchangeInitialization(),
 +        .level_view = [&image](s32 host_level) { return image.StorageImageView(host_level); },
 +        .wait = true,
++    };
++    AssembleInto(image.info, image.host_level_offset, image.guest_size_bytes, target, map,
++                 swizzles);
++}
++
++void ASTCDecoderPass::AssembleLayers(Image& image, const StagingBufferRef& map,
++                                     std::span<const VideoCommon::SwizzleParameters> swizzles,
++                                     std::span<const u32> layers) {
++    const Target target{
++        .image = image.Handle(),
++        .aspect_mask = image.AspectMask(),
++        .initialized = image.ExchangeInitialization(),
++        .level_view = [&image](s32 host_level) { return image.StorageImageView(host_level); },
++        .wait = true,
++        .layers = layers,
++        .layer_view = [&image](s32 host_level, u32 layer) {
++            return image.StorageImageLayerView(host_level, layer);
++        },
 +    };
 +    AssembleInto(image.info, image.host_level_offset, image.guest_size_bytes, target, map,
 +                 swizzles);
@@ -50402,7 +50953,7 @@ index ab58560..773ab1a 100644
      scheduler.Record([vk_pipeline, vk_image, aspect_mask,
                        is_initialized](vk::CommandBuffer cmdbuf) {
          const VkImageMemoryBarrier image_barrier{
-@@ -557,20 +623,30 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
+@@ -557,39 +641,60 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, image_barrier);
          cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
      });
@@ -50415,20 +50966,17 @@ index ab58560..773ab1a 100644
 +    const size_t input_size = skip != 0 ? size_t{input_layer_stride} * info.resources.layers
 +                                        : guest_size_bytes;
      for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
-         const size_t input_offset = swizzle.buffer_offset + map.offset;
+-        const size_t input_offset = swizzle.buffer_offset + map.offset;
          const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
          const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
 -        const u32 num_dispatches_z = image.info.resources.layers;
-+        const u32 num_dispatches_z = info.resources.layers;
- 
-         compute_pass_descriptor_queue.Acquire(scheduler, 2);
-         compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset,
+-
+-        compute_pass_descriptor_queue.Acquire(scheduler, 2);
+-        compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset,
 -                                                image.guest_size_bytes - swizzle.buffer_offset);
 -        compute_pass_descriptor_queue.AddImage(image.StorageImageView(swizzle.level));
-+                                                input_size - swizzle.buffer_offset);
-+        compute_pass_descriptor_queue.AddImage(
-+            target.level_view(swizzle.level - static_cast<s32>(skip)));
-         const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+-        const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
++        const s32 host_level = swizzle.level - static_cast<s32>(skip);
  
          // To unswizzle the ASTC data
 -        const auto params = MakeBlockLinearSwizzle2DParams(swizzle, image.info);
@@ -50437,15 +50985,61 @@ index ab58560..773ab1a 100644
          ASSERT(params.origin == (std::array<u32, 3>{0, 0, 0}));
          ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
          ASSERT(params.bytes_per_block_log2 == 4);
-@@ -583,6 +659,7 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
-                 .x_shift = params.x_shift,
-                 .block_height = params.block_height,
-                 .block_height_mask = params.block_height_mask,
-+                .native_tiling = params.native_tiling,
-             };
-             const VkDescriptorSet set = descriptor_allocator.Commit();
-             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
-@@ -613,7 +690,75 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
+-        scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
+-                          params, descriptor_data](vk::CommandBuffer cmdbuf) {
+-            const AstcPushConstants uniforms{
+-                .blocks_dims = block_dims,
+-                .layer_stride = params.layer_stride,
+-                .block_size = params.block_size,
+-                .x_shift = params.x_shift,
+-                .block_height = params.block_height,
+-                .block_height_mask = params.block_height_mask,
+-            };
+-            const VkDescriptorSet set = descriptor_allocator.Commit();
+-            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+-            cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
+-            cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
+-        });
++
++        // Only some layers: the input holds them one after another, each decoded by its own
++        // dispatch into a view of its layer. Otherwise one dispatch covers every layer.
++        const size_t num_inputs = target.layers.empty() ? 1 : target.layers.size();
++        for (size_t i = 0; i < num_inputs; ++i) {
++            const bool all_layers = target.layers.empty();
++            const size_t input_offset = map.offset + i * input_layer_stride + swizzle.buffer_offset;
++            const size_t input_range = (all_layers ? input_size : input_layer_stride) - swizzle.buffer_offset;
++            const u32 num_dispatches_z = all_layers ? static_cast<u32>(info.resources.layers) : 1U;
++
++            compute_pass_descriptor_queue.Acquire(scheduler, 2);
++            compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset, input_range);
++            compute_pass_descriptor_queue.AddImage(all_layers
++                                                       ? target.level_view(host_level)
++                                                       : target.layer_view(host_level, target.layers[i]));
++            const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
++
++            scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
++                              params, descriptor_data](vk::CommandBuffer cmdbuf) {
++                const AstcPushConstants uniforms{
++                    .blocks_dims = block_dims,
++                    .layer_stride = params.layer_stride,
++                    .block_size = params.block_size,
++                    .x_shift = params.x_shift,
++                    .block_height = params.block_height,
++                    .block_height_mask = params.block_height_mask,
++                    .native_tiling = params.native_tiling,
++                };
++                const VkDescriptorSet set = descriptor_allocator.Commit();
++                device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
++                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
++                cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
++                cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
++            });
++        }
+     }
+     scheduler.Record([vk_image, aspect_mask](vk::CommandBuffer cmdbuf) {
+         const VkImageMemoryBarrier image_barrier{
+@@ -613,7 +718,75 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
          cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
      });
@@ -50522,7 +51116,7 @@ index ab58560..773ab1a 100644
  }
  
  constexpr u32 BL3D_BINDING_INPUT_BUFFER  = 0;
-@@ -633,7 +778,7 @@ struct alignas(16) BlockLinearUnswizzle3DPushConstants {
+@@ -633,7 +806,7 @@ struct alignas(16) BlockLinearUnswizzle3DPushConstants {
  
      u32 block_depth;             // Offset 48
      u32 block_depth_mask;        // Offset 52
@@ -50531,7 +51125,7 @@ index ab58560..773ab1a 100644
  
      s32 destination[3];          // Offset 60
      s32 _pad_end;                // Offset 72
-@@ -753,6 +898,7 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
+@@ -753,6 +926,7 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
      pc.block_height_mask    = params.block_height_mask;
      pc.block_depth          = params.block_depth;
      pc.block_depth_mask     = params.block_depth_mask;
@@ -50540,7 +51134,7 @@ index ab58560..773ab1a 100644
      pc.blocks_dim[0] = blocks_x;
      pc.blocks_dim[1] = blocks_y;
 diff --git a/src/video_core/renderer_vulkan/vk_compute_pass.h b/src/video_core/renderer_vulkan/vk_compute_pass.h
-index 3d30aa6..5daf4eb 100644
+index 3d30aa6..3ffd99e 100644
 --- a/src/video_core/renderer_vulkan/vk_compute_pass.h
 +++ b/src/video_core/renderer_vulkan/vk_compute_pass.h
 @@ -6,6 +6,7 @@
@@ -50551,10 +51145,15 @@ index 3d30aa6..5daf4eb 100644
  #include <optional>
  #include <span>
  #include <utility>
-@@ -130,6 +131,21 @@ public:
+@@ -130,6 +131,30 @@ public:
      void Assemble(Image& image, const StagingBufferRef& map,
                    std::span<const VideoCommon::SwizzleParameters> swizzles);
  
++    /// Decodes only `layers` of `image` (an array uploaded before); `map` holds them in order.
++    void AssembleLayers(Image& image, const StagingBufferRef& map,
++                        std::span<const VideoCommon::SwizzleParameters> swizzles,
++                        std::span<const u32> layers);
++
 +    /// Where a decode writes: an RGBA8 image with a storage view per (host) level.
 +    struct Target {
 +        VkImage image;
@@ -50562,6 +51161,10 @@ index 3d30aa6..5daf4eb 100644
 +        bool initialized;
 +        std::function<VkImageView(s32 host_level)> level_view;
 +        bool wait; ///< Wait for the GPU afterwards (the decoded image itself is sampled).
++        /// When set, the input holds only these layers (in order), each decoded into
++        /// layer_view(host level, layer).
++        std::span<const u32> layers{};
++        std::function<VkImageView(s32 host_level, u32 layer)> layer_view{};
 +    };
 +
 +    /// Decodes `info`'s ASTC data in `map` into `target`. `skip` leading levels are absent on the
@@ -50573,7 +51176,7 @@ index 3d30aa6..5daf4eb 100644
  private:
      Scheduler& scheduler;
      StagingBufferPool& staging_buffer_pool;
-@@ -137,6 +153,24 @@ private:
+@@ -137,6 +162,24 @@ private:
      MemoryAllocator& memory_allocator;
  };
  
@@ -51176,7 +51779,7 @@ index 8b5b0bc..deb7409 100644
  }
  
 diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
-index d4ffcd8..845a831 100644
+index d4ffcd8..6245910 100644
 --- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 @@ -5,6 +5,7 @@
@@ -51392,6 +51995,65 @@ index d4ffcd8..845a831 100644
      const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
      const auto& qmd{kepler_compute->launch_description};
      ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+@@ -1045,7 +1165,11 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                  const vk::PipelineCache& pipeline_cache,
+                                                  u32 cache_version) try {
+-    std::ofstream file(filename, std::ios::binary);
++    // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
++    // cut short, and every later boot failed to read it.
++    auto temporary = filename;
++    temporary += ".tmp";
++    std::ofstream file(temporary, std::ios::binary);
+     file.exceptions(std::ifstream::failbit);
+     if (!file.is_open()) {
+         LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
+@@ -1063,16 +1187,26 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
+         pipeline_cache.Read(&cache_size, cache_data.data());
+     }
+     file.write(cache_data.data(), cache_size);
++    file.close();
++    std::error_code error;
++    std::filesystem::rename(temporary, filename, error);
++    if (error) {
++        LOG_ERROR(Common_Filesystem, "Failed to replace Vulkan driver pipeline cache file {}: {}",
++                  Common::FS::PathToUTF8String(filename), error.message());
++        std::filesystem::remove(temporary, error);
++        return;
++    }
+ 
+     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
+              Common::FS::PathToUTF8String(filename));
+ 
+ } catch (const std::ios_base::failure& e) {
++    // The cache itself is untouched; only the partly written copy goes.
+     LOG_ERROR(Common_Filesystem, "{}", e.what());
+-    if (!Common::FS::RemoveFile(filename)) {
+-        LOG_ERROR(Common_Filesystem, "Failed to delete Vulkan driver pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
+-    }
++    auto temporary = filename;
++    temporary += ".tmp";
++    std::error_code error;
++    std::filesystem::remove(temporary, error);
+ }
+ 
+ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
+@@ -1097,6 +1231,14 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
+ 
+         std::array<char, 8> magic_number;
+         u32 cache_version;
++        // A file cut short (the emulator stopped while writing it) would throw from the reads
++        // below.
++        if (static_cast<size_t>(end) < magic_number.size() + sizeof(cache_version)) {
++            file.close();
++            LOG_ERROR(Common_Filesystem, "Truncated Vulkan driver pipeline cache file, deleting it");
++            Common::FS::RemoveFile(filename);
++            return create_pipeline_cache(0, nullptr);
++        }
+         file.read(magic_number.data(), magic_number.size())
+             .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
+         if (magic_number != VULKAN_CACHE_MAGIC_NUMBER || cache_version != expected_cache_version) {
 diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
 index 71dfb46..a4b10c7 100644
 --- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
@@ -52603,7 +53265,7 @@ index d926cc1..4151600 100644
      /// Presents the rendered image to the swapchain.
      void Present(VkSemaphore render_semaphore);
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
-index 583cb6e..8e8464a 100644
+index 583cb6e..fb2e5fd 100644
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 @@ -7,6 +7,7 @@
@@ -52744,7 +53406,28 @@ index 583cb6e..8e8464a 100644
  [[nodiscard]] VkImageCreateInfo MakeImageCreateInfo(const Device& device, const ImageInfo& info,
                                                      std::optional<VkFormat> format_override = {}) {
      auto format_info =
-@@ -527,6 +640,20 @@ TransformBufferCopies(std::span<const VideoCommon::BufferCopy> copies, size_t bu
+@@ -249,7 +362,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+ }
+ 
+ [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
+-                                            VkFormat format) {
++                                            VkFormat format, u32 base_layer = 0,
++                                            u32 layer_count = VK_REMAINING_ARRAY_LAYERS) {
+     static constexpr VkImageViewUsageCreateInfo storage_image_view_usage_create_info{
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .pNext = nullptr,
+@@ -272,8 +386,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+             .baseMipLevel = level,
+             .levelCount = 1,
+-            .baseArrayLayer = 0,
+-            .layerCount = VK_REMAINING_ARRAY_LAYERS,
++            .baseArrayLayer = base_layer,
++            .layerCount = layer_count,
+         },
+     });
+ }
+@@ -527,6 +641,20 @@ TransformBufferCopies(std::span<const VideoCommon::BufferCopy> copies, size_t bu
      };
  }
  
@@ -52765,7 +53448,7 @@ index 583cb6e..8e8464a 100644
  [[nodiscard]] VkImageSubresourceRange MakeSubresourceRange(const ImageView* image_view) {
      SubresourceRange range = image_view->range;
      if (True(image_view->flags & VideoCommon::ImageViewFlagBits::Slice)) {
-@@ -942,9 +1069,16 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+@@ -942,9 +1070,16 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
      : device{device_}, scheduler{scheduler_}, memory_allocator{memory_allocator_},
        staging_buffer_pool{staging_buffer_pool_}, blit_image_helper{blit_image_helper_},
        render_pass_cache{render_pass_cache_}, resolution{Settings::values.resolution_info} {
@@ -52783,7 +53466,7 @@ index 583cb6e..8e8464a 100644
      }
      if (!device.IsKhrImageFormatListSupported()) {
          return;
-@@ -1796,6 +1930,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
+@@ -1796,6 +1931,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
      return device.GetDeviceMemoryUsage();
  }
  
@@ -52794,7 +53477,7 @@ index 583cb6e..8e8464a 100644
  bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
      const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
      if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
-@@ -1814,6 +1952,20 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
+@@ -1814,6 +1953,20 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
      return device.CanReportMemoryUsage();
  }
  
@@ -52815,7 +53498,7 @@ index 583cb6e..8e8464a 100644
  void TextureCacheRuntime::FlushDeferredClear() {
      scheduler.FlushDeferredClear();
  }
-@@ -1859,6 +2011,9 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
+@@ -1859,6 +2012,9 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
  }
  
  void TextureCacheRuntime::TickFrame() {
@@ -52825,7 +53508,7 @@ index 583cb6e..8e8464a 100644
      static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
      std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
          if (!scheduler.IsFree(scratch.tick)) {
-@@ -1876,13 +2031,30 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+@@ -1876,13 +2032,30 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
               VAddr cpu_addr_)
      : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
        runtime{&runtime_},
@@ -52860,7 +53543,7 @@ index 583cb6e..8e8464a 100644
                  flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
              }
              break;
-@@ -1903,11 +2075,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+@@ -1903,11 +2076,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
          original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
      }
      current_image = &Image::original_image;
@@ -52875,7 +53558,7 @@ index 583cb6e..8e8464a 100644
              storage_image_views[level] =
                  MakeStorageView(device, level, *original_image, storage_format);
          }
-@@ -2085,6 +2258,11 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
+@@ -2085,6 +2259,11 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
  
  void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                              std::span<const VideoCommon::BufferImageCopy> copies) {
@@ -52887,7 +53570,28 @@ index 583cb6e..8e8464a 100644
      const bool is_rescaled = True(flags & ImageFlagBits::Rescaled);
      if (is_rescaled) {
          ScaleDown();
-@@ -2519,6 +2697,15 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+@@ -2335,6 +2514,20 @@ VkImageView Image::StorageImageView(s32 level) noexcept {
+     return *view;
+ }
+ 
++VkImageView Image::StorageImageLayerView(s32 level, u32 layer) {
++    const u32 layers = static_cast<u32>(info.resources.layers);
++    if (storage_layer_views.empty()) {
++        storage_layer_views.resize(storage_image_views.size() * layers);
++    }
++    auto& view = storage_layer_views[static_cast<size_t>(level) * layers + layer];
++    if (!view) {
++        // Only GPU-decoded ASTC uploads by layer (TextureCacheRuntime::CanUploadLayers).
++        view = MakeStorageView(runtime->device.GetLogical(), level, *(this->*current_image),
++                               VK_FORMAT_A8B8G8R8_UNORM_PACK32, layer, 1);
++    }
++    return *view;
++}
++
+ bool Image::IsRescaled() const noexcept {
+     return True(flags & ImageFlagBits::Rescaled);
+ }
+@@ -2519,6 +2712,15 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
          }
      }
      auto format_info = MaxwellToVK::SurfaceFormat(*device, FormatType::Optimal, true, format);
@@ -52903,7 +53607,7 @@ index 583cb6e..8e8464a 100644
      if (device->ApiVersion() >= VK_API_VERSION_1_3) {
          const VkFormatProperties3 properties3 =
              device->GetPhysical().GetFormatProperties3(format_info.format);
-@@ -2567,7 +2754,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+@@ -2567,7 +2769,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
          .viewType = VkImageViewType{},
          .format = format_info.format,
          .components = swizzle_mapping,
@@ -52912,7 +53616,7 @@ index 583cb6e..8e8464a 100644
      };
      const auto create = [&](TextureType tex_type, std::optional<u32> num_layers) {
          VkImageViewCreateInfo ci{create_info};
-@@ -2601,6 +2788,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+@@ -2601,6 +2803,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
          break;
      case VideoCommon::ImageViewType::Cube:
      case VideoCommon::ImageViewType::CubeArray:
@@ -52920,7 +53624,7 @@ index 583cb6e..8e8464a 100644
          create(TextureType::ColorCube, 6);
          create(TextureType::ColorArrayCube, std::nullopt);
          break;
-@@ -2821,6 +3009,11 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
+@@ -2821,6 +3024,11 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
      if (tsc.mipmap_filter != TextureMipmapFilter::None) {
          min_lod = tsc.MinLod();
          max_lod = tsc.MaxLod();
@@ -52932,7 +53636,7 @@ index 583cb6e..8e8464a 100644
      }
      base_ci = VkSamplerCreateInfo{
          .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-@@ -3133,6 +3326,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
+@@ -3133,6 +3341,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
      u32 z_start, u32 z_count) {
  
      if (IsPixelFormatASTC(image.info.format)) {
@@ -52942,10 +53646,20 @@ index 583cb6e..8e8464a 100644
          return astc_decoder_pass->Assemble(image, map, swizzles);
      }
  
-@@ -3151,6 +3347,107 @@ void TextureCacheRuntime::AccelerateImageUpload(
+@@ -3151,6 +3362,117 @@ void TextureCacheRuntime::AccelerateImageUpload(
      ASSERT(false);
  }
  
++bool TextureCacheRuntime::CanUploadLayers(const Image& image) const noexcept {
++    return WillUseAcceleratedAstcDecode(device, image.info);
++}
++
++void TextureCacheRuntime::AccelerateImageUploadLayers(
++    Image& image, const StagingBufferRef& map,
++    std::span<const VideoCommon::SwizzleParameters> swizzles, std::span<const u32> layers) {
++    astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
++}
++
 +void TextureCacheRuntime::TranscodeAstcToBcn(
 +    Image& image, const StagingBufferRef& map,
 +    std::span<const VideoCommon::SwizzleParameters> swizzles) {
@@ -53051,7 +53765,7 @@ index 583cb6e..8e8464a 100644
      if (!image.ExchangeInitialization()) {
          VkImageMemoryBarrier barrier{
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
-index 2e9736f..1d92d43 100644
+index 2e9736f..410c918 100644
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.h
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
 @@ -6,6 +6,7 @@
@@ -53078,7 +53792,23 @@ index 2e9736f..1d92d43 100644
      bool CanDownloadMsaa(const VideoCommon::ImageInfo& info) const;
  
      [[nodiscard]] VkImage AcquireMsaaScratchImage(const VkImageCreateInfo& image_ci);
-@@ -157,6 +165,20 @@ public:
+@@ -101,6 +109,15 @@ public:
+                                std::span<const VideoCommon::SwizzleParameters>,
+                                u32 z_start, u32 z_count);
+ 
++    /// True when AccelerateImageUploadLayers can refresh some layers of the image alone (ASTC the
++    /// GPU decodes to RGBA8, not the BCn transcode).
++    bool CanUploadLayers(const Image& image) const noexcept;
++
++    /// Decodes only `layers` of an ASTC array; the staging buffer holds those layers in order.
++    void AccelerateImageUploadLayers(Image&, const StagingBufferRef&,
++                                     std::span<const VideoCommon::SwizzleParameters>,
++                                     std::span<const u32> layers);
++
+     void InsertUploadMemoryBarrier() {}
+ 
+     void TransitionImageLayout(Image& image);
+@@ -157,6 +174,20 @@ public:
      BlitImageHelper& blit_image_helper;
      RenderPassCache& render_pass_cache;
      std::optional<ASTCDecoderPass> astc_decoder_pass;
@@ -53099,6 +53829,24 @@ index 2e9736f..1d92d43 100644
  
      std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
      const Settings::ResolutionScalingInfo& resolution;
+@@ -355,6 +386,9 @@ public:
+ 
+     VkImageView StorageImageView(s32 level) noexcept;
+ 
++    /// A storage view of one layer of a host level (decoding only some layers of an array).
++    VkImageView StorageImageLayerView(s32 level, u32 layer);
++
+     bool IsRescaled() const noexcept;
+ 
+     bool ScaleUp(bool ignore = false);
+@@ -387,6 +421,7 @@ private:
+     vk::Image Image::*current_image{};
+ 
+     std::vector<vk::ImageView> storage_image_views;
++    std::vector<vk::ImageView> storage_layer_views; ///< By host level * layers + layer
+     VkImageAspectFlags aspect_mask = 0;
+     bool initialized = false;
+ 
 diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
 index f1aff28..3aff04d 100644
 --- a/src/video_core/shader_cache.cpp
@@ -53390,7 +54138,7 @@ index 997f2b0..b27b15d 100644
  
  } // namespace VideoCommon
 diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
-index 4d5db7e..c33cdeb 100644
+index 4d5db7e..0790167 100644
 --- a/src/video_core/shader_environment.cpp
 +++ b/src/video_core/shader_environment.cpp
 @@ -4,10 +4,19 @@
@@ -53824,7 +54572,7 @@ index 4d5db7e..c33cdeb 100644
 +    Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
 +    cached_lowest = 0;
 +    cached_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
-+    LOG_INFO(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
++    LOG_DEBUG(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
 +             program_base, native_source_size, lowered.instructions.size());
 +}
 +
@@ -54317,7 +55065,7 @@ index 9b0f332..8db081d 100644
          return ImageViewId{};
      }
 diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
-index 79fc850..aa5eebf 100644
+index 79fc850..f0a5d64 100644
 --- a/src/video_core/texture_cache/image_base.h
 +++ b/src/video_core/texture_cache/image_base.h
 @@ -45,6 +45,11 @@ enum class ImageFlagBits : u32 {
@@ -54332,7 +55080,7 @@ index 79fc850..aa5eebf 100644
  };
  DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
  
-@@ -93,6 +98,12 @@ struct ImageBase {
+@@ -93,6 +98,15 @@ struct ImageBase {
      u32 unswizzled_size_bytes = 0;
      u32 converted_size_bytes = 0;
      u32 scale_rating = 0;
@@ -54342,6 +55090,9 @@ index 79fc850..aa5eebf 100644
 +    std::vector<u32> partial_dirty_pages;
 +    /// Byte ranges (from the image start) whose GPU mapping changed; re-uploaded like the pages.
 +    std::vector<std::pair<u64, u64>> partial_remapped;
++    /// Large GPU-decoded arrays: one bit per layer the CPU wrote since the last upload while the
++    /// image stays tracked (CpuModified). Empty while CpuModified means the whole image.
++    std::vector<u64> dirty_layers;
      u64 scale_tick = 0;
      bool has_scaled = false;
  
@@ -54490,7 +55241,7 @@ index 0000000..52a48e8
 +
 +} // namespace VideoCommon
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index e92e54f..130f73b 100644
+index e92e54f..8815802 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
 @@ -6,7 +6,14 @@
@@ -54580,7 +55331,7 @@ index e92e54f..130f73b 100644
          UnregisterImage(image_id);
          DeleteImage(image_id, image.scale_tick > frame_tick + 5);
          if (aggressive_mode && total_used_memory < critical_memory) {
-@@ -167,12 +210,120 @@ void TextureCache<P>::RunGarbageCollector() {
+@@ -167,12 +210,129 @@ void TextureCache<P>::RunGarbageCollector() {
      }
  }
  
@@ -54601,6 +55352,12 @@ index e92e54f..130f73b 100644
 +
  template <class P>
  void TextureCache<P>::TickFrame() {
++    // Upload buffers grown for one huge image are freed rather than kept for the session.
++    for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
++        if (scratch->capacity() > LargeScratchCapacity) {
++            scratch->release();
++        }
++    }
 +    if constexpr (HAS_DEVICE_MEMORY_INFO) {
 +        // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
 +        // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
@@ -54683,6 +55440,9 @@ index e92e54f..130f73b 100644
 +                 images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
 +                 gc_download_deletes,
 +                 async_decodes_queued, astc_opaque_images, astc_alpha_images);
++        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
++                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
++        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
 +        astc_opaque_images = astc_alpha_images = 0;
 +        std::vector<std::pair<u32, u64>> shapes;
 +        for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -54701,7 +55461,7 @@ index e92e54f..130f73b 100644
      if (total_used_memory > minimum_memory) {
          RunGarbageCollector();
      }
-@@ -217,6 +368,7 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
+@@ -217,6 +377,7 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
  
  template <class P>
  void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
@@ -54709,7 +55469,7 @@ index e92e54f..130f73b 100644
      bool has_blacklisted = false;
      do {
          has_deleted_images = false;
-@@ -225,6 +377,13 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
+@@ -225,6 +386,13 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
          }
          for (ImageViewInOut& view : views) {
              view.id = VisitImageView(view.index, compute);
@@ -54723,7 +55483,7 @@ index e92e54f..130f73b 100644
              if (blacklist) {
                  if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                      const ImageViewBase& image_view = slot_image_views[view.id];
-@@ -315,6 +474,7 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
+@@ -315,6 +483,7 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
      }
      auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
      auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
@@ -54731,13 +55491,17 @@ index e92e54f..130f73b 100644
      if (is_new) {
          auto const id = FindSampler(descriptor, compute);
          channel_state->sampler_ids.insert_or_assign(map_index, id);
-@@ -584,10 +744,15 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
+@@ -584,10 +753,19 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
  
  template <class P>
  void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
 -    ForEachImageInRegion(cpu_addr, size, [this](ImageId image_id, Image& image) {
 +    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
 +        if (MarkPartialWrite(image, cpu_addr, size)) {
++            return;
++        }
++        if (UploadsByLayer(image)) {
++            MarkLayersWritten(image, cpu_addr, size);
 +            return;
 +        }
          if (True(image.flags & ImageFlagBits::CpuModified)) {
@@ -54748,7 +55512,7 @@ index e92e54f..130f73b 100644
          image.flags |= ImageFlagBits::CpuModified;
          if (True(image.flags & ImageFlagBits::Tracked)) {
              UntrackImage(image, image_id);
-@@ -597,7 +762,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+@@ -597,7 +775,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
  
  template <class P>
  bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
@@ -54757,7 +55521,7 @@ index e92e54f..130f73b 100644
          return false;
      }
      if (image.info.num_samples == 1) {
-@@ -610,6 +775,74 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
+@@ -610,6 +788,74 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
      }
  }
  
@@ -54832,7 +55596,7 @@ index e92e54f..130f73b 100644
  template <class P>
  void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
      boost::container::small_vector<ImageId, 16> images;
-@@ -684,7 +917,12 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
+@@ -684,16 +930,29 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
                              [&](ImageId id, Image&) { deleted_images.push_back(id); });
      for (const ImageId id : deleted_images) {
          Image& image = slot_images[id];
@@ -54845,7 +55609,10 @@ index e92e54f..130f73b 100644
              image.flags |= ImageFlagBits::CpuModified;
              if (True(image.flags & ImageFlagBits::Tracked)) {
                  UntrackImage(image, id);
-@@ -694,6 +932,13 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
+             }
+         }
++        image.dirty_layers.clear(); // all of it
+         if (True(image.flags & ImageFlagBits::Remapped)) {
              continue;
          }
          image.flags |= ImageFlagBits::Remapped;
@@ -54859,7 +55626,7 @@ index e92e54f..130f73b 100644
      }
  }
  
-@@ -714,6 +959,14 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
+@@ -714,6 +973,14 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
  
      Image& dst_image = slot_images[dst_id];
      Image& src_image = slot_images[src_id];
@@ -54874,7 +55641,7 @@ index e92e54f..130f73b 100644
      bool is_src_rescaled = True(src_image.flags & ImageFlagBits::Rescaled);
      bool is_dst_rescaled = True(dst_image.flags & ImageFlagBits::Rescaled);
  
-@@ -803,6 +1056,17 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
+@@ -803,6 +1070,17 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
      if (it == page_table.end()) {
          return {};
      }
@@ -54892,7 +55659,7 @@ index e92e54f..130f73b 100644
      const auto& image_map_ids = it->second;
      boost::container::small_vector<ImageId, 4> valid_image_ids;
      for (const ImageMapId map_id : image_map_ids) {
-@@ -814,20 +1078,17 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
+@@ -814,20 +1092,17 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
          if (image.image_view_ids.empty()) {
              continue;
          }
@@ -54921,7 +55688,7 @@ index e92e54f..130f73b 100644
      const auto GetImageViewForFramebuffer = [&](ImageId image_id) {
          ImageViewInfo info{ImageViewType::e2D, view_format};
          if (config.blending == Tegra::BlendMode::Opaque) {
-@@ -859,6 +1120,11 @@ bool TextureCache<P>::HasUncommittedFlushes() const noexcept {
+@@ -859,6 +1134,11 @@ bool TextureCache<P>::HasUncommittedFlushes() const noexcept {
      return !uncommitted_downloads.empty();
  }
  
@@ -54933,7 +55700,7 @@ index e92e54f..130f73b 100644
  template <class P>
  bool TextureCache<P>::ShouldWaitAsyncFlushes() const noexcept {
      return !committed_downloads.empty() && !committed_downloads.front().empty();
-@@ -869,6 +1135,7 @@ void TextureCache<P>::CommitAsyncFlushes() {
+@@ -869,6 +1149,7 @@ void TextureCache<P>::CommitAsyncFlushes() {
      // This is intentionally passing the value by copy
      if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
          auto& download_ids = uncommitted_downloads;
@@ -54941,7 +55708,7 @@ index e92e54f..130f73b 100644
          if (download_ids.empty()) {
              committed_downloads.emplace_back(std::move(uncommitted_downloads));
              uncommitted_downloads.clear();
-@@ -882,17 +1149,32 @@ void TextureCache<P>::CommitAsyncFlushes() {
+@@ -882,17 +1163,32 @@ void TextureCache<P>::CommitAsyncFlushes() {
          for (PendingDownload& download_info : download_ids) {
              if (download_info.is_swizzle) {
                  total_size_bytes +=
@@ -54976,7 +55743,7 @@ index e92e54f..130f73b 100644
                      const auto copies = FullDownloadCopies(image.info);
                      image.DownloadMemory(download_map, copies);
                      download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
-@@ -925,7 +1207,7 @@ void TextureCache<P>::PopAsyncFlushes() {
+@@ -925,7 +1221,7 @@ void TextureCache<P>::PopAsyncFlushes() {
              auto& download_info = download_ids[i - 1];
              auto& download_buffer = download_map[download_info.async_buffer_id];
              if (download_info.is_swizzle) {
@@ -54985,7 +55752,7 @@ index e92e54f..130f73b 100644
                  const auto copies = FullDownloadCopies(image.info);
                  download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                  std::span<u8> download_span =
-@@ -954,7 +1236,7 @@ void TextureCache<P>::PopAsyncFlushes() {
+@@ -954,7 +1250,7 @@ void TextureCache<P>::PopAsyncFlushes() {
          size_t total_size_bytes = 0;
          for (const PendingDownload& download_info : download_ids) {
              if (download_info.is_swizzle) {
@@ -54994,7 +55761,7 @@ index e92e54f..130f73b 100644
              }
          }
          auto download_map = runtime.DownloadStagingBuffer(total_size_bytes);
-@@ -963,7 +1245,7 @@ void TextureCache<P>::PopAsyncFlushes() {
+@@ -963,7 +1259,7 @@ void TextureCache<P>::PopAsyncFlushes() {
              if (!download_info.is_swizzle) {
                  continue;
              }
@@ -55003,7 +55770,7 @@ index e92e54f..130f73b 100644
              const auto copies = FullDownloadCopies(image.info);
              image.DownloadMemory(download_map, copies);
              download_map.offset += image.unswizzled_size_bytes;
-@@ -976,7 +1258,7 @@ void TextureCache<P>::PopAsyncFlushes() {
+@@ -976,7 +1272,7 @@ void TextureCache<P>::PopAsyncFlushes() {
              if (!download_info.is_swizzle) {
                  continue;
              }
@@ -55012,7 +55779,7 @@ index e92e54f..130f73b 100644
              const auto copies = FullDownloadCopies(image.info);
              SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
              download_map.offset += image.unswizzled_size_bytes;
-@@ -1117,11 +1399,47 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+@@ -1117,10 +1413,54 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
          // Only upload modified images
          return;
      }
@@ -55049,24 +55816,35 @@ index e92e54f..130f73b 100644
  
      image.flags &= ~ImageFlagBits::CpuModified;
  
-     TrackImage(image, image_id);
- 
+-    TrackImage(image, image_id);
++    // Arrays uploaded by layer stay tracked while some of their layers are dirty.
++    if (False(image.flags & ImageFlagBits::Tracked)) {
++        TrackImage(image, image_id);
++    }
++    if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
++        runtime.InsertUploadMemoryBarrier();
++        return;
++    }
++    image.dirty_layers.clear();
++
 +    if (True(image.flags & ImageFlagBits::Unbacked)) {
 +        // Nothing to upload into (and staging it could take tens of GB).
 +        runtime.TransitionImageLayout(image);
 +        return;
 +    }
-+
+ 
      if (image.info.num_samples > 1 && !runtime.CanUploadMSAA()) {
          LOG_WARNING(HW_GPU, "MSAA image uploads are not implemented");
-         runtime.TransitionImageLayout(image);
-@@ -1145,9 +1463,27 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+@@ -1145,9 +1485,118 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
          QueueAsyncUnswizzle(image, image_id);
          return;
      }
 -    auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
 -    UploadImageContents(image, staging);
 -    runtime.InsertUploadMemoryBarrier();
++    ++images_uploaded;
++    uploaded_bytes += image.guest_size_bytes;
++    largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
 +    const auto upload_start = std::chrono::steady_clock::now();
 +    if (!UploadInChunks(image)) {
 +        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
@@ -55088,10 +55866,98 @@ index e92e54f..130f73b 100644
 +                     True(image.flags & ImageFlagBits::Converted) ? " converted" : "");
 +        }
 +    }
++}
++
++template <class P>
++bool TextureCache<P>::UploadsByLayer(const Image& image) const noexcept {
++    // Title 1's 8192x8192x68 ASTC arrays (1.45 GB each) get a few layers streamed in at a time;
++    // decoding all 68 again for each write took ~50 ms of GPU thread time.
++    if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
++        constexpr ImageFlagBits excluded =
++            ImageFlagBits::Unbacked | ImageFlagBits::Sparse | ImageFlagBits::Remapped;
++        return True(image.flags & ImageFlagBits::AcceleratedUpload) && False(image.flags & excluded) &&
++               image.info.type == ImageType::e2D && image.info.resources.layers > 1 &&
++               image.guest_size_bytes >= LayerUploadMinSize && runtime.CanUploadLayers(image);
++    } else {
++        return false;
++    }
++}
++
++template <class P>
++void TextureCache<P>::MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size) {
++    if (True(image.flags & ImageFlagBits::CpuModified) && image.dirty_layers.empty()) {
++        return; // all of it is dirty already
++    }
++    const u32 layers = static_cast<u32>(image.info.resources.layers);
++    if (False(image.flags & ImageFlagBits::CpuModified)) {
++        image.flags |= ImageFlagBits::CpuModified;
++        image.dirty_layers.assign(Common::DivCeil(layers, 64U), 0);
++    }
++    const DAddr begin = (std::max<DAddr>)(cpu_addr, image.cpu_addr) - image.cpu_addr;
++    const DAddr end = (std::min<DAddr>)(cpu_addr + size, image.cpu_addr + image.guest_size_bytes) -
++                      image.cpu_addr;
++    const u32 stride = image.info.layer_stride;
++    if (end <= begin || stride == 0) {
++        return;
++    }
++    const u32 last = (std::min)(static_cast<u32>((end - 1) / stride), layers - 1);
++    for (u32 layer = static_cast<u32>(begin / stride); layer <= last; ++layer) {
++        image.dirty_layers[layer / 64] |= u64{1} << (layer % 64);
++    }
++}
++
++template <class P>
++bool TextureCache<P>::UploadWrittenLayers(Image& image) {
++    if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
++        const u32 num_layers = static_cast<u32>(image.info.resources.layers);
++        std::vector<u32> layers;
++        for (u32 layer = 0; layer < num_layers; ++layer) {
++            if ((image.dirty_layers[layer / 64] >> (layer % 64)) & 1) {
++                layers.push_back(layer);
++            }
++        }
++        image.dirty_layers.clear();
++        if (layers.empty() || layers.size() == num_layers) {
++            return false;
++        }
++        const auto upload_start = std::chrono::steady_clock::now();
++        // Each layer's mip chain from the first level the host keeps on (as UploadImageContents).
++        auto uploads = FullUploadSwizzles(image.info);
++        const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
++        const size_t tail = image.info.layer_stride - level_offset;
++        auto staging = runtime.UploadStagingBuffer(tail * layers.size());
++        for (size_t i = 0; i < layers.size(); ++i) {
++            gpu_memory->ReadBlock(image.gpu_addr + u64{layers[i]} * image.info.layer_stride +
++                                      level_offset,
++                                  staging.mapped_span.data() + i * tail, tail,
++                                  VideoCommon::CacheType::NoTextureCache);
++        }
++        uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
++        for (auto& upload : uploads) {
++            upload.buffer_offset -= level_offset;
++        }
++        runtime.AccelerateImageUploadLayers(image, staging, uploads, layers);
++        ++images_uploaded;
++        ++layer_uploads;
++        uploaded_bytes += tail * layers.size();
++        largest_upload = (std::max<u64>)(largest_upload, tail * layers.size());
++        if (VideoCommon::Nx2Profile::Enabled()) {
++            static u32 logged{};
++            if (logged++ < 300) {
++                LOG_INFO(HW_GPU, "Layer texture upload: {} us, gpu {:#x}, {} of {} layers",
++                         std::chrono::duration_cast<std::chrono::microseconds>(
++                             std::chrono::steady_clock::now() - upload_start).count(),
++                         image.gpu_addr, layers.size(), num_layers);
++            }
++        }
++        return true;
++    } else {
++        return false;
++    }
  }
  
  template <class P>
-@@ -1156,6 +1492,24 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
+@@ -1156,6 +1605,24 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
      const std::span<u8> mapped_span = staging.mapped_span;
      const GPUVAddr gpu_addr = image.gpu_addr;
  
@@ -55116,7 +55982,7 @@ index e92e54f..130f73b 100644
      if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
          gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
                                VideoCommon::CacheType::NoTextureCache);
-@@ -1178,8 +1532,42 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
+@@ -1178,8 +1645,42 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
  }
  
  template <class P>
@@ -55160,7 +56026,7 @@ index e92e54f..130f73b 100644
      if (info.type == ImageType::Buffer) {
          const ImageViewInfo view_info(config, 0);
          return slot_image_views.insert(runtime, info, view_info, config.Address());
-@@ -1191,6 +1579,18 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& config) {
+@@ -1191,6 +1692,18 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& config) {
          return NULL_IMAGE_VIEW_ID;
      }
      ImageBase& image = slot_images[image_id];
@@ -55179,7 +56045,7 @@ index e92e54f..130f73b 100644
      const SubresourceBase base = image.TryFindBase(config.Address()).value();
      ASSERT(base.level == 0);
      const ImageViewInfo view_info(config, base.layer);
-@@ -1213,12 +1613,9 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
+@@ -1213,12 +1726,9 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
  template <class P>
  ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                     RelaxedOptions options) {
@@ -55194,7 +56060,7 @@ index e92e54f..130f73b 100644
      }
      const bool broken_views =
          runtime.HasBrokenTextureViewFormats() || True(options & RelaxedOptions::ForceBrokenViews);
-@@ -1344,9 +1741,10 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
+@@ -1344,9 +1854,10 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
  template <class P>
  void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
      UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
@@ -55206,7 +56072,7 @@ index e92e54f..130f73b 100644
      auto decode = std::make_unique<AsyncDecodeContext>();
      auto* decode_ptr = decode.get();
      decode->image_id = image_id;
-@@ -1356,6 +1754,18 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+@@ -1356,6 +1867,18 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
      Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
      auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
      const size_t out_size = MapSizeBytes(image);
@@ -55225,7 +56091,7 @@ index e92e54f..130f73b 100644
  
      auto func = [out_size, copies, info = image.info,
                   input = std::move(local_unswizzle_data_buffer),
-@@ -1392,12 +1802,26 @@ void TextureCache<P>::TickAsyncDecode() {
+@@ -1392,12 +1915,26 @@ void TextureCache<P>::TickAsyncDecode() {
      auto i = async_decodes.begin();
      while (i != async_decodes.end()) {
          auto* async_decode = i->get();
@@ -55255,7 +56121,7 @@ index e92e54f..130f73b 100644
          auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
          std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
                      async_decode->decoded_data.size());
-@@ -1512,21 +1936,37 @@ bool TextureCache<P>::ScaleDown(Image& image) {
+@@ -1512,21 +2049,37 @@ bool TextureCache<P>::ScaleDown(Image& image) {
      return true;
  }
  
@@ -55302,7 +56168,7 @@ index e92e54f..130f73b 100644
      const Image& image = slot_images[image_id];
      // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
      const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
-@@ -1634,10 +2074,44 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -1634,10 +2187,44 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
          }
      }
  
@@ -55347,7 +56213,7 @@ index e92e54f..130f73b 100644
  
      if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
          new_info.is_sparse) {
-@@ -1647,7 +2121,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -1647,7 +2234,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
      for (const ImageId overlap_id : join_ignore_textures) {
          Image& overlap = slot_images[overlap_id];
          if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -55360,7 +56226,7 @@ index e92e54f..130f73b 100644
          }
          if (True(overlap.flags & ImageFlagBits::Tracked)) {
              UntrackImage(overlap, overlap_id);
-@@ -1833,12 +2311,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
+@@ -1833,12 +2424,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
  
  template <class P>
  ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) {
@@ -55375,7 +56241,7 @@ index e92e54f..130f73b 100644
      }
      ImageId image_id{};
      boost::container::small_vector<ImageId, 8> image_ids;
-@@ -1859,6 +2334,13 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
+@@ -1859,6 +2447,13 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
                  return true;
              }
          } else if (IsSubCopy(info, existing_image, gpu_addr)) {
@@ -55389,7 +56255,7 @@ index e92e54f..130f73b 100644
              image_id = existing_image_id;
              image_ids.push_back(existing_image_id);
              return true;
-@@ -1954,6 +2436,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
+@@ -1954,6 +2549,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
          base = image.TryFindBase(gpu_addr).value();
      }
      const s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
@@ -55403,7 +56269,7 @@ index e92e54f..130f73b 100644
      const SubresourceRange range{
          .base = base,
          .extent = {.levels = 1, .layers = layers},
-@@ -2136,6 +2625,13 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
+@@ -2136,6 +2738,13 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
      if (const ImageViewId image_view_id = image.FindView(info); image_view_id) {
          return image_view_id;
      }
@@ -55417,7 +56283,7 @@ index e92e54f..130f73b 100644
      const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
      image.InsertView(info, image_view_id);
      return image_view_id;
-@@ -2291,9 +2787,185 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
+@@ -2291,9 +2900,185 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
                           });
  }
  
@@ -55603,7 +56469,7 @@ index e92e54f..130f73b 100644
      image.flags &= ~ImageFlagBits::Tracked;
      if (False(image.flags & ImageFlagBits::Sparse)) {
          if (image.cpu_addr < ~(1ULL << 40)) {
-@@ -2316,6 +2988,24 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+@@ -2316,6 +3101,24 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
  template <class P>
  void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
      ImageBase& image = slot_images[image_id];
@@ -55628,7 +56494,7 @@ index e92e54f..130f73b 100644
      if (image.HasScaled()) {
          total_used_memory -= GetScaledImageSizeBytes(image);
      }
-@@ -2385,7 +3075,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+@@ -2385,7 +3188,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
          }
          slot_image_views.erase(image_view_id);
      }
@@ -55641,15 +56507,16 @@ index e92e54f..130f73b 100644
          sentenced_images.Push(std::move(slot_images[image_id]));
      }
      slot_images.erase(image_id);
-@@ -2504,6 +3198,7 @@ template <class P>
+@@ -2504,6 +3311,8 @@ template <class P>
  void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
      Image& image = slot_images[image_id];
      if (invalidate) {
 +        RestorePartialPages(image);
++        image.dirty_layers.clear();
          image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
          if (False(image.flags & ImageFlagBits::Tracked)) {
              TrackImage(image, image_id);
-@@ -2537,6 +3232,11 @@ template <class P>
+@@ -2537,6 +3346,11 @@ template <class P>
  void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
      Image& dst = slot_images[dst_id];
      Image& src = slot_images[src_id];
@@ -55661,7 +56528,7 @@ index e92e54f..130f73b 100644
      const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
      if (is_rescaled) {
          ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
-@@ -2628,7 +3328,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id)
+@@ -2628,7 +3442,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id)
      }
      if (new_id) {
          const ImageViewBase& old_view = slot_image_views[new_id];
@@ -55672,7 +56539,7 @@ index e92e54f..130f73b 100644
              uncommitted_downloads.emplace_back(new_download);
          }
 diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
-index 8a2318c..a2292ca 100644
+index 8a2318c..1bf8c58 100644
 --- a/src/video_core/texture_cache/texture_cache_base.h
 +++ b/src/video_core/texture_cache/texture_cache_base.h
 @@ -9,6 +9,7 @@
@@ -55706,7 +56573,7 @@ index 8a2318c..a2292ca 100644
  };
  
  using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
-@@ -118,6 +122,22 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+@@ -118,6 +122,26 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
      static constexpr s64 TARGET_THRESHOLD = 4_GiB;
  #endif
  
@@ -55716,6 +56583,10 @@ index 8a2318c..a2292ca 100644
 +    u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
 +    u64 async_decodes_queued{};
 +    u64 images_created{};
++    u64 images_uploaded{}; ///< Image contents uploaded from guest memory
++    u64 uploaded_bytes{};  ///< Guest bytes those uploads read
++    u64 largest_upload{};  ///< Largest of them
++    u64 layer_uploads{};   ///< Of them, uploads of only the written layers of an array
 +    bool native_thresholds_applied{};
 +    u64 native_critical_memory{};
 +    u64 native_expected_memory{};
@@ -55729,7 +56600,7 @@ index 8a2318c..a2292ca 100644
      static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
      static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
      static constexpr size_t GC_EMERGENCY_COUNTS = 2;
-@@ -170,6 +190,8 @@ public:
+@@ -170,6 +194,8 @@ public:
      /// Fill image_view_ids with the graphics/compute images in indices
      void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
  
@@ -55738,7 +56609,7 @@ index 8a2318c..a2292ca 100644
      /// Handle feedback loops during draws.
      void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
  
-@@ -226,6 +248,9 @@ public:
+@@ -226,6 +252,9 @@ public:
      /// Return true when there are uncommitted images to be downloaded
      [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
  
@@ -55748,7 +56619,7 @@ index 8a2318c..a2292ca 100644
      /// Return true when the caller should wait for async downloads
      [[nodiscard]] bool ShouldWaitAsyncFlushes() const noexcept;
  
-@@ -258,7 +283,7 @@ public:
+@@ -258,7 +287,7 @@ public:
      /// Prepare an image to be used
      void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
  
@@ -55757,7 +56628,7 @@ index 8a2318c..a2292ca 100644
  
  private:
      /// Iterate over all page indices in a range
-@@ -379,6 +404,23 @@ private:
+@@ -379,6 +408,36 @@ private:
      /// Stop tracking CPU reads and writes for image
      void UntrackImage(ImageBase& image, ImageId image_id);
  
@@ -55767,6 +56638,19 @@ index 8a2318c..a2292ca 100644
 +
 +    /// Uploads a large plain 2D image in chunks; false if it does not qualify.
 +    bool UploadInChunks(Image& image);
++
++    static constexpr u32 LayerUploadMinSize = 64U << 20;
++    static constexpr size_t LargeScratchCapacity = 64U << 20;
++
++    /// Large GPU-decoded ASTC arrays, whose refresh can decode only the layers written since the
++    /// last one (the image stays tracked meanwhile).
++    [[nodiscard]] bool UploadsByLayer(const Image& image) const noexcept;
++
++    /// Records the layers a CPU write of [cpu_addr, +size) touches.
++    void MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size);
++
++    /// Uploads the image's dirty layers. False when it needs a whole upload instead.
++    bool UploadWrittenLayers(Image& image);
 +
 +    /// Records a GPU remap of a small part of a large 2D image for a partial re-upload instead of
 +    /// marking the whole image remapped (which replaces it). False if the image does not qualify.
@@ -55781,7 +56665,7 @@ index 8a2318c..a2292ca 100644
      /// Delete image from the cache
      void DeleteImage(ImageId image, bool immediate_delete = false);
  
-@@ -448,6 +490,12 @@ private:
+@@ -448,6 +507,12 @@ private:
  
      DAddr virtual_invalid_space{};
  
@@ -55794,7 +56678,7 @@ index 8a2318c..a2292ca 100644
      bool has_deleted_images = false;
      bool is_rescaling = false;
      u64 total_used_memory = 0;
-@@ -463,11 +511,7 @@ private:
+@@ -463,11 +528,7 @@ private:
          size_t size;
      };
  
