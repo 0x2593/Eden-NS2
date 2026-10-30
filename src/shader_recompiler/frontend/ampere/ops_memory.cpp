@@ -527,7 +527,7 @@ void Visitor::ATOMS_POPC() {
     const u32 stride = Take(78, 2);
     Require(Take(87, 4) == 10 && Take(91, 1) == 1, "native shared increment operation");
     Require(dest == 255, "native shared increment result");
-    ir.SharedAtomicIAdd(SharedOffset(reg, stride, 0), ir.Imm32(1U));
+    static_cast<void>(ir.SharedAtomicIAdd(SharedOffset(reg, stride, 0), ir.Imm32(1U)));
 }
 
 // BAR.SYNC 0 over the whole workgroup; bit 80 is the deferred-blocking scheduling qualifier.
