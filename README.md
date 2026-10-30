@@ -17,7 +17,8 @@ Nintendo Switch 2 games.
 
 ### Known issues
 
-- **Donkey Kong Bananza:** some destructible terrain is drawn as black patches.
+- **Donkey Kong Bananza:** destructible terrain is drawn black on NVIDIA and appears to be completely
+  invisible on AMD.
 - **Mario Kart World:** loading into a Grand Prix hangs on a black screen.
   Recommended per-game settings: GPU accuracy Low, asynchronous shaders on, and ASTC
   recompression BC3 (needed on GPUs with less than 8 GB of video memory). Some geometry
