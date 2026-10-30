@@ -36,11 +36,11 @@ jobs:
 
     - name: Build with MSVC Script
       shell: cmd
-      run: build-eden-msvc.bat < NUL
+      run: build-eden-msvc.bat 4 < NUL
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Eden-NS2-Windows
-        path: build/bin/
+        path: build-msvc-gui-relwithdebinfo/bin/
         if-no-files-found: error

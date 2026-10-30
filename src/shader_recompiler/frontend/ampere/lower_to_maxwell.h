@@ -2801,7 +2801,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         }
         case 0x209: case 0x809: case 0xa09: case 0xc09: { // FMNMX, register/imm/cbuf/uniform operand
             // The uniform form sets bit 91 as part of the operand form.
-            if (insn.Bits(74, 6) || insn.Bits(82, 5) || insn.Bits(91, 1) != (opcode == 0xc09))
+            if (insn.Bits(74, 6) || insn.Bits(82, 5) || (insn.Bits(91, 1) != 0) != (opcode == 0xc09))
                 return fail(index, "native floating min/max mode");
             const u32 a = operand(0), b = operand(1);
             const bool propagate_nan = insn.Bits(81, 1);
