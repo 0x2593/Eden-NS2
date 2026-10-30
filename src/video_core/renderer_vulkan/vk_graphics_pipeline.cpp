@@ -566,8 +566,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 if (!cb.enabled || cb.size == 0) continue;
                 std::array<u32, 12> words{};
                 const size_t bytes = std::min<size_t>(cb.size, sizeof(words));
-                if (const auto device = gpu_memory->GpuToCpuAddress(cb.address)) {
-                    buffer_cache.DownloadMemory(*device, bytes);
+                if (const auto device_addr = gpu_memory->GpuToCpuAddress(cb.address)) {
+                    buffer_cache.DownloadMemory(*device_addr, bytes);
                 }
                 gpu_memory->ReadBlockUnsafe(cb.address, words.data(), bytes);
                 std::array<f32, 12> floats{};

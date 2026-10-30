@@ -51202,7 +51202,7 @@ index 3d30aa6..3ffd99e 100644
  public:
      explicit BlockLinearUnswizzle3DPass(const Device& device_, Scheduler& scheduler_,
 diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-index 8b5b0bc..deb7409 100644
+index 8b5b0bc..3870db4 100644
 --- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 @@ -4,18 +4,24 @@
@@ -51418,8 +51418,8 @@ index 8b5b0bc..deb7409 100644
 +                if (!cb.enabled || cb.size == 0) continue;
 +                std::array<u32, 12> words{};
 +                const size_t bytes = std::min<size_t>(cb.size, sizeof(words));
-+                if (const auto device = gpu_memory->GpuToCpuAddress(cb.address)) {
-+                    buffer_cache.DownloadMemory(*device, bytes);
++                if (const auto device_addr = gpu_memory->GpuToCpuAddress(cb.address)) {
++                    buffer_cache.DownloadMemory(*device_addr, bytes);
 +                }
 +                gpu_memory->ReadBlockUnsafe(cb.address, words.data(), bytes);
 +                std::array<f32, 12> floats{};
