@@ -14,19 +14,21 @@ jobs:
         submodules: recursive
 
     - name: Install Choco Dependencies
-      run: |
-        choco install cmake ninja --installargs 'ADD_CMAKE_TO_PATH=System' -y
+      shell: cmd
+      run: choco install cmake ninja --installargs "ADD_CMAKE_TO_PATH=System" -y
 
     - name: Configure Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
 
     - name: Build with MSVC Script
       shell: cmd
-      run: |
-        call build-eden-msvc.bat
+      run: build-eden-msvc.bat
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Eden-NS2-Windows
         path: build/bin/
+        if-no-files-found: error
