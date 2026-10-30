@@ -503,6 +503,19 @@ index 0000000..3fbbd66
 +
 +set_property(GLOBAL APPEND PROPERTY CPM_PACKAGE_NAMES libgav1)
 +set_property(GLOBAL APPEND PROPERTY CPM_PACKAGE_URLS https://chromium.googlesource.com/codecs/libgav1)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a2abc7d..dbc41fc 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -107,8 +107,6 @@ if (MSVC AND NOT CXX_CLANG)
+         /we4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
+         /we4189 # 'identifier': local variable is initialized but not referenced
+         /we4265 # 'class': class has virtual functions, but destructor is not virtual
+-        /we4388 # 'expression': signed/unsigned mismatch
+-        /we4389 # 'operator': signed/unsigned mismatch
+         /we4456 # Declaration of 'identifier' hides previous local declaration
+         /we4457 # Declaration of 'identifier' hides function parameter
+         /we4458 # Declaration of 'identifier' hides class member
 diff --git a/src/audio_core/common/feature_support.h b/src/audio_core/common/feature_support.h
 index 4585be4..d6571c0 100644
 --- a/src/audio_core/common/feature_support.h
@@ -2115,7 +2128,7 @@ index 5ea5dde..acd1fe7 100644
      const bool m_debugger_enabled{};
      const bool m_check_memory_access{};
 diff --git a/src/core/core.cpp b/src/core/core.cpp
-index 06543b0..d2b262d 100644
+index 06543b0..8bd6c96 100644
 --- a/src/core/core.cpp
 +++ b/src/core/core.cpp
 @@ -24,6 +24,7 @@
@@ -2181,6 +2194,15 @@ index 06543b0..d2b262d 100644
 +        }
          return perf_stats->GetAndResetStats(core_timing.GetGlobalTimeUs());
      }
+ 
+@@ -1011,6 +1040,8 @@ void System::ApplySettings() {
+ 
+     if (IsPoweredOn()) {
+         Renderer().RefreshBaseSettings();
++        // Frontends switch docked/handheld through the settings; let the running game know.
++        GetAppletManager().OperationModeChanged();
+     }
+ }
  
 diff --git a/src/core/core.h b/src/core/core.h
 index d88ed64..0276679 100644
@@ -4832,6 +4854,49 @@ index 571fa65..69d2876 100644
      GamePlayRecordingState game_play_recording_state{GamePlayRecordingState::Disabled};
      bool jit_service_launched{};
      bool application_crash_report_enabled{};
+diff --git a/src/core/hle/service/am/applet_manager.cpp b/src/core/hle/service/am/applet_manager.cpp
+index 05bcf6c..887c452 100644
+--- a/src/core/hle/service/am/applet_manager.cpp
++++ b/src/core/hle/service/am/applet_manager.cpp
+@@ -248,11 +248,16 @@ void AppletManager::RequestExit() {
+     }
+ }
+ 
++// Frontends call this after any settings change, so only an actual docked/handheld switch is
++// passed on.
+ void AppletManager::OperationModeChanged() {
+     std::scoped_lock lk{m_lock};
+-    if (m_window_system) {
+-        m_window_system->OnOperationModeChanged();
++    const bool docked = Settings::IsDockedMode();
++    if (!m_window_system || docked == m_docked) {
++        return;
+     }
++    m_docked = docked;
++    m_window_system->OnOperationModeChanged();
+ }
+ 
+ void AppletManager::SetWindowSystem(WindowSystem* window_system) {
+@@ -262,6 +267,7 @@ void AppletManager::SetWindowSystem(WindowSystem* window_system) {
+     if (!m_window_system) {
+         return;
+     }
++    m_docked = Settings::IsDockedMode();
+ 
+     m_cv.wait(lk, [&] { return m_pending_process != nullptr; });
+ 
+diff --git a/src/core/hle/service/am/applet_manager.h b/src/core/hle/service/am/applet_manager.h
+index cd3035d..bae3ab4 100644
+--- a/src/core/hle/service/am/applet_manager.h
++++ b/src/core/hle/service/am/applet_manager.h
+@@ -58,6 +58,7 @@ private:
+     std::condition_variable m_cv;
+ 
+     WindowSystem* m_window_system{};
++    bool m_docked{}; // console mode the applets were last told about
+ 
+     FrontendAppletParameters m_pending_parameters{};
+     std::unique_ptr<Process> m_pending_process{};
 diff --git a/src/core/hle/service/am/frontend/applet_software_keyboard.cpp b/src/core/hle/service/am/frontend/applet_software_keyboard.cpp
 index fe07d72..9b6bd8c 100644
 --- a/src/core/hle/service/am/frontend/applet_software_keyboard.cpp
@@ -4956,11 +5021,91 @@ index c59e4b9..695d7e8 100644
          return std::make_shared<StubApplet>(system, applet, id, mode);
      }
  }
+diff --git a/src/core/hle/service/am/lifecycle_manager.cpp b/src/core/hle/service/am/lifecycle_manager.cpp
+index 4b003c4..14c6179 100644
+--- a/src/core/hle/service/am/lifecycle_manager.cpp
++++ b/src/core/hle/service/am/lifecycle_manager.cpp
+@@ -12,7 +12,8 @@ namespace Service::AM {
+ LifecycleManager::LifecycleManager(Core::System& system, KernelHelpers::ServiceContext& context,
+                                    bool is_application)
+     : m_system_event(context), m_operation_mode_changed_system_event(context),
+-      m_hdcp_state_changed_event(context), m_is_application(is_application) {}
++      m_operation_mode_refresh_event(context), m_hdcp_state_changed_event(context),
++      m_is_application(is_application) {}
+ 
+ LifecycleManager::~LifecycleManager() = default;
+ 
+@@ -24,6 +25,10 @@ Event& LifecycleManager::GetOperationModeChangedSystemEvent() {
+     return m_operation_mode_changed_system_event;
+ }
+ 
++Event& LifecycleManager::GetOperationModeRefreshEvent() {
++    return m_operation_mode_refresh_event;
++}
++
+ Event& LifecycleManager::GetHDCPStateChangedEvent() {
+     return m_hdcp_state_changed_event;
+ }
+@@ -152,6 +157,7 @@ void LifecycleManager::OnOperationAndPerformanceModeChanged(Kernel::KernelCore&
+         m_has_performance_mode_changed = true;
+     }
+     m_operation_mode_changed_system_event.Signal(kernel);
++    m_operation_mode_refresh_event.Signal(kernel);
+     this->SignalSystemEventIfNeeded(kernel);
+ }
+ 
+diff --git a/src/core/hle/service/am/lifecycle_manager.h b/src/core/hle/service/am/lifecycle_manager.h
+index 15657a3..097ad00 100644
+--- a/src/core/hle/service/am/lifecycle_manager.h
++++ b/src/core/hle/service/am/lifecycle_manager.h
+@@ -45,6 +45,7 @@ public:
+ public:
+     Event& GetSystemEvent();
+     Event& GetOperationModeChangedSystemEvent();
++    Event& GetOperationModeRefreshEvent();
+     Event& GetHDCPStateChangedEvent();
+ 
+ public:
+@@ -158,6 +159,7 @@ private:
+ private:
+     Event m_system_event;
+     Event m_operation_mode_changed_system_event;
++    Event m_operation_mode_refresh_event;
+     Event m_hdcp_state_changed_event;
+ 
+     std::list<AppletMessage> m_unordered_messages{};
 diff --git a/src/core/hle/service/am/service/application_functions.cpp b/src/core/hle/service/am/service/application_functions.cpp
-index 90d292c..3259406 100644
+index 90d292c..45470f5 100644
 --- a/src/core/hle/service/am/service/application_functions.cpp
 +++ b/src/core/hle/service/am/service/application_functions.cpp
-@@ -118,7 +118,9 @@ IApplicationFunctions::IApplicationFunctions(Core::System& system_, std::shared_
+@@ -9,11 +9,13 @@
+ #include "common/hex_util.h"
+ #include "common/settings.h"
+ #include "common/uuid.h"
++#include "core/core.h"
+ #include "core/file_sys/common_funcs.h"
+ #include "core/file_sys/control_metadata.h"
+ #include "core/file_sys/patch_manager.h"
+ #include "core/file_sys/registered_cache.h"
+ #include "core/file_sys/savedata_factory.h"
++#include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/k_transfer_memory.h"
+ #include "core/hle/result.h"
+ #include "core/hle/service/am/am_results.h"
+@@ -27,6 +29,7 @@
+ #include "core/hle/service/ns/application_manager_interface.h"
+ #include "core/hle/service/ns/service_getter_interface.h"
+ #include "core/hle/service/sm/sm.h"
++#include "core/loader/loader.h"
+ 
+ namespace Service::AM {
+ 
+@@ -114,11 +117,13 @@ IApplicationFunctions::IApplicationFunctions(Core::System& system_, std::shared_
+         {181, nullptr, "UpgradeLaunchRequiredVersion"},
+         {190, nullptr, "SendServerMaintenanceOverlayNotification"},
+         {200, nullptr, "GetLastApplicationExitReason"},
+-        {210, D<&IApplicationFunctions::GetUnknownEvent210>, "Unknown210"},
++        {210, D<&IApplicationFunctions::GetOperationModeRefreshEvent>, "GetOperationModeRefreshEvent (guessed)"},
          {220, nullptr, "Unknown220"}, // [20.0.0+]
          {300, nullptr, "CreateMovieWriter"}, // [19.0.0+]
          {310, nullptr, "Unknown310"}, // [20.0.0+]
@@ -4971,7 +5116,46 @@ index 90d292c..3259406 100644
          {330, D<&IApplicationFunctions::Unknown330>, "Unknown330"}, // [20.0.0+]
          {500, nullptr, "StartContinuousRecordingFlushForDebug"},
          {1000, nullptr, "CreateMovieMaker"},
-@@ -352,10 +354,12 @@ Result IApplicationFunctions::GetPseudoDeviceId(Out<Common::UUID> out_pseudo_dev
+@@ -214,18 +219,32 @@ Result IApplicationFunctions::SetTerminateResult(Result terminate_result) {
+     R_SUCCEED();
+ }
+ 
++// A loose ExeFS/RomFS dump has no installed control data: ask its loader (a control.nacp near the
++// dump, else the RomFS's version tag). Only for the program it loaded, not for library applets.
++bool IApplicationFunctions::LooseDumpDisplayVersion(std::string& version) {
++    auto& loader = system.GetAppLoader();
++    u64 program_id{};
++    if (loader.ReadProgramId(program_id) != Loader::ResultStatus::Success ||
++        FileSys::GetBaseTitleID(program_id) != FileSys::GetBaseTitleID(m_applet->program_id) ||
++        loader.ReadDisplayVersion(version) != Loader::ResultStatus::Success || version.empty()) {
++        return false;
++    }
++    LOG_INFO(Service_AM, "Display version {} from the dump's files", version);
++    return true;
++}
++
+ Result IApplicationFunctions::GetDisplayVersion(Out<DisplayVersion> out_display_version) {
+     LOG_DEBUG(Service_AM, "called");
+ 
+     const auto res = GetApplicationMetadata(system, m_applet->program_id);
++    std::string version;
+     if (res.first != nullptr) {
+-        const auto& version = res.first->GetVersionString();
+-        std::memcpy(out_display_version->string.data(), version.data(),
+-                    (std::min)(version.size(), out_display_version->string.size()));
+-    } else {
+-        static constexpr char default_version[]{"1.0.0"};
+-        std::memcpy(out_display_version->string.data(), default_version, sizeof(default_version));
++        version = res.first->GetVersionString();
++    } else if (!LooseDumpDisplayVersion(version)) {
++        version = "1.0.0";
+     }
++    std::memcpy(out_display_version->string.data(), version.data(),
++                (std::min)(version.size(), out_display_version->string.size()));
+ 
+     out_display_version->string[out_display_version->string.size() - 1] = '\0';
+     R_SUCCEED();
+@@ -352,10 +371,12 @@ Result IApplicationFunctions::GetPseudoDeviceId(Out<Common::UUID> out_pseudo_dev
      // This should be hashed with the device specific hash
      // for now this will do
      const auto res = FileSys::PatchManager::GetMetadataFromBaseOrUpdate(system, m_applet->program_id);
@@ -4986,10 +5170,27 @@ index 90d292c..3259406 100644
      EVP_MD_CTX *ctx = EVP_MD_CTX_new();
      auto const algorithm = EVP_sha1();
      EVP_DigestInit_ex(ctx, algorithm, nullptr);
-@@ -544,6 +548,24 @@ Result IApplicationFunctions::GetUnknownEvent210(
+@@ -537,10 +558,36 @@ Result IApplicationFunctions::GetHealthWarningDisappearedSystemEvent(
      R_SUCCEED();
  }
  
+-Result IApplicationFunctions::GetUnknownEvent210(
++// The Switch 2 nn::oe::GetOperationMode caches the mode and only asks ICommonStateGetter again
++// once this event is signaled, so it has to fire on every docked/handheld change. Switch 1 titles
++// keep the event that never fires, as its use there is unknown.
++Result IApplicationFunctions::GetOperationModeRefreshEvent(
+     OutCopyHandle<Kernel::KReadableEvent> out_event) {
+     LOG_DEBUG(Service_AM, "called");
+-    *out_event = m_applet->unknown_event.GetHandle();
++    const auto* process = m_applet->process ? m_applet->process->GetHandle() : nullptr;
++    if (process != nullptr && process->IsSwitch2()) {
++        *out_event = m_applet->lifecycle_manager.GetOperationModeRefreshEvent().GetHandle();
++    } else {
++        *out_event = m_applet->unknown_event.GetHandle();
++    }
++    R_SUCCEED();
++}
++
 +Result IApplicationFunctions::GetScreenShotAndContinuousRecordingInitiallyEnabled(
 +    Out<bool> out_screenshot_enabled, Out<bool> out_recording_enabled) {
 +    std::scoped_lock lk{m_applet->lock};
@@ -5005,20 +5206,27 @@ index 90d292c..3259406 100644
 +    // SDK 23.0 uses this initial bool for VI buffer permission bit 4 and RTC sharing audio.
 +    *out_enabled = false;
 +    LOG_DEBUG(Service_AM, "called, enabled={}", *out_enabled);
-+    R_SUCCEED();
-+}
-+
- Result IApplicationFunctions::Unknown330(Out<u8> out) {
-     LOG_DEBUG(Service_AM, "called");
-     *out = 0;
+     R_SUCCEED();
+ }
+ 
 diff --git a/src/core/hle/service/am/service/application_functions.h b/src/core/hle/service/am/service/application_functions.h
-index b97ed7e..f0371c3 100644
+index b97ed7e..664af89 100644
 --- a/src/core/hle/service/am/service/application_functions.h
 +++ b/src/core/hle/service/am/service/application_functions.h
-@@ -82,6 +82,9 @@ private:
+@@ -36,6 +36,7 @@ private:
+     Result GetDesiredLanguage(Out<u64> out_language_code);
+     Result SetTerminateResult(Result terminate_result);
+     Result GetDisplayVersion(Out<DisplayVersion> out_display_version);
++    bool LooseDumpDisplayVersion(std::string& version);
+     Result ExtendSaveData(Out<u64> out_required_size, FileSys::SaveDataType type,
+                           Common::UUID user_id, u64 normal_size, u64 journal_size);
+     Result GetSaveDataSize(Out<u64> out_normal_size, Out<u64> out_journal_size,
+@@ -81,7 +82,10 @@ private:
+     Result GetNotificationStorageChannelEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
      Result GetHealthWarningDisappearedSystemEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
      Result CreateApplicationAndRequestToStart(u64 application_id);
-     Result GetUnknownEvent210(OutCopyHandle<Kernel::KReadableEvent> out_event);
+-    Result GetUnknownEvent210(OutCopyHandle<Kernel::KReadableEvent> out_event);
++    Result GetOperationModeRefreshEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
 +    Result GetScreenShotAndContinuousRecordingInitiallyEnabled(
 +        Out<bool> out_screenshot_enabled, Out<bool> out_recording_enabled);
 +    Result Unknown321(Out<bool> out_enabled);
@@ -14309,10 +14517,20 @@ index a048322..814a2cb 100644
                  if (!argument_ok) {
                      // try to look it up by username, only finds the first username that matches.
 diff --git a/src/core/loader/deconstructed_rom_directory.cpp b/src/core/loader/deconstructed_rom_directory.cpp
-index 5e2ec7e..367e051 100644
+index 5e2ec7e..8cc65a7 100644
 --- a/src/core/loader/deconstructed_rom_directory.cpp
 +++ b/src/core/loader/deconstructed_rom_directory.cpp
-@@ -13,9 +13,12 @@
+@@ -4,7 +4,9 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <cstring>
++#include <string_view>
+ #include "common/logging.h"
+ #include "common/random.h"
+ #include "common/settings.h"
+@@ -13,9 +15,12 @@
  #include "core/file_sys/control_metadata.h"
  #include "core/file_sys/patch_manager.h"
  #include "core/file_sys/romfs_factory.h"
@@ -14325,7 +14543,81 @@ index 5e2ec7e..367e051 100644
  #include "core/loader/deconstructed_rom_directory.h"
  #include "core/loader/nso.h"
  
-@@ -129,10 +132,14 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
+@@ -71,6 +76,40 @@ struct PatchCollection {
+     std::array<s32, 13> module_patcher_indices{};
+ };
+ 
++// The display version of a dump without control data, from its RomFS: Nintendo EPD titles name
++// their resource size tables after it (System/Resource/ResourceSizeTable.Product.180.* in Mario
++// Kart World 1.8.0). A hotfix can keep its minor version's tables (Product.110 in a 1.1.1).
++static std::string RomFSProductVersion(const FileSys::VirtualDir& romfs_dir) {
++    if (romfs_dir == nullptr) {
++        return {};
++    }
++    const auto system_dir = romfs_dir->GetSubdirectory("System");
++    const auto resource_dir = system_dir != nullptr ? system_dir->GetSubdirectory("Resource") : nullptr;
++    if (resource_dir == nullptr) {
++        return {};
++    }
++    constexpr std::string_view Prefix = "ResourceSizeTable.Product.";
++    std::string best;
++    for (const auto& file : resource_dir->GetFiles()) {
++        const std::string file_name = file->GetName();
++        if (!file_name.starts_with(Prefix) || file_name.size() < Prefix.size() + 4) {
++            continue;
++        }
++        const std::string_view digits = std::string_view{file_name}.substr(Prefix.size(), 3);
++        if (file_name[Prefix.size() + 3] != '.' ||
++            !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; })) {
++            continue;
++        }
++        if (std::string version{digits}; version > best) {
++            best = version;
++        }
++    }
++    if (best.empty()) {
++        return {};
++    }
++    return fmt::format("{}.{}.{}", best[0], best[1], best[2]);
++}
++
+ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_, bool override_update_)
+     : AppLoader(std::move(file_))
+     , override_update(override_update_)
+@@ -107,7 +146,8 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
+             icon_data = (*icon_iter)->ReadAllBytes();
+     }
+ 
+-    // Metadata
++    // Metadata: control.nacp (or any .nacp) next to main, else a control.nacp in the folders above
++    // it (dumps keep the title's or the update's control data at their root).
+     FileSys::VirtualFile nacp_file = file_dir->GetFile("control.nacp");
+     if (nacp_file == nullptr) {
+         const auto& files = file_dir->GetFiles();
+@@ -118,9 +158,20 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
+             nacp_file = *nacp_iter;
+     }
+ 
++    auto parent = file_dir->GetParentDirectory();
++    for (int level = 0; level < 3 && nacp_file == nullptr && parent != nullptr; ++level) {
++        nacp_file = parent->GetFile("control.nacp");
++        parent = parent->GetParentDirectory();
++    }
++
+     if (nacp_file != nullptr) {
+-        FileSys::NACP nacp(nacp_file);
+-        name = nacp.GetApplicationName();
++        control.emplace(nacp_file);
++        name = control->GetApplicationName();
++    }
++
++    // The loose RomFS beside the exefs folder (as ReadRomFS finds it).
++    if (const auto title_dir = file_dir->GetParentDirectory()) {
++        romfs_version = RomFSProductVersion(title_dir->GetSubdirectory("romfs"));
+     }
+ }
+ 
+@@ -129,10 +180,14 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
      : AppLoader(directory->GetFile("main"))
      , dir(std::move(directory))
      , override_update(override_update_)
@@ -14341,7 +14633,7 @@ index 5e2ec7e..367e051 100644
          return FileType::DeconstructedRomDirectory;
      }
  
-@@ -182,11 +189,11 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
+@@ -182,11 +237,11 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
      }
      metadata.Print();
  
@@ -14355,7 +14647,7 @@ index 5e2ec7e..367e051 100644
  
      const std::array static_modules = {"rtld",    "main",    "subsdk0", "subsdk1", "subsdk2",
                                         "subsdk3", "subsdk4", "subsdk5", "subsdk6", "subsdk7",
-@@ -264,14 +271,59 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
+@@ -264,14 +319,59 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
          next_load_addr = *tentative_next_load_addr;
          modules.insert_or_assign(load_addr, module);
          LOG_DEBUG(Loader, "loaded module {} @ {:#x}", module, load_addr);
@@ -14415,12 +14707,63 @@ index 5e2ec7e..367e051 100644
      if (romfs == nullptr) {
          return ResultStatus::ErrorNoRomFS;
      }
+@@ -303,6 +403,26 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadTitle(std::string& out_tit
+     return ResultStatus::Success;
+ }
+ 
++ResultStatus AppLoader_DeconstructedRomDirectory::ReadControlData(FileSys::NACP& out_control) {
++    if (!control) {
++        return ResultStatus::ErrorNoControl;
++    }
++    out_control = *control;
++    return ResultStatus::Success;
++}
++
++ResultStatus AppLoader_DeconstructedRomDirectory::ReadDisplayVersion(std::string& version) {
++    if (control && !control->GetVersionString().empty()) {
++        version = control->GetVersionString();
++        return ResultStatus::Success;
++    }
++    if (!romfs_version.empty()) {
++        version = romfs_version;
++        return ResultStatus::Success;
++    }
++    return ResultStatus::ErrorNoControl;
++}
++
+ bool AppLoader_DeconstructedRomDirectory::IsRomFSUpdatable() const {
+     return false;
+ }
 diff --git a/src/core/loader/deconstructed_rom_directory.h b/src/core/loader/deconstructed_rom_directory.h
-index 7283db0..aba8993 100644
+index 7283db0..35f9e80 100644
 --- a/src/core/loader/deconstructed_rom_directory.h
 +++ b/src/core/loader/deconstructed_rom_directory.h
-@@ -62,6 +62,7 @@ private:
+@@ -6,8 +6,10 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include <string>
+ #include "common/common_types.h"
++#include "core/file_sys/control_metadata.h"
+ #include "core/file_sys/program_metadata.h"
+ #include "core/loader/loader.h"
+ 
+@@ -49,6 +51,8 @@ public:
+     ResultStatus ReadIcon(std::vector<u8>& out_buffer) override;
+     ResultStatus ReadProgramId(u64& out_program_id) override;
+     ResultStatus ReadTitle(std::string& title) override;
++    ResultStatus ReadControlData(FileSys::NACP& control) override;
++    ResultStatus ReadDisplayVersion(std::string& version) override;
+     bool IsRomFSUpdatable() const override;
+ 
+     ResultStatus ReadNSOModules(Modules& out_modules) override;
+@@ -60,8 +64,11 @@ private:
+ 
+     std::vector<u8> icon_data;
      std::string name;
++    std::optional<FileSys::NACP> control; ///< control.nacp next to or above the dump, if any
++    std::string romfs_version;            ///< "1.8.0" from the RomFS's Product.180 tables, if any
      u64 title_id{};
      bool override_update;
 +    bool standalone{true};
@@ -14428,10 +14771,18 @@ index 7283db0..aba8993 100644
      Modules modules;
  };
 diff --git a/src/core/loader/loader.cpp b/src/core/loader/loader.cpp
-index 92e2e2f..171984f 100644
+index 92e2e2f..e56a6fc 100644
 --- a/src/core/loader/loader.cpp
 +++ b/src/core/loader/loader.cpp
-@@ -125,6 +125,10 @@ bool HasApplicationProgramContent(const std::shared_ptr<FileSys::NSP>& nsp) {
+@@ -17,6 +17,7 @@
+ #include "core/core.h"
+ #include "core/file_sys/card_image.h"
+ #include "core/file_sys/common_funcs.h"
++#include "core/file_sys/control_metadata.h"
+ #include "core/file_sys/content_archive.h"
+ #include "core/file_sys/registered_cache.h"
+ #include "core/file_sys/submission_package.h"
+@@ -125,6 +126,10 @@ bool HasApplicationProgramContent(const std::shared_ptr<FileSys::NSP>& nsp) {
  } // namespace
  
  FileType IdentifyFile(FileSys::VirtualFile file) {
@@ -14442,7 +14793,7 @@ index 92e2e2f..171984f 100644
      if (const auto nsp_type = IdentifyFileLoader<AppLoader_NSP>(file)) {
          return *nsp_type;
      } else if (const auto xci_type = IdentifyFileLoader<AppLoader_XCI>(file)) {
-@@ -139,9 +143,6 @@ FileType IdentifyFile(FileSys::VirtualFile file) {
+@@ -139,9 +144,6 @@ FileType IdentifyFile(FileSys::VirtualFile file) {
          return *kip_type;
      } else if (const auto nso_type = IdentifyFileLoader<AppLoader_NSO>(file)) {
          return *nso_type;
@@ -14452,7 +14803,23 @@ index 92e2e2f..171984f 100644
      } else {
          return FileType::Unknown;
      }
-@@ -393,6 +394,13 @@ std::unique_ptr<AppLoader> GetLoader(Core::System& system, FileSys::VirtualFile
+@@ -309,6 +311,15 @@ std::ostream& operator<<(std::ostream& os, ResultStatus status) {
+ AppLoader::AppLoader(FileSys::VirtualFile file_) : file(std::move(file_)) {}
+ AppLoader::~AppLoader() = default;
+ 
++ResultStatus AppLoader::ReadDisplayVersion(std::string& version) {
++    FileSys::NACP control;
++    if (const ResultStatus result = ReadControlData(control); result != ResultStatus::Success) {
++        return result;
++    }
++    version = control.GetVersionString();
++    return ResultStatus::Success;
++}
++
+ /**
+  * Get a loader for a file with a specific type
+  * @param system The system context to use.
+@@ -393,6 +404,13 @@ std::unique_ptr<AppLoader> GetLoader(Core::System& system, FileSys::VirtualFile
      FileType type = IdentifyFile(file);
      const FileType filename_type = GuessFromFilename(file->GetName());
  
@@ -14466,6 +14833,26 @@ index 92e2e2f..171984f 100644
      // Special case: 00 is either a NCA or NAX.
      if (type != filename_type && !(file->GetName() == "00" && type == FileType::NAX)) {
          LOG_WARNING(Loader, "File {} has a different type ({}) than its extension.",
+diff --git a/src/core/loader/loader.h b/src/core/loader/loader.h
+index d3c0230..431aeac 100644
+--- a/src/core/loader/loader.h
++++ b/src/core/loader/loader.h
+@@ -327,6 +327,15 @@ public:
+         return ResultStatus::ErrorNotImplemented;
+     }
+ 
++    /**
++     * Get the application's display version ("1.8.0"), from its control data by default
++     *
++     * @param[out] version Reference to store the display version into
++     *
++     * @return ResultStatus result of function
++     */
++    virtual ResultStatus ReadDisplayVersion(std::string& version);
++
+     /**
+      * Get the RomFS of the manual of the application
+      *
 diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
 index ea1d1c9..7e3b9a5 100644
 --- a/src/core/loader/nso.cpp
@@ -19094,7 +19481,7 @@ index 0000000..7b682de
 +} // namespace Shader::Ampere
 diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 new file mode 100644
-index 0000000..f3c4458
+index 0000000..b35e850
 --- /dev/null
 +++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 @@ -0,0 +1,3951 @@
@@ -19403,7 +19790,7 @@ index 0000000..f3c4458
 +        }
 +        const bool uniform_predicate_bank = original_opcode == 0x290 || original_opcode == 0x890 || original_opcode == 0x892;
 +        if (uniform_predicate_bank) {
-+            const auto map = [](u32 code) { return ((code & 7) == 7 ? 7U : 6U - (code & 7)) | (code & 8); };
++            const auto map = [](u32 c) { return ((c & 7) == 7 ? 7U : 6U - (c & 7)) | (c & 8); };
 +            const u32 execution = map(insn.Bits(12, 4));
 +            insn.words[0] = (insn.words[0] & ~0xf000U) | (execution << 12);
 +            const u32 first = map(insn.Bits(81, 3));
@@ -21901,7 +22288,7 @@ index 0000000..f3c4458
 +        }
 +        case 0x209: case 0x809: case 0xa09: case 0xc09: { // FMNMX, register/imm/cbuf/uniform operand
 +            // The uniform form sets bit 91 as part of the operand form.
-+            if (insn.Bits(74, 6) || insn.Bits(82, 5) || insn.Bits(91, 1) != (opcode == 0xc09))
++            if (insn.Bits(74, 6) || insn.Bits(82, 5) || (insn.Bits(91, 1) != 0) != (opcode == 0xc09))
 +                return fail(index, "native floating min/max mode");
 +            const u32 a = operand(0), b = operand(1);
 +            const bool propagate_nan = insn.Bits(81, 1);
@@ -24801,7 +25188,7 @@ index 0000000..551dbd2
 +} // namespace Shader::Ampere
 diff --git a/src/shader_recompiler/frontend/ampere/ops_memory.cpp b/src/shader_recompiler/frontend/ampere/ops_memory.cpp
 new file mode 100644
-index 0000000..11d04e5
+index 0000000..55c10ea
 --- /dev/null
 +++ b/src/shader_recompiler/frontend/ampere/ops_memory.cpp
 @@ -0,0 +1,691 @@
@@ -25334,7 +25721,7 @@ index 0000000..11d04e5
 +    const u32 stride = Take(78, 2);
 +    Require(Take(87, 4) == 10 && Take(91, 1) == 1, "native shared increment operation");
 +    Require(dest == 255, "native shared increment result");
-+    ir.SharedAtomicIAdd(SharedOffset(reg, stride, 0), ir.Imm32(1U));
++    static_cast<void>(ir.SharedAtomicIAdd(SharedOffset(reg, stride, 0), ir.Imm32(1U)));
 +}
 +
 +// BAR.SYNC 0 over the whole workgroup; bit 80 is the deferred-blocking scheduling qualifier.
@@ -53265,7 +53652,7 @@ index d926cc1..4151600 100644
      /// Presents the rendered image to the swapchain.
      void Present(VkSemaphore render_semaphore);
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
-index 583cb6e..fb2e5fd 100644
+index 583cb6e..e898436 100644
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 @@ -7,6 +7,7 @@
@@ -53624,7 +54011,24 @@ index 583cb6e..fb2e5fd 100644
          create(TextureType::ColorCube, 6);
          create(TextureType::ColorArrayCube, std::nullopt);
          break;
-@@ -2821,6 +3024,11 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
+@@ -2706,6 +2909,16 @@ vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_
+                                   std::optional<Shader::TextureType> texture_type) {
+     VkImageViewType view_type = ImageViewType(type);
+     VkImageSubresourceRange subresource_range = MakeSubresourceRange(aspect_mask, range);
++    const auto is_3d = [](VkImageViewType t) { return t == VK_IMAGE_VIEW_TYPE_3D; };
++    if (texture_type && is_3d(ImageViewType(*texture_type)) != is_3d(view_type)) {
++        // A 3D view of a 2D image (or the reverse) is invalid in Vulkan and aborts on Metal; keep
++        // the image's own type when the shader's declared dimension disagrees with it.
++        LOG_WARNING(Render_Vulkan,
++                    "Shader image type {} does not match view type {} at 0x{:x} (format={} "
++                    "size={}x{}x{}), using the view type",
++                    *texture_type, type, gpu_addr, format, size.width, size.height, size.depth);
++        texture_type.reset();
++    }
+     if (texture_type) {
+         view_type = ImageViewType(*texture_type);
+         switch (view_type) {
+@@ -2821,6 +3034,11 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
      if (tsc.mipmap_filter != TextureMipmapFilter::None) {
          min_lod = tsc.MinLod();
          max_lod = tsc.MaxLod();
@@ -53636,7 +54040,7 @@ index 583cb6e..fb2e5fd 100644
      }
      base_ci = VkSamplerCreateInfo{
          .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-@@ -3133,6 +3341,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
+@@ -3133,6 +3351,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
      u32 z_start, u32 z_count) {
  
      if (IsPixelFormatASTC(image.info.format)) {
@@ -53646,7 +54050,7 @@ index 583cb6e..fb2e5fd 100644
          return astc_decoder_pass->Assemble(image, map, swizzles);
      }
  
-@@ -3151,6 +3362,117 @@ void TextureCacheRuntime::AccelerateImageUpload(
+@@ -3151,6 +3372,117 @@ void TextureCacheRuntime::AccelerateImageUpload(
      ASSERT(false);
  }
  
@@ -55050,7 +55454,7 @@ index d6e019c..35860c7 100644
          return PixelFormat::D24_UNORM_S8_UINT;
      case Hash(TextureFormat::Z32_X24S8, FLOAT, UINT, UNORM, UNORM, LINEAR):
 diff --git a/src/video_core/texture_cache/image_base.cpp b/src/video_core/texture_cache/image_base.cpp
-index 9b0f332..8db081d 100644
+index 9b0f332..3185dd8 100644
 --- a/src/video_core/texture_cache/image_base.cpp
 +++ b/src/video_core/texture_cache/image_base.cpp
 @@ -109,7 +109,9 @@ std::optional<SubresourceBase> ImageBase::TryFindBase(GPUVAddr other_addr) const
@@ -55058,8 +55462,8 @@ index 9b0f332..8db081d 100644
  
  ImageViewId ImageBase::FindView(const ImageViewInfo& view_info) const noexcept {
 -    const auto it = std::ranges::find(image_view_infos, view_info);
-+    const auto it = std::ranges::find_if(image_view_infos, [&view_info](const ImageViewInfo& info) {
-+        return info == view_info;
++    const auto it = std::ranges::find_if(image_view_infos, [&view_info](const ImageViewInfo& candidate) {
++        return candidate == view_info;
 +    });
      if (it == image_view_infos.end()) {
          return ImageViewId{};
