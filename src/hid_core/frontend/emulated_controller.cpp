@@ -1872,9 +1872,44 @@ DebugPadButton EmulatedController::GetDebugPadButtons() const {
     return controller.debug_pad_button_state;
 }
 
+// EDEN_AUTO_STICK=<start>,<end>,<left x>,<left y>,<right x>,<right y>[;...]: holds the sticks at
+// those positions (-1 to 1) between the two times (seconds after launch), for unattended runs
+// that have to walk or turn the camera.
+static std::optional<AnalogSticks> AutoSticks() {
+    static const auto windows = [] {
+        std::vector<std::array<double, 6>> parsed;
+        for (const char* cursor = std::getenv("EDEN_AUTO_STICK"); cursor && *cursor;) {
+            std::array<double, 6> window{};
+            if (std::sscanf(cursor, "%lf,%lf,%lf,%lf,%lf,%lf", &window[0], &window[1], &window[2],
+                            &window[3], &window[4], &window[5]) == 6) {
+                parsed.push_back(window);
+            }
+            cursor = std::strchr(cursor, ';');
+            if (cursor) ++cursor;
+        }
+        return parsed;
+    }();
+    if (windows.empty()) return std::nullopt;
+    const double now =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
+    for (const auto& window : windows) {
+        if (now >= window[0] && now <= window[1]) {
+            const auto axis = [](double value) {
+                return static_cast<s32>(std::clamp(value, -1.0, 1.0) * HID_JOYSTICK_MAX);
+            };
+            return AnalogSticks{.left = {axis(window[2]), axis(window[3])},
+                                .right = {axis(window[4]), axis(window[5])}};
+        }
+    }
+    return std::nullopt;
+}
+
 AnalogSticks EmulatedController::GetSticks() const {
     if (is_configuring)
         return {};
+    if (const auto scripted = AutoSticks()) {
+        return *scripted;
+    }
     return controller.analog_stick_state;
 }
 

@@ -16029,7 +16029,7 @@ index 15a77e4..1b7b22f 100644
      A64/fp_min_max.cpp
      A64/misaligned_page_table.cpp
 diff --git a/src/hid_core/frontend/emulated_controller.cpp b/src/hid_core/frontend/emulated_controller.cpp
-index 7b4af13..d2c232c 100644
+index 7b4af13..744c579 100644
 --- a/src/hid_core/frontend/emulated_controller.cpp
 +++ b/src/hid_core/frontend/emulated_controller.cpp
 @@ -5,6 +5,13 @@
@@ -16107,6 +16107,76 @@ index 7b4af13..d2c232c 100644
  }
  
  DebugPadButton EmulatedController::GetDebugPadButtons() const {
+@@ -1816,9 +1872,44 @@ DebugPadButton EmulatedController::GetDebugPadButtons() const {
+     return controller.debug_pad_button_state;
+ }
+ 
++// EDEN_AUTO_STICK=<start>,<end>,<left x>,<left y>,<right x>,<right y>[;...]: holds the sticks at
++// those positions (-1 to 1) between the two times (seconds after launch), for unattended runs
++// that have to walk or turn the camera.
++static std::optional<AnalogSticks> AutoSticks() {
++    static const auto windows = [] {
++        std::vector<std::array<double, 6>> parsed;
++        for (const char* cursor = std::getenv("EDEN_AUTO_STICK"); cursor && *cursor;) {
++            std::array<double, 6> window{};
++            if (std::sscanf(cursor, "%lf,%lf,%lf,%lf,%lf,%lf", &window[0], &window[1], &window[2],
++                            &window[3], &window[4], &window[5]) == 6) {
++                parsed.push_back(window);
++            }
++            cursor = std::strchr(cursor, ';');
++            if (cursor) ++cursor;
++        }
++        return parsed;
++    }();
++    if (windows.empty()) return std::nullopt;
++    const double now =
++        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
++    for (const auto& window : windows) {
++        if (now >= window[0] && now <= window[1]) {
++            const auto axis = [](double value) {
++                return static_cast<s32>(std::clamp(value, -1.0, 1.0) * HID_JOYSTICK_MAX);
++            };
++            return AnalogSticks{.left = {axis(window[2]), axis(window[3])},
++                                .right = {axis(window[4]), axis(window[5])}};
++        }
++    }
++    return std::nullopt;
++}
++
+ AnalogSticks EmulatedController::GetSticks() const {
+     if (is_configuring)
+         return {};
++    if (const auto scripted = AutoSticks()) {
++        return *scripted;
++    }
+     return controller.analog_stick_state;
+ }
+ 
+diff --git a/src/hid_core/resources/npad/npad.cpp b/src/hid_core/resources/npad/npad.cpp
+index 2b04e2c..a39731f 100644
+--- a/src/hid_core/resources/npad/npad.cpp
++++ b/src/hid_core/resources/npad/npad.cpp
+@@ -149,13 +149,19 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
+         ControllerUpdate(kernel, Core::HID::ControllerTriggerType::Battery, controller_idx);
+         return;
+     }
++    // Controllers report connection and battery changes from the input thread as soon as they
++    // are set up, which can be before the HID service activated its applet resource.
++    const auto applet_resource = applet_resource_holder.applet_resource;
++    if (applet_resource == nullptr) {
++        return;
++    }
+ 
+     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
+         if (controller_idx >= controller_data[aruid_index].size()) {
+             return;
+         }
+ 
+-        auto* data = applet_resource_holder.applet_resource->GetAruidDataByIndex(aruid_index);
++        auto* data = applet_resource->GetAruidDataByIndex(aruid_index);
+ 
+         if (data == nullptr || !data->flag.is_assigned) {
+             continue;
 diff --git a/src/input_common/drivers/tas_input.cpp b/src/input_common/drivers/tas_input.cpp
 index 32febc0..520ea8b 100644
 --- a/src/input_common/drivers/tas_input.cpp
@@ -16269,6 +16339,20 @@ index 96aac50..632c300 100644
  void EmitFPLog2(EmitContext& ctx, IR::Inst& inst, std::string_view value);
  void EmitFPRecip32(EmitContext& ctx, IR::Inst& inst, std::string_view value);
  void EmitFPRecip64(EmitContext& ctx, IR::Inst& inst, std::string_view value);
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.h b/src/shader_recompiler/backend/spirv/emit_spirv.h
+index c88f07c..bfe3a35 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.h
+@@ -33,6 +33,9 @@ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescalin
+ constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
+ constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
+ 
++/// Diagnostics: the unique hash of the shader being emitted on this thread (EDEN_DEBUG_SHADER).
++inline thread_local u64 debug_shader_hash{};
++
+ [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
+ [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
+     Bindings binding;
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
 index d1c08c1..1d62096 100644
 --- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
@@ -16360,10 +16444,26 @@ index d1c08c1..1d62096 100644
  
  Id EmitGlobalAtomicIAdd64(EmitContext&) {
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
-index 28f9869..19f82f8 100644
+index 28f9869..742d1f9 100644
 --- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
 +++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
-@@ -58,6 +58,9 @@ std::optional<OutAttr> OutputAttrPointer(EmitContext& ctx, IR::Attribute attr) {
+@@ -4,10 +4,15 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <bit>
++#include <cstdlib>
++#include <cstring>
+ #include <tuple>
++#include <vector>
+ #include <utility>
+ 
++#include "shader_recompiler/backend/spirv/emit_spirv.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+ 
+@@ -58,6 +63,9 @@ std::optional<OutAttr> OutputAttrPointer(EmitContext& ctx, IR::Attribute attr) {
      }
  
      switch (attr) {
@@ -16373,6 +16473,45 @@ index 28f9869..19f82f8 100644
      case IR::Attribute::PointSize:
          return ctx.output_point_size;
      case IR::Attribute::PositionX:
+@@ -490,6 +498,38 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
+     const Id component_id{ctx.Const(component)};
+     const AttributeType type{ctx.runtime_info.color_output_types[index]};
+     if (type == AttributeType::Float) {
++        // EDEN_NAN_OUTPUTS=magenta|zero|big (diagnostic): float color outputs that are NaN or
++        // infinite become magenta, to find the draw that makes them, or zero; "big" also marks
++        // values over 4096 magenta.
++        static const char nan_outputs = [] {
++            const char* value = std::getenv("EDEN_NAN_OUTPUTS");
++            return value != nullptr ? value[0] : '\0';
++        }();
++        if (nan_outputs == 'm' || nan_outputs == 'z' || nan_outputs == 'b') {
++            Id bad{ctx.OpLogicalOr(ctx.U1, ctx.OpIsNan(ctx.U1, value), ctx.OpIsInf(ctx.U1, value))};
++            if (nan_outputs == 'b') {
++                bad = ctx.OpLogicalOr(ctx.U1, bad,
++                                      ctx.OpFOrdGreaterThan(ctx.U1, ctx.OpFAbs(ctx.F32[1], value),
++                                                            ctx.Const(4096.0f)));
++            }
++            const f32 replacement{nan_outputs != 'z' && component != 1 ? 1.0f : 0.0f};
++            value = ctx.OpSelect(ctx.F32[1], bad, ctx.Const(replacement), value);
++        }
++        // EDEN_DEBUG_SHADER=<hash>[,<hash>...] (diagnostic): those fragment shaders output a magenta
++        // bright enough to stay visible after HDR exposure (1000), with alpha one.
++        static const std::vector<u64> debug_hashes = [] {
++            std::vector<u64> hashes;
++            for (const char* cursor = std::getenv("EDEN_DEBUG_SHADER"); cursor && *cursor;) {
++                hashes.push_back(std::strtoull(cursor, nullptr, 16));
++                cursor = std::strchr(cursor, ',');
++                if (cursor) ++cursor;
++            }
++            return hashes;
++        }();
++        if (!debug_hashes.empty() &&
++            std::find(debug_hashes.begin(), debug_hashes.end(), debug_shader_hash) != debug_hashes.end()) {
++            value = ctx.Const(component == 1 ? 0.0f : component == 3 ? 1.0f : 1000.0f);
++        }
+         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
+         ctx.OpStore(pointer, value);
+     } else if (type == AttributeType::UnsignedInt) {
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
 index d921913..fbc8632 100644
 --- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
@@ -41365,7 +41504,7 @@ index 64d14ab..d54a141 100644
      texture_cache/image_view_base.h
      texture_cache/image_view_info.cpp
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
-index f30c859..f184c04 100644
+index f30c859..eacaa64 100644
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
 @@ -9,11 +9,19 @@
@@ -41500,18 +41639,16 @@ index f30c859..f184c04 100644
  template <class P>
  void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
      async_downloads.DeleteAll(device_addr, size);
-@@ -234,7 +292,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+@@ -234,7 +292,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
          const DAddr diff = base_address - *cpu_src_address;
          const DAddr new_base_address = *cpu_dest_address + diff;
          tmp_intervals.push_back({new_base_address, size});
 -        uncommitted_gpu_modified_ranges.Add(new_base_address, size);
-+        if (AsyncBufferDownloads()) {
-+            uncommitted_gpu_modified_ranges.Add(new_base_address, size);
-+        }
++        QueueDownload(new_base_address, size);
      };
      gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
      // This subtraction in this order is important for overlapping copies.
-@@ -455,8 +515,11 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
+@@ -455,8 +513,11 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
  
      const auto& cbufs = maxwell3d->state.shader_stages[stage];
      const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
@@ -41524,7 +41661,7 @@ index f30c859..f184c04 100644
      return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
  }
  
-@@ -471,6 +534,8 @@ template <class P>
+@@ -471,6 +532,8 @@ template <class P>
  void BufferCache<P>::BindGraphicsTextureBuffer(size_t stage, size_t tbo_index, GPUVAddr gpu_addr,
                                                 u32 size, PixelFormat format, bool is_written,
                                                 bool is_image) {
@@ -41533,7 +41670,7 @@ index f30c859..f184c04 100644
      channel_state->enabled_texture_buffers[stage] |= 1U << tbo_index;
      channel_state->written_texture_buffers[stage] |= (is_written ? 1U : 0U) << tbo_index;
      if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
-@@ -531,8 +596,23 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+@@ -531,8 +594,23 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
  
      const auto& cbufs = launch_desc.const_buffer_config;
      const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
@@ -41558,7 +41695,7 @@ index f30c859..f184c04 100644
  }
  
  template <class P>
-@@ -550,6 +630,7 @@ void BufferCache<P>::BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_add
+@@ -550,6 +628,7 @@ void BufferCache<P>::BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_add
                    tbo_index);
          return;
      }
@@ -41566,7 +41703,7 @@ index f30c859..f184c04 100644
      channel_state->enabled_compute_texture_buffers |= 1U << tbo_index;
      channel_state->written_compute_texture_buffers |= (is_written ? 1U : 0U) << tbo_index;
      if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
-@@ -649,6 +730,8 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+@@ -649,6 +728,8 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
          async_buffers.emplace_back(std::optional<Async_Buffer>{});
          return;
      }
@@ -41575,7 +41712,7 @@ index f30c859..f184c04 100644
      auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
      boost::container::small_vector<BufferCopy, 4> normalized_copies;
      runtime.PreCopyBarrier();
-@@ -659,6 +742,19 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+@@ -659,6 +740,19 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
          Buffer& buffer = slot_buffers[buffer_id];
          second_copy.src_offset = static_cast<size_t>(buffer.CpuAddr()) + copy.src_offset;
          const DAddr orig_device_addr = static_cast<DAddr>(second_copy.src_offset);
@@ -41595,7 +41732,7 @@ index f30c859..f184c04 100644
          async_downloads.Add(orig_device_addr, copy.size);
          buffer.MarkUsage(copy.src_offset, copy.size);
          runtime.CopyBuffer(download_staging.buffer, buffer, copies, false);
-@@ -711,9 +807,9 @@ void BufferCache<P>::PopAsyncBuffers() {
+@@ -711,9 +805,28 @@ void BufferCache<P>::PopAsyncBuffers() {
  
  template <class P>
  bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
@@ -41605,10 +41742,29 @@ index f30c859..f184c04 100644
 +    // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
 +    // inline uploads once GPU-written ranges are no longer cleared by downloads).
 +    return gpu_modified_ranges.Intersects(addr, size);
++}
++
++template <class P>
++void BufferCache<P>::NoteCpuRead(DAddr addr, size_t size) {
++    if (AsyncBufferDownloads()) {
++        return;
++    }
++    size_t covered = 0;
++    cpu_read_ranges.ForEachInRange(addr, size, [&](DAddr start, DAddr end) { covered += end - start; });
++    if (covered >= size) {
++        return;
++    }
++    cpu_read_ranges.Add(addr, size);
++    if (Nx2Profile::Enabled()) {
++        static u64 noted{};
++        if ((++noted & 255) == 1) {
++            LOG_INFO(HW_GPU, "CPU-read buffer pages noted: {} (latest {:#x})", noted, addr);
++        }
++    }
  }
  
  template <class P>
-@@ -930,6 +1026,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
+@@ -930,6 +1043,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
  template <class P>
  void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind) {
      ++channel_state->uniform_cache_shots[0];
@@ -41632,7 +41788,7 @@ index f30c859..f184c04 100644
      const Binding& binding = channel_state->uniform_buffers[stage][index];
      const DAddr device_addr = binding.device_addr;
      const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
-@@ -1006,11 +1119,67 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+@@ -1006,11 +1136,67 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
      channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
  }
  
@@ -41701,7 +41857,7 @@ index f30c859..f184c04 100644
      if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
          if (binding.gpu_addr == 0 || binding.size == 0) {
              return;
-@@ -1054,7 +1223,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1054,7 +1240,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
          if (binding.segment_first + binding.segment_count > pool.size()) {
              return false;
          }
@@ -41712,7 +41868,7 @@ index f30c859..f184c04 100644
          runtime.ResetMultiRange();
          for (u32 index = 0; index < binding.segment_count; ++index) {
              const MultiRangeSegment& segment = pool[binding.segment_first + index];
-@@ -1070,6 +1241,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1070,6 +1258,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
              }
              runtime.PushMultiRangeSource(buffer, offset, segment.size);
          }
@@ -41723,7 +41879,7 @@ index f30c859..f184c04 100644
          return runtime.BindMultiRangeStorageBuffer(key, is_written);
      } else {
          return false;
-@@ -1194,8 +1369,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
+@@ -1194,8 +1386,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                  return alignment > 1 && (offset % alignment) != 0;
              }
          }();
@@ -41740,7 +41896,7 @@ index f30c859..f184c04 100644
                  const std::span<u8> span =
                      runtime.BindMappedUniformBuffer(0, binding_index, size);
                  device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
-@@ -1292,6 +1474,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
+@@ -1292,6 +1491,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
          if (current_draw_indirect) {
              UpdateDrawIndirect();
          }
@@ -41758,7 +41914,7 @@ index f30c859..f184c04 100644
      });
  }
  
-@@ -1302,6 +1495,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
+@@ -1302,6 +1512,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
          UpdateComputeUniformBuffers();
          UpdateComputeStorageBuffers();
          UpdateComputeTextureBuffers();
@@ -41775,7 +41931,7 @@ index f30c859..f184c04 100644
      });
  }
  
-@@ -1372,7 +1575,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
+@@ -1372,7 +1592,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
      const auto& array = maxwell3d->regs.vertex_streams[index];
      const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
      const GPUVAddr gpu_addr_begin = array.Address();
@@ -41789,7 +41945,7 @@ index f30c859..f184c04 100644
      const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
      const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
      u32 size = address_size; // TODO: Analyze stride and number of vertices
-@@ -1419,6 +1627,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
+@@ -1419,6 +1644,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
  template <class P>
  void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
@@ -41797,7 +41953,7 @@ index f30c859..f184c04 100644
          Binding& binding = channel_state->uniform_buffers[stage][index];
          if (binding.buffer_id) {
              // Already updated
-@@ -1438,6 +1647,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
+@@ -1438,6 +1664,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->storage_buffers[stage][index];
@@ -41807,7 +41963,7 @@ index f30c859..f184c04 100644
          const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          binding.buffer_id = buffer_id;
          const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
-@@ -1504,6 +1716,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
+@@ -1504,6 +1733,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
      ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->compute_storage_buffers[index];
@@ -41817,18 +41973,16 @@ index f30c859..f184c04 100644
          binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          const bool is_written =
              ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-@@ -1529,7 +1744,9 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+@@ -1529,7 +1761,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
      }
      memory_tracker.MarkRegionAsGpuModified(device_addr, size);
      gpu_modified_ranges.Add(device_addr, size);
 -    uncommitted_gpu_modified_ranges.Add(device_addr, size);
-+    if (AsyncBufferDownloads()) {
-+        uncommitted_gpu_modified_ranges.Add(device_addr, size);
-+    }
++    QueueDownload(device_addr, size);
  }
  
  template <class P>
-@@ -1710,9 +1927,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
+@@ -1710,9 +1942,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
      Buffer& buffer = slot_buffers[buffer_id];
      const auto size = buffer.SizeBytes();
      if (insert) {
@@ -41840,7 +41994,7 @@ index f30c859..f184c04 100644
          total_used_memory -= Common::AlignUp(size, 1024);
          lru_cache.Free(buffer.getLRUID());
      }
-@@ -1902,6 +2121,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
+@@ -1902,6 +2136,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
      DownloadBufferMemory(buffer, buffer.CpuAddr(), buffer.SizeBytes());
  }
  
@@ -41893,7 +42047,7 @@ index f30c859..f184c04 100644
  template <class P>
  void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
      boost::container::small_vector<BufferCopy, 1> copies;
-@@ -2030,28 +2295,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+@@ -2030,28 +2310,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
      channel_state->has_deleted_buffers = true;
  }
  
@@ -41972,7 +42126,7 @@ index f30c859..f184c04 100644
      // Alignment only applies to the offset of the buffer
      const u32 alignment = runtime.GetStorageBufferAlignment();
 diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
-index 26bf3dd..f4d1d5c 100644
+index 26bf3dd..739e04a 100644
 --- a/src/video_core/buffer_cache/buffer_cache_base.h
 +++ b/src/video_core/buffer_cache/buffer_cache_base.h
 @@ -7,6 +7,8 @@
@@ -42037,7 +42191,18 @@ index 26bf3dd..f4d1d5c 100644
      std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
  
      bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
-@@ -339,7 +354,7 @@ public:
+@@ -316,6 +331,10 @@ public:
+     /// Return true when a CPU region is modified from the GPU
+     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+ 
++    /// The guest CPU reads [addr, addr + size) (pages its reads are tracked on): without
++    /// AsyncBufferDownloads, GPU writes there are still copied back at fences from now on.
++    void NoteCpuRead(DAddr addr, size_t size);
++
+     /// Return true when a region is registered on the cache
+     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
+ 
+@@ -339,7 +358,7 @@ public:
          } while (channel_state->has_deleted_buffers);
      }
  
@@ -42046,7 +42211,7 @@ index 26bf3dd..f4d1d5c 100644
      Runtime& runtime;
      bool any_buffer_uploaded = false;
  
-@@ -376,7 +391,7 @@ private:
+@@ -376,7 +395,7 @@ private:
                 ((device_addr + size) & ~Core::DEVICE_PAGEMASK);
      }
  
@@ -42055,7 +42220,7 @@ index 26bf3dd..f4d1d5c 100644
  
      void BindHostIndexBuffer();
  
-@@ -466,10 +481,17 @@ private:
+@@ -466,10 +485,17 @@ private:
  
      void DownloadBufferMemory(Buffer& buffer_id, DAddr device_addr, u64 size);
  
@@ -42074,7 +42239,7 @@ index 26bf3dd..f4d1d5c 100644
  
      [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                 PixelFormat format);
-@@ -513,6 +535,24 @@ private:
+@@ -513,8 +539,43 @@ private:
  
      MemoryTracker memory_tracker;
      Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
@@ -42098,8 +42263,27 @@ index 26bf3dd..f4d1d5c 100644
 +    }
      Common::RangeSet<DAddr> gpu_modified_ranges;
      std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
++    /// Buffer pages the guest CPU reads (NoteCpuRead). Without AsyncBufferDownloads, GPU writes
++    /// to them are still copied back at fences: Pokemon Pokopia builds its sky, fog and exposure
++    /// constants from values the GPU computes, and drew a black, flickering sky without them.
++    /// Copying every GPU-written range back instead (each written native storage binding is an
++    /// 8 MiB window) dropped it from 60 to about 42 frames a second.
++    Common::RangeSet<DAddr> cpu_read_ranges;
++
++    /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next fence.
++    void QueueDownload(DAddr addr, u64 size) {
++        if (AsyncBufferDownloads()) {
++            uncommitted_gpu_modified_ranges.Add(addr, size);
++            return;
++        }
++        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
++            uncommitted_gpu_modified_ranges.Add(start, end - start);
++        });
++    }
  
-@@ -533,10 +573,22 @@ private:
+     // Async Buffers
+     Common::OverlapRangeSet<DAddr> async_downloads;
+@@ -533,10 +594,22 @@ private:
      };
      Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache;
      VirtualRangeCache virtual_ranges;
@@ -42122,7 +42306,7 @@ index 26bf3dd..f4d1d5c 100644
      u64 minimum_memory = 0;
      u64 critical_memory = 0;
      BufferId inline_buffer_id;
-@@ -544,7 +596,8 @@ private:
+@@ -544,7 +617,8 @@ private:
      bool immediately_free = false;
  #endif
  
@@ -45032,7 +45216,7 @@ index ed4675e..8603c71 100644
  
  void MaxwellDMA::ReleaseSemaphore() {
 diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
-index 0b05d31..d1cf7a7 100644
+index 0b05d31..b8dae87 100644
 --- a/src/video_core/engines/puller.cpp
 +++ b/src/video_core/engines/puller.cpp
 @@ -4,6 +4,9 @@
@@ -45175,7 +45359,7 @@ index 0b05d31..d1cf7a7 100644
          break;
      default:
          UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
-@@ -79,16 +165,93 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+@@ -79,16 +165,117 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
      }
  }
  
@@ -45186,8 +45370,16 @@ index 0b05d31..d1cf7a7 100644
 +    // The release may still be queued for the split GPU thread's back half (and the caches
 +    // ReadNativeSemaphoreWord asks are its state).
 +    DrainBack();
-+    return !dma_pusher.memory_manager.IsShuttingDown() &&
-+           native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address));
++    if (dma_pusher.memory_manager.IsShuttingDown()) {
++        return false;
++    }
++    if (native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address))) {
++        return true;
++    }
++    const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address);
++    const auto pending = cpu_address ? dma_pusher.rasterizer->PendingSemaphoreRelease(*cpu_address)
++                                     : std::nullopt;
++    return pending && native_acquire->Matches(*pending);
 +}
 +
 +bool Puller::ResumeNativeAcquire(DmaPusher& dma_pusher) {
@@ -45244,6 +45436,22 @@ index 0b05d31..d1cf7a7 100644
 +                    return false;
 +                };
 +                if (!ready()) {
++                    // A release the GPU already processed may only wait for the host GPU to
++                    // write it (accurate GPU mode). Work after this acquire runs after the work
++                    // before that release on the host anyway: no need to wait for the host GPU.
++                    if (const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(
++                            regs.semaphore_address.SemaphoreAddress())) {
++                        if (const auto pending =
++                                dma_pusher.rasterizer->PendingSemaphoreRelease(*cpu_address)) {
++                            const u32 written = word;
++                            word = *pending;
++                            if (!ready()) {
++                                word = written;
++                            }
++                        }
++                    }
++                }
++                if (!ready()) {
 +                    dma_pusher.rasterizer->ReleaseFences(true);
 +                    word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
 +                    static u32 native_wait_traces{};
@@ -45271,7 +45479,7 @@ index 0b05d31..d1cf7a7 100644
              regs.acquire_source = true;
              regs.acquire_value = regs.semaphore_sequence;
              if (op == GpuSemaphoreOperation::AcquireEqual) {
-@@ -120,10 +283,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+@@ -120,10 +307,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
  void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
      const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
      const u32 payload = regs.semaphore_release;
@@ -45290,7 +45498,7 @@ index 0b05d31..d1cf7a7 100644
      u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
      const auto value = regs.semaphore_acquire;
      while (word != value) {
-@@ -155,13 +325,13 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+@@ -155,13 +349,13 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
      case BufferMethods::WrcacheFlush:
          break;
      case BufferMethods::RefCnt:
@@ -45306,7 +45514,7 @@ index 0b05d31..d1cf7a7 100644
          break;
      case BufferMethods::SemaphoreOperation: {
          ProcessSemaphoreTriggerMethod(dma_pusher);
-@@ -172,17 +342,22 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+@@ -172,17 +366,22 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
          break;
      }
      case BufferMethods::MemOpA: {
@@ -45332,7 +45540,7 @@ index 0b05d31..d1cf7a7 100644
          break;
      }
      case BufferMethods::SemaphoreAcquire: {
-@@ -211,12 +386,19 @@ void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+@@ -211,12 +410,19 @@ void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
      case EngineID::FERMI_TWOD_A:
          dma_pusher.channel_state.payload->fermi_2d.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
          break;
@@ -45352,7 +45560,7 @@ index 0b05d31..d1cf7a7 100644
      case EngineID::MAXWELL_DMA_COPY_A:
          dma_pusher.channel_state.payload->maxwell_dma.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
          break;
-@@ -239,12 +421,19 @@ void Puller::CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subcha
+@@ -239,12 +445,19 @@ void Puller::CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subcha
      case EngineID::FERMI_TWOD_A:
          dma_pusher.channel_state.payload->fermi_2d.CallMultiMethod(dma_pusher.system, method, base_start, amount, methods_pending);
          break;
@@ -45710,7 +45918,7 @@ index 1fc7058..bb041cf 100644
  };
  
 diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
-index 1621b24..8a9b760 100644
+index 1621b24..da31636 100644
 --- a/src/video_core/gpu.cpp
 +++ b/src/video_core/gpu.cpp
 @@ -23,6 +23,7 @@
@@ -45732,6 +45940,15 @@ index 1621b24..8a9b760 100644
      }
  
      std::shared_ptr<Control::ChannelState> AllocateChannel() {
+@@ -114,7 +119,7 @@ struct GPU::Impl {
+     /// Synchronizes CPU writes with Host GPU memory.
+     void InvalidateGPUCache() {
+         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
+-            renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
++            renderer->ReadRasterizer()->OnCachedWrite(address, size);
+         });
+         system.GatherGPUDirtyMemory(callback_writes);
+     }
 @@ -217,6 +222,13 @@ struct GPU::Impl {
              return raster_area;
          }
@@ -46359,7 +46576,7 @@ index 0000000..cf2adde
 +
 +} // namespace VideoCommon
 diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
-index a01375e..11f7dbf 100644
+index a01375e..d37f240 100644
 --- a/src/video_core/gpu_thread.cpp
 +++ b/src/video_core/gpu_thread.cpp
 @@ -4,6 +4,9 @@
@@ -46402,7 +46619,7 @@ index a01375e..11f7dbf 100644
  ThreadManager::ThreadManager(Core::System& system_)
      : system{system_}
  {}
-@@ -35,14 +55,69 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+@@ -35,14 +55,77 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
  
          auto current_context = context.Acquire();
          CommandDataContainer next;
@@ -46445,6 +46662,8 @@ index a01375e..11f7dbf 100644
 +                auto* const rasterizer_ptr = renderer.ReadRasterizer();
 +                if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
 +                    Profile::Scope scope{Profile::Zone::Push};
++                    // Held-back guest CPU writes first (see the single-thread path below).
++                    split.Defer([gpu = &system.GPU()] { gpu->InvalidateGPUCache(); });
 +                    scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
 +                } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
 +                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
@@ -46467,13 +46686,19 @@ index a01375e..11f7dbf 100644
 +            }
              if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
 +                Profile::Scope scope{Profile::Zone::Push};
++                // Guest CPU writes to GPU-written memory are held back until the GPU thread
++                // applies them, by default at the next fence. The guest made them before it
++                // submitted this list, which may read them: apply them first. Pokemon Pokopia
++                // keeps constants in pages its native storage bindings mark GPU-written, and some
++                // frames drew stale ones (flickering shadows, stretched geometry).
++                system.GPU().InvalidateGPUCache();
                  scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
              } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
 +                Profile::Scope scope{Profile::Zone::Tick};
                  system.GPU().TickWork();
              } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
                  renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
-@@ -51,13 +126,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+@@ -51,13 +134,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
              } else {
                  ASSERT(false);
              }
@@ -46488,7 +46713,7 @@ index a01375e..11f7dbf 100644
          }
      });
  }
-@@ -119,6 +188,7 @@ void ThreadManager::NotifyShutdown() {
+@@ -119,6 +196,7 @@ void ThreadManager::NotifyShutdown() {
          thread.request_stop();
          thread.join();
      }
@@ -49510,7 +49735,7 @@ index 0000000..a921b72
 +
 +} // namespace VideoCommon::Nx2Profile
 diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
-index b8c1bc4..66180dc 100644
+index b8c1bc4..d7275b8 100644
 --- a/src/video_core/query_cache/query_cache.h
 +++ b/src/video_core/query_cache/query_cache.h
 @@ -7,6 +7,7 @@
@@ -49580,7 +49805,7 @@ index b8c1bc4..66180dc 100644
              LOG_ERROR(HW_GPU,
                        "Query report value not synchronized. Consider increasing GPU accuracy.");
              if (!is_synced) [[likely]] {
-@@ -281,12 +300,16 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+@@ -281,16 +300,36 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
          streamer->SetAccumulationValue(query_base->value);
          if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
              u64 timestamp = impl->gpu.GetTicks();
@@ -49597,7 +49822,27 @@ index b8c1bc4..66180dc 100644
          if (!is_synced) [[likely]] {
              impl->pending_unregister.push_back(query_location);
          }
-@@ -298,11 +321,15 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     });
++    if (counter_type == QueryType::Payload &&
++        (is_fence || Settings::IsGPULevelHigh())) {
++        // Written later, from the fence: remembered until then for GPU acquires (PendingRelease).
++        {
++            std::scoped_lock lock{pending_releases_mutex};
++            pending_releases.insert_or_assign(cpu_addr, payload);
++        }
++        operation = [this, cpu_addr, payload, write = std::move(operation)] {
++            write();
++            std::scoped_lock lock{pending_releases_mutex};
++            if (const auto it = pending_releases.find(cpu_addr);
++                it != pending_releases.end() && it->second == payload) {
++                pending_releases.erase(it);
++            }
++        };
++    }
+     if (is_fence) {
+         impl->rasterizer.SignalFence(std::move(operation));
+     } else {
+@@ -298,11 +337,15 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
              if (has_timestamp) {
                  u64 timestamp = impl->gpu.GetTicks();
                  u64 value = static_cast<u64>(payload);
@@ -49613,7 +49858,23 @@ index b8c1bc4..66180dc 100644
              streamer->Free(new_query_id);
              return;
          }
-@@ -505,6 +532,16 @@ bool QueryCacheBase<Traits>::HasUncommittedFlushes() const {
+@@ -328,6 +371,15 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     }
+ }
+ 
++template <typename Traits>
++std::optional<u32> QueryCacheBase<Traits>::PendingRelease(DAddr cpu_addr) {
++    std::scoped_lock lock{pending_releases_mutex};
++    if (const auto it = pending_releases.find(cpu_addr); it != pending_releases.end()) {
++        return it->second;
++    }
++    return std::nullopt;
++}
++
+ template <typename Traits>
+ void QueryCacheBase<Traits>::UnregisterPending() {
+     const auto gen_caching_indexing = [](VAddr cur_addr) {
+@@ -505,6 +557,16 @@ bool QueryCacheBase<Traits>::HasUncommittedFlushes() const {
      return result;
  }
  
@@ -49630,7 +49891,7 @@ index b8c1bc4..66180dc 100644
  template <typename Traits>
  bool QueryCacheBase<Traits>::ShouldWaitAsyncFlushes() {
      std::scoped_lock lk(impl->flush_guard);
-@@ -568,10 +605,12 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
+@@ -568,10 +630,12 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
          False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
          auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
          if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
@@ -49644,10 +49905,20 @@ index b8c1bc4..66180dc 100644
          return false;
      }
 diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
-index d73e903..5a60e42 100644
+index d73e903..0e345a8 100644
 --- a/src/video_core/query_cache/query_cache_base.h
 +++ b/src/video_core/query_cache/query_cache_base.h
-@@ -109,6 +109,9 @@ public:
+@@ -104,11 +104,19 @@ public:
+ 
+     bool AccelerateHostConditionalRendering();
+ 
++    /// The payload of the newest semaphore release to cpu_addr that the GPU processed but whose
++    /// guest write still waits for the host GPU to finish the work before it (fences, and every
++    /// release in accurate GPU mode).
++    std::optional<u32> PendingRelease(DAddr cpu_addr);
++
+     // Async downloads
+     void CommitAsyncFlushes();
  
      bool HasUncommittedFlushes() const;
  
@@ -49657,6 +49928,48 @@ index d73e903..5a60e42 100644
      bool ShouldWaitAsyncFlushes();
  
      void PopAsyncFlushes();
+@@ -171,6 +179,11 @@ protected:
+     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
+     std::mutex cache_mutex;
+ 
++    /// Releases not written to guest memory yet (PendingRelease). Written on the GPU thread,
++    /// erased by the fence that writes them.
++    ::Common::unordered_map<DAddr, u32> pending_releases;
++    std::mutex pending_releases_mutex;
++
+     struct QueryCacheBaseImpl;
+     friend struct QueryCacheBaseImpl;
+     friend RuntimeType;
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index b527c0e..b08bd27 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -64,6 +64,12 @@ public:
+     virtual void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+                        VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) = 0;
+ 
++    /// The payload of a semaphore release to addr that the GPU processed but has not written to
++    /// guest memory yet, since that waits for the host GPU to finish the work before it.
++    [[nodiscard]] virtual std::optional<u32> PendingSemaphoreRelease(DAddr addr) {
++        return std::nullopt;
++    }
++
+     /// Signal an uniform buffer binding
+     virtual void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
+                                            u32 size) = 0;
+@@ -114,6 +120,12 @@ public:
+     /// Notify rasterizer that any caches of the specified region are desync with guest
+     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
+ 
++    /// A guest CPU write to GPU-written memory, held back until now (InvalidateGPUCache, on the
++    /// GPU thread): only those bytes changed.
++    virtual void OnCachedWrite(DAddr addr, u64 size) {
++        OnCacheInvalidation(addr, size);
++    }
++
+     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
+         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
+         OnCacheInvalidation(addr, size);
 diff --git a/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp b/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
 index 8354546..ecd6544 100644
 --- a/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
@@ -50286,7 +50599,7 @@ index 3d30aa6..5daf4eb 100644
  public:
      explicit BlockLinearUnswizzle3DPass(const Device& device_, Scheduler& scheduler_,
 diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-index 8b5b0bc..6084bef 100644
+index 8b5b0bc..deb7409 100644
 --- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 @@ -4,18 +4,24 @@
@@ -50443,7 +50756,7 @@ index 8b5b0bc..6084bef 100644
                  views.push_back({handle.first});
  
                  VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
-@@ -432,24 +525,216 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -432,24 +525,241 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
  
          return true;
      }};
@@ -50488,6 +50801,31 @@ index 8b5b0bc..6084bef 100644
 +    // EDEN_DRAW_TEXTURE_LOG=1: creating draw-textures.request logs the next 20000 draws once, with
 +    // each sampled view's format, type, size, layers, address and how much of its first page is
 +    // non-zero in guest memory (meaningful for textures the CPU or DMA filled).
++    // EDEN_DEBUG_SHADER=<hash>[,...] (diagnostic): log the first words of the fragment stage's
++    // constant buffers 0-4 for draws with those fragment shaders (guest memory, then the buffer
++    // cache's copy where the GPU wrote it).
++    if (static const char* const debug_hashes = std::getenv("EDEN_DEBUG_SHADER");
++        debug_hashes != nullptr &&
++        std::string_view{debug_hashes}.find(fmt::format("{:016x}", key.unique_hashes[5])) != std::string_view::npos) {
++        static u32 logged{};
++        if (logged++ < 12) {
++            const auto& fs_cbufs{maxwell3d->state.shader_stages[4].const_buffers};
++            for (u32 bank = 0; bank < 5; ++bank) {
++                const auto& cb = fs_cbufs[bank];
++                if (!cb.enabled || cb.size == 0) continue;
++                std::array<u32, 12> words{};
++                const size_t bytes = std::min<size_t>(cb.size, sizeof(words));
++                if (const auto device = gpu_memory->GpuToCpuAddress(cb.address)) {
++                    buffer_cache.DownloadMemory(*device, bytes);
++                }
++                gpu_memory->ReadBlockUnsafe(cb.address, words.data(), bytes);
++                std::array<f32, 12> floats{};
++                std::memcpy(floats.data(), words.data(), sizeof(words));
++                LOG_INFO(HW_GPU, "Debug shader {:016x} cbuf {} @{:#x} size {:#x}: {}", key.unique_hashes[5], bank,
++                         cb.address, cb.size, fmt::join(floats, " "));
++            }
++        }
++    }
 +    static const bool texture_log = std::getenv("EDEN_DRAW_TEXTURE_LOG") != nullptr;
 +    static u32 texture_log_remaining{};
 +    if (texture_log) {
@@ -50674,7 +51012,7 @@ index 8b5b0bc..6084bef 100644
  
      VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
      const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
-@@ -493,30 +778,39 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -493,30 +803,39 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
              texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
          }
      }};
@@ -50731,7 +51069,7 @@ index 8b5b0bc..6084bef 100644
  
      RescalingPushConstant rescaling;
      RenderAreaPushConstant render_area;
-@@ -524,13 +818,81 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -524,13 +843,81 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
      const VideoCommon::ImageViewInOut* views_it{views.data()};
      const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
          buffer_cache.BindHostStageBuffers(stage);
@@ -50817,7 +51155,7 @@ index 8b5b0bc..6084bef 100644
          }
      }};
      if constexpr (Spec::enabled_stages[0]) {
-@@ -552,12 +914,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -552,12 +939,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
          buffer_cache.runtime.PostCopyBarrier();
          buffer_cache.any_buffer_uploaded = false;
      }
@@ -50838,7 +51176,7 @@ index 8b5b0bc..6084bef 100644
  }
  
 diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
-index d4ffcd8..75d69dd 100644
+index d4ffcd8..845a831 100644
 --- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 @@ -5,6 +5,7 @@
@@ -50971,7 +51309,26 @@ index d4ffcd8..75d69dd 100644
      return nullptr;
  }
  
-@@ -923,14 +991,50 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+@@ -878,6 +946,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+ 
+         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+         ConvertLegacyToGeneric(program, runtime_info);
++        Shader::Backend::SPIRV::debug_shader_hash = key.unique_hashes[index];
++        // EDEN_DEBUG_SHADER_IR=1 with EDEN_DEBUG_SHADER=<hash>[,...] (diagnostic): write those
++        // shaders' IR to shader-<hash>.ir.txt in the working directory.
++        if (std::getenv("EDEN_DEBUG_SHADER_IR") != nullptr) {
++            if (const char* hashes = std::getenv("EDEN_DEBUG_SHADER");
++                hashes != nullptr &&
++                std::string_view{hashes}.find(fmt::format("{:016x}", key.unique_hashes[index])) !=
++                    std::string_view::npos) {
++                std::ofstream dump(fmt::format("shader-{:016x}.ir.txt", key.unique_hashes[index]));
++                dump << Shader::IR::DumpProgram(program);
++            }
++        }
+         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+         device.SaveShader(code);
+         modules[stage_index] = BuildShader(device, code);
+@@ -923,14 +1003,50 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
          ++env_index;
  
          const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
@@ -51024,7 +51381,7 @@ index d4ffcd8..75d69dd 100644
      GraphicsEnvironments environments;
      GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
  
-@@ -956,6 +1060,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+@@ -956,6 +1072,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
  
  std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
      const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
@@ -51073,7 +51430,7 @@ index 9298764..c1724e1 100644
      }
  
 diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-index 264ffb2..bd7be30 100644
+index 264ffb2..5cfd79d 100644
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 @@ -4,9 +4,20 @@
@@ -51121,7 +51478,111 @@ index 264ffb2..bd7be30 100644
  
  namespace Vulkan {
  
-@@ -238,28 +253,489 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+@@ -232,34 +247,596 @@ RasterizerVulkan::~RasterizerVulkan() {
+     scheduler.Finish();
+ }
+ 
++
++namespace {
++// EDEN_FRAME_EVENTS=1 (diagnostic): when frame-events.request appears in the working directory,
++// log the next N draws, clears and compute dispatches (N from the file, default 4000), one line
++// each, to see how a frame is built.
++bool FrameEventsActive() {
++    static const bool enabled = std::getenv("EDEN_FRAME_EVENTS") != nullptr;
++    if (!enabled) {
++        return false;
++    }
++    static u32 remaining{};
++    static u32 checks{};
++    if (remaining == 0 && (checks++ & 63) == 0) {
++        std::error_code error;
++        if (std::filesystem::exists("frame-events.request", error)) {
++            u32 count = 4000;
++            {
++                std::ifstream request("frame-events.request");
++                request >> count;
++            }
++            std::filesystem::remove("frame-events.request", error);
++            remaining = count;
++            LOG_INFO(HW_GPU, "Frame events: logging the next {}", count);
++        }
++    }
++    if (remaining == 0) {
++        return false;
++    }
++    --remaining;
++    return true;
++}
++
++u64 StageProgram(const Tegra::Engines::Maxwell3D::Regs& regs, size_t stage) {
++    if (!regs.IsShaderConfigEnabled(stage)) {
++        return 0;
++    }
++    return (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) | regs.pipelines[stage].reserved[1];
++}
++
++void LogFrameDraw(const Tegra::Engines::Maxwell3D& maxwell3d, bool is_indexed, bool has_pipeline) {
++    const auto& regs = maxwell3d.regs;
++    const auto& draw = maxwell3d.draw_manager.draw_state;
++    const auto& rt = regs.rt[0];
++    const auto& vp = regs.viewport_transform[0];
++    LOG_INFO(HW_GPU,
++             "FE draw{} n={} inst={} topo={} pipe={} | rts={} rt0={:#x} {}x{} f{:#x} | z={} {:#x} "
++             "f{:#x} test={} func={:#x} write={} | vp sz={} tz={} range={}..{} z01={} mode={} "
++             "| vs={:#x} ps={:#x}",
++             is_indexed ? "I" : "", is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count,
++             draw.instance_count, static_cast<u32>(draw.topology), has_pipeline,
++             regs.rt_control.count.Value(), rt.Address(), rt.width, rt.height,
++             static_cast<u32>(rt.format), regs.zeta_enable, regs.zeta.Address(),
++             static_cast<u32>(regs.zeta.format), regs.depth_test_enable,
++             static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled, vp.scale_z,
++             vp.translate_z, regs.viewports[0].depth_range_near, regs.viewports[0].depth_range_far,
++             regs.viewport_clip_control.depth_0_to_1.Value(), static_cast<u32>(regs.depth_mode),
++             StageProgram(regs, 1), StageProgram(regs, 5));
++    // EDEN_FRAME_EVENTS_PS=<address>: also describe draws with that pixel shader in detail.
++    static const u64 detail_ps = [] {
++        const char* value = std::getenv("EDEN_FRAME_EVENTS_PS");
++        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
++    }();
++    // EDEN_FRAME_EVENTS_DETAIL=1: describe every draw in detail.
++    static const bool detail_all = std::getenv("EDEN_FRAME_EVENTS_DETAIL") != nullptr;
++    if (detail_all || vp.scale_z == 0.0f || (detail_ps != 0 && StageProgram(regs, 5) == detail_ps)) {
++        const auto& sc = regs.scissor_test[0];
++        LOG_INFO(HW_GPU,
++                 "FE   state stencil={} func={:#x} ref={:#x} fmask={:#x} wmask={:#x} ops={}/{}/{} | cull={} face={:#x} "
++                 "front={:#x} | cmask_common={} cmask0={:#x} | scissor={} {}..{} {}..{} | vp xy scale={} {} tr={} {} "
++                 "offset_en={} | alpha_test={} rasterize={} zclip_geom={}",
++                 regs.stencil_enable, static_cast<u32>(regs.stencil_front_op.func), regs.stencil_front_ref,
++                 regs.stencil_front_func_mask, regs.stencil_front_mask,
++                 static_cast<u32>(regs.stencil_front_op.fail), static_cast<u32>(regs.stencil_front_op.zfail),
++                 static_cast<u32>(regs.stencil_front_op.zpass), regs.gl_cull_test_enabled,
++                 static_cast<u32>(regs.gl_cull_face), static_cast<u32>(regs.gl_front_face),
++                 regs.color_mask_common, regs.color_mask[0].raw, sc.enable, sc.min_x.Value(),
++                 sc.max_x.Value(), sc.min_y.Value(), sc.max_y.Value(), vp.scale_x, vp.scale_y,
++                 vp.translate_x, vp.translate_y, regs.viewport_scale_offset_enabled,
++                 regs.alpha_test_enabled, regs.rasterize_enable,
++                 static_cast<u32>(regs.viewport_clip_control.geometry_clip.Value()));
++        const auto& pt = regs.blend_per_target[0];
++        LOG_INFO(HW_GPU,
++                 "FE   blend enable0={} per_target={} common op={:#x} src={:#x} dst={:#x} aop={:#x} asrc={:#x} "
++                 "adst={:#x} sep={} | rt0 op={:#x} src={:#x} dst={:#x} aop={:#x} asrc={:#x} adst={:#x} sep={} | "
++                 "rt_map0={} | blend_color={} {} {} {}",
++                 regs.blend.enable[0], regs.blend_per_target_enabled, static_cast<u32>(regs.blend.color_op),
++                 static_cast<u32>(regs.blend.color_source), static_cast<u32>(regs.blend.color_dest),
++                 static_cast<u32>(regs.blend.alpha_op), static_cast<u32>(regs.blend.alpha_source),
++                 static_cast<u32>(regs.blend.alpha_dest), regs.blend.separate_alpha,
++                 static_cast<u32>(pt.color_op), static_cast<u32>(pt.color_source),
++                 static_cast<u32>(pt.color_dest), static_cast<u32>(pt.alpha_op),
++                 static_cast<u32>(pt.alpha_source), static_cast<u32>(pt.alpha_dest), pt.separate_alpha,
++                 regs.rt_control.Map(0), regs.blend_color.r, regs.blend_color.g, regs.blend_color.b,
++                 regs.blend_color.a);
++    }
++}
++} // Anonymous namespace
++
+ template <typename Func>
+ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ 
      SCOPE_EXIT {
          gpu.TickWork();
      };
@@ -51163,6 +51624,9 @@ index 264ffb2..bd7be30 100644
 +        Profile::Scope scope{Profile::Zone::PipelineLookup};
 +        return pipeline_cache.CurrentGraphicsPipeline();
 +    }()};
++    if (FrameEventsActive()) [[unlikely]] {
++        LogFrameDraw(*maxwell3d, is_indexed, pipeline != nullptr);
++    }
      if (!pipeline) {
 +        // A draw withheld for an asynchronous pipeline build is not a failure of the native work.
 +        submitted = pipeline_cache.TakeDeferredDraw();
@@ -51617,7 +52081,7 @@ index 264ffb2..bd7be30 100644
      PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
          const auto& draw_state = maxwell3d->draw_manager.draw_state;
          const u32 num_instances{instance_count};
-@@ -293,6 +769,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+@@ -293,6 +870,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
  }
  
  void RasterizerVulkan::DrawIndirect() {
@@ -51625,7 +52089,7 @@ index 264ffb2..bd7be30 100644
      const auto& params = maxwell3d->draw_manager.indirect_state;
      buffer_cache.SetDrawIndirect(&params);
      PrepareDraw(params.is_indexed, [this, &params] {
-@@ -398,6 +875,15 @@ void RasterizerVulkan::DrawTexture() {
+@@ -398,6 +976,23 @@ void RasterizerVulkan::DrawTexture() {
  }
  
  void RasterizerVulkan::Clear(u32 layer_count) {
@@ -51638,10 +52102,32 @@ index 264ffb2..bd7be30 100644
 +                 regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
 +    }
 +    TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
++    if (FrameEventsActive()) [[unlikely]] {
++        const auto& clear_regs = maxwell3d->regs;
++        LOG_INFO(HW_GPU, "FE clear surface={:#x} rt0={:#x} {}x{} f{:#x} colour={} {} {} {} depth={} z={:#x}",
++                 clear_regs.clear_surface.raw, clear_regs.rt[0].Address(), clear_regs.rt[0].width,
++                 clear_regs.rt[0].height, static_cast<u32>(clear_regs.rt[0].format),
++                 clear_regs.clear_color[0], clear_regs.clear_color[1], clear_regs.clear_color[2],
++                 clear_regs.clear_color[3], clear_regs.clear_depth, clear_regs.zeta.Address());
++    }
      FlushWork();
      gpu_memory->FlushCaching();
  
-@@ -510,6 +996,14 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+@@ -485,6 +1080,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+         return;
+     }
+ 
++    if (FrameEventsActive()) [[unlikely]] {
++        LOG_INFO(HW_GPU, "FE clear-area render={}x{} rect=({},{} {}x{}) scissor={} zeta_size={}x{} depth={} stencil={} z_aspect={}",
++                 render_area.width, render_area.height, clear_rect.rect.offset.x, clear_rect.rect.offset.y,
++                 clear_rect.rect.extent.width, clear_rect.rect.extent.height,
++                 regs.clear_control.use_scissor.Value(), regs.zeta_size.width, regs.zeta_size.height,
++                 use_depth, use_stencil, framebuffer->HasAspectDepthBit());
++    }
+     const bool clear_covers_render_area =
+         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
+         clear_rect.rect.extent.width >= render_area.width &&
+@@ -510,6 +1112,14 @@ void RasterizerVulkan::Clear(u32 layer_count) {
          VkClearValue clear_value{};
          if (!is_integer) {
              std::memcpy(clear_value.color.float32, regs.clear_color.data(), regs.clear_color.size() * sizeof(f32));
@@ -51656,7 +52142,7 @@ index 264ffb2..bd7be30 100644
          } else if (!is_signed) {
              for (size_t i = 0; i < 4; i++)
                  clear_value.color.uint32[i] = u32(f32(u64(int_size) << 1U) * regs.clear_color[i]);
-@@ -583,16 +1077,22 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+@@ -583,16 +1193,25 @@ void RasterizerVulkan::Clear(u32 layer_count) {
  }
  
  void RasterizerVulkan::DispatchCompute() {
@@ -51665,6 +52151,9 @@ index 264ffb2..bd7be30 100644
      gpu_memory->FlushCaching();
  
      ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
++    if (FrameEventsActive()) [[unlikely]] {
++        LOG_INFO(HW_GPU, "FE dispatch pipe={}", pipeline != nullptr);
++    }
      if (!pipeline) {
 +        if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
          return;
@@ -51679,7 +52168,7 @@ index 264ffb2..bd7be30 100644
          return;
      }
  
-@@ -612,6 +1112,7 @@ void RasterizerVulkan::DispatchCompute() {
+@@ -612,6 +1231,7 @@ void RasterizerVulkan::DispatchCompute() {
              }
              cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
          });
@@ -51687,7 +52176,7 @@ index 264ffb2..bd7be30 100644
          return;
      }
      const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
-@@ -634,6 +1135,7 @@ void RasterizerVulkan::DispatchCompute() {
+@@ -634,6 +1254,7 @@ void RasterizerVulkan::DispatchCompute() {
          }
          cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
      });
@@ -51695,7 +52184,32 @@ index 264ffb2..bd7be30 100644
  
      // Log compute dispatch
      if (GPU::Logging::IsActive() &&
-@@ -725,10 +1227,43 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
+@@ -664,6 +1285,10 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+ }
+ 
++std::optional<u32> RasterizerVulkan::PendingSemaphoreRelease(DAddr addr) {
++    return query_cache.PendingRelease(addr);
++}
++
+ void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
+                                                  u32 size) {
+     buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
+@@ -710,6 +1335,13 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
+ }
+ 
+ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
++    {
++        // Guest CPU reads of buffer memory decide which GPU-written buffer data is copied back.
++        std::scoped_lock lock{buffer_cache.mutex};
++        buffer_cache.NoteCpuRead(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
++                                 Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
++                                     Common::AlignDown(addr, Core::DEVICE_PAGESIZE));
++    }
+     {
+         std::scoped_lock lock{texture_cache.mutex};
+         auto area = texture_cache.GetFlushArea(addr, size);
+@@ -725,10 +1357,43 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
      return new_area;
  }
  
@@ -51739,7 +52253,7 @@ index 264ffb2..bd7be30 100644
      if (True(which & VideoCommon::CacheType::TextureCache)) {
          std::scoped_lock lock{texture_cache.mutex};
          texture_cache.WriteMemory(addr, size);
-@@ -766,7 +1301,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+@@ -766,7 +1431,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
      }
  }
  
@@ -51749,7 +52263,7 @@ index 264ffb2..bd7be30 100644
      DEBUG_ASSERT(addr != 0 || size != 0);
      {
          std::scoped_lock lock{buffer_cache.mutex};
-@@ -786,6 +1323,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+@@ -786,6 +1453,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
      if (addr == 0 || size == 0) {
          return;
      }
@@ -51757,7 +52271,32 @@ index 264ffb2..bd7be30 100644
  
      {
          std::scoped_lock lock{texture_cache.mutex};
-@@ -942,23 +1480,48 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA()
+@@ -798,6 +1466,24 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+     pipeline_cache.InvalidateRegion(addr, size);
+ }
+ 
++void RasterizerVulkan::OnCachedWrite(DAddr addr, u64 size) {
++    if (addr == 0 || size == 0) {
++        return;
++    }
++    WatchCpuWrite(gpu_memory, "cached write", addr, size);
++    {
++        std::scoped_lock lock{texture_cache.mutex};
++        texture_cache.WriteMemory(addr, size);
++    }
++    {
++        // Copies just these bytes in: marking the pages CPU-modified instead re-uploads them
++        // whole from guest memory, over what the GPU wrote there and never copied back.
++        std::scoped_lock lock{buffer_cache.mutex};
++        buffer_cache.CachedWriteMemory(addr, size);
++    }
++    pipeline_cache.InvalidateRegion(addr, size);
++}
++
+ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
+     if (addr == 0 || size == 0) return true;
+     {
+@@ -942,23 +1628,48 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA()
  void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                  std::span<const u8> memory) {
      auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
@@ -51810,7 +52349,7 @@ index 264ffb2..bd7be30 100644
  }
  
  std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
-@@ -966,10 +1529,29 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
+@@ -966,10 +1677,29 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
      if (!framebuffer_addr) {
          return {};
      }
@@ -51841,7 +52380,7 @@ index 264ffb2..bd7be30 100644
          return {};
      }
  
-@@ -997,8 +1579,10 @@ void RasterizerVulkan::FlushWork() {
+@@ -997,8 +1727,10 @@ void RasterizerVulkan::FlushWork() {
      static constexpr u32 DRAWS_TO_DISPATCH = 512;
      static constexpr u32 CHECK_MASK = 3;
  #else
@@ -51853,6 +52392,26 @@ index 264ffb2..bd7be30 100644
  #endif // __ANDROID__
  
      static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index ae9929c..4854932 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -94,6 +94,7 @@ public:
+     void ResetCounter(VideoCommon::QueryType type) override;
+     void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;
++    std::optional<u32> PendingSemaphoreRelease(DAddr addr) override;
+     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
+     void DisableGraphicsUniformBuffer(size_t stage, u32 index) override;
+     void FlushAll() override;
+@@ -106,6 +107,7 @@ public:
+                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+     void OnCacheInvalidation(DAddr addr, u64 size) override;
++    void OnCachedWrite(DAddr addr, u64 size) override;
+     bool TryCacheInvalidation(DAddr addr, u64 size) override;
+     bool OnCPUWrite(DAddr addr, u64 size) override;
+     void InvalidateGPUCache() override;
 diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
 index 4a7a7d5..e1e989c 100644
 --- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
@@ -53931,7 +54490,7 @@ index 0000000..52a48e8
 +
 +} // namespace VideoCommon
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index e92e54f..d5ed090 100644
+index e92e54f..130f73b 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
 @@ -6,7 +6,14 @@
@@ -54557,7 +55116,7 @@ index e92e54f..d5ed090 100644
      if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
          gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
                                VideoCommon::CacheType::NoTextureCache);
-@@ -1178,7 +1532,18 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
+@@ -1178,8 +1532,42 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
  }
  
  template <class P>
@@ -54575,9 +55134,52 @@ index e92e54f..d5ed090 100644
 +    }
 +    const TICEntry config = TextureViewHeader(raw_config, native);
      const ImageInfo info(config);
++    // EDEN_DEBUG_TIC_SIZE=<width>x<height> (diagnostic): log the texture headers of views that size.
++    static const std::pair<u32, u32> debug_tic_size = [] {
++        u32 width{}, height{};
++        if (const char* value = std::getenv("EDEN_DEBUG_TIC_SIZE")) {
++            std::sscanf(value, "%ux%u", &width, &height);
++        }
++        return std::pair{width, height};
++    }();
++    if (debug_tic_size.first != 0 && info.size.width == debug_tic_size.first &&
++        info.size.height == debug_tic_size.second) {
++        static u32 logged{};
++        if (logged++ < 32) {
++            LOG_INFO(HW_GPU, "TIC {:#x}: raw {:016x} {:016x} {:016x} {:016x} format {} "
++                             "types {}/{}/{}/{} swizzle {}/{}/{}/{} srgb {} type {} pixel format {}",
++                     config.Address(), config.raw[0], config.raw[1], config.raw[2], config.raw[3],
++                     static_cast<u32>(config.format.Value()), static_cast<u32>(config.r_type.Value()),
++                     static_cast<u32>(config.g_type.Value()), static_cast<u32>(config.b_type.Value()),
++                     static_cast<u32>(config.a_type.Value()), static_cast<u32>(config.x_source.Value()),
++                     static_cast<u32>(config.y_source.Value()), static_cast<u32>(config.z_source.Value()),
++                     static_cast<u32>(config.w_source.Value()), config.srgb_conversion.Value(),
++                     static_cast<u32>(config.texture_type.Value()), static_cast<u32>(info.format));
++        }
++    }
      if (info.type == ImageType::Buffer) {
          const ImageViewInfo view_info(config, 0);
-@@ -1213,12 +1578,9 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
+         return slot_image_views.insert(runtime, info, view_info, config.Address());
+@@ -1191,6 +1579,18 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& config) {
+         return NULL_IMAGE_VIEW_ID;
+     }
+     ImageBase& image = slot_images[image_id];
++    if (debug_tic_size.first != 0 && info.size.width == debug_tic_size.first &&
++        info.size.height == debug_tic_size.second) {
++        static u32 logged{};
++        if (logged++ < 32) {
++            std::array<u8, 64> bytes{};
++            gpu_memory->ReadBlockUnsafe(config.Address(), bytes.data(), bytes.size());
++            LOG_INFO(HW_GPU, "TIC {:#x}: image {:#x} {}x{} format {} flags {:#x}, guest bytes {:02x}",
++                     config.Address(), image.gpu_addr, image.info.size.width, image.info.size.height,
++                     static_cast<u32>(image.info.format), static_cast<u32>(image.flags),
++                     fmt::join(bytes, ""));
++        }
++    }
+     const SubresourceBase base = image.TryFindBase(config.Address()).value();
+     ASSERT(base.level == 0);
+     const ImageViewInfo view_info(config, base.layer);
+@@ -1213,12 +1613,9 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
  template <class P>
  ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                     RelaxedOptions options) {
@@ -54592,7 +55194,7 @@ index e92e54f..d5ed090 100644
      }
      const bool broken_views =
          runtime.HasBrokenTextureViewFormats() || True(options & RelaxedOptions::ForceBrokenViews);
-@@ -1344,9 +1706,10 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
+@@ -1344,9 +1741,10 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
  template <class P>
  void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
      UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
@@ -54604,7 +55206,7 @@ index e92e54f..d5ed090 100644
      auto decode = std::make_unique<AsyncDecodeContext>();
      auto* decode_ptr = decode.get();
      decode->image_id = image_id;
-@@ -1356,6 +1719,18 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+@@ -1356,6 +1754,18 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
      Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
      auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
      const size_t out_size = MapSizeBytes(image);
@@ -54623,7 +55225,7 @@ index e92e54f..d5ed090 100644
  
      auto func = [out_size, copies, info = image.info,
                   input = std::move(local_unswizzle_data_buffer),
-@@ -1392,12 +1767,26 @@ void TextureCache<P>::TickAsyncDecode() {
+@@ -1392,12 +1802,26 @@ void TextureCache<P>::TickAsyncDecode() {
      auto i = async_decodes.begin();
      while (i != async_decodes.end()) {
          auto* async_decode = i->get();
@@ -54653,7 +55255,7 @@ index e92e54f..d5ed090 100644
          auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
          std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
                      async_decode->decoded_data.size());
-@@ -1512,21 +1901,37 @@ bool TextureCache<P>::ScaleDown(Image& image) {
+@@ -1512,21 +1936,37 @@ bool TextureCache<P>::ScaleDown(Image& image) {
      return true;
  }
  
@@ -54700,7 +55302,7 @@ index e92e54f..d5ed090 100644
      const Image& image = slot_images[image_id];
      // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
      const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
-@@ -1634,10 +2039,44 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -1634,10 +2074,44 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
          }
      }
  
@@ -54745,7 +55347,7 @@ index e92e54f..d5ed090 100644
  
      if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
          new_info.is_sparse) {
-@@ -1647,7 +2086,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -1647,7 +2121,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
      for (const ImageId overlap_id : join_ignore_textures) {
          Image& overlap = slot_images[overlap_id];
          if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -54758,7 +55360,7 @@ index e92e54f..d5ed090 100644
          }
          if (True(overlap.flags & ImageFlagBits::Tracked)) {
              UntrackImage(overlap, overlap_id);
-@@ -1833,12 +2276,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
+@@ -1833,12 +2311,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
  
  template <class P>
  ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) {
@@ -54773,7 +55375,7 @@ index e92e54f..d5ed090 100644
      }
      ImageId image_id{};
      boost::container::small_vector<ImageId, 8> image_ids;
-@@ -1859,6 +2299,13 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
+@@ -1859,6 +2334,13 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
                  return true;
              }
          } else if (IsSubCopy(info, existing_image, gpu_addr)) {
@@ -54787,7 +55389,7 @@ index e92e54f..d5ed090 100644
              image_id = existing_image_id;
              image_ids.push_back(existing_image_id);
              return true;
-@@ -1954,6 +2401,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
+@@ -1954,6 +2436,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
          base = image.TryFindBase(gpu_addr).value();
      }
      const s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
@@ -54801,7 +55403,7 @@ index e92e54f..d5ed090 100644
      const SubresourceRange range{
          .base = base,
          .extent = {.levels = 1, .layers = layers},
-@@ -2136,6 +2590,13 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
+@@ -2136,6 +2625,13 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
      if (const ImageViewId image_view_id = image.FindView(info); image_view_id) {
          return image_view_id;
      }
@@ -54815,7 +55417,7 @@ index e92e54f..d5ed090 100644
      const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
      image.InsertView(info, image_view_id);
      return image_view_id;
-@@ -2291,9 +2752,185 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
+@@ -2291,9 +2787,185 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
                           });
  }
  
@@ -55001,7 +55603,7 @@ index e92e54f..d5ed090 100644
      image.flags &= ~ImageFlagBits::Tracked;
      if (False(image.flags & ImageFlagBits::Sparse)) {
          if (image.cpu_addr < ~(1ULL << 40)) {
-@@ -2316,6 +2953,24 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+@@ -2316,6 +2988,24 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
  template <class P>
  void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
      ImageBase& image = slot_images[image_id];
@@ -55026,7 +55628,7 @@ index e92e54f..d5ed090 100644
      if (image.HasScaled()) {
          total_used_memory -= GetScaledImageSizeBytes(image);
      }
-@@ -2385,7 +3040,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+@@ -2385,7 +3075,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
          }
          slot_image_views.erase(image_view_id);
      }
@@ -55039,7 +55641,7 @@ index e92e54f..d5ed090 100644
          sentenced_images.Push(std::move(slot_images[image_id]));
      }
      slot_images.erase(image_id);
-@@ -2504,6 +3163,7 @@ template <class P>
+@@ -2504,6 +3198,7 @@ template <class P>
  void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
      Image& image = slot_images[image_id];
      if (invalidate) {
@@ -55047,7 +55649,7 @@ index e92e54f..d5ed090 100644
          image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
          if (False(image.flags & ImageFlagBits::Tracked)) {
              TrackImage(image, image_id);
-@@ -2537,6 +3197,11 @@ template <class P>
+@@ -2537,6 +3232,11 @@ template <class P>
  void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
      Image& dst = slot_images[dst_id];
      Image& src = slot_images[src_id];
@@ -55059,7 +55661,7 @@ index e92e54f..d5ed090 100644
      const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
      if (is_rescaled) {
          ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
-@@ -2628,7 +3293,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id)
+@@ -2628,7 +3328,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id)
      }
      if (new_id) {
          const ImageViewBase& old_view = slot_image_views[new_id];

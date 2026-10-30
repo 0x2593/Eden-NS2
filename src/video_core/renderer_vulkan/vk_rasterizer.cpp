@@ -247,6 +247,104 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
+
+namespace {
+// EDEN_FRAME_EVENTS=1 (diagnostic): when frame-events.request appears in the working directory,
+// log the next N draws, clears and compute dispatches (N from the file, default 4000), one line
+// each, to see how a frame is built.
+bool FrameEventsActive() {
+    static const bool enabled = std::getenv("EDEN_FRAME_EVENTS") != nullptr;
+    if (!enabled) {
+        return false;
+    }
+    static u32 remaining{};
+    static u32 checks{};
+    if (remaining == 0 && (checks++ & 63) == 0) {
+        std::error_code error;
+        if (std::filesystem::exists("frame-events.request", error)) {
+            u32 count = 4000;
+            {
+                std::ifstream request("frame-events.request");
+                request >> count;
+            }
+            std::filesystem::remove("frame-events.request", error);
+            remaining = count;
+            LOG_INFO(HW_GPU, "Frame events: logging the next {}", count);
+        }
+    }
+    if (remaining == 0) {
+        return false;
+    }
+    --remaining;
+    return true;
+}
+
+u64 StageProgram(const Tegra::Engines::Maxwell3D::Regs& regs, size_t stage) {
+    if (!regs.IsShaderConfigEnabled(stage)) {
+        return 0;
+    }
+    return (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) | regs.pipelines[stage].reserved[1];
+}
+
+void LogFrameDraw(const Tegra::Engines::Maxwell3D& maxwell3d, bool is_indexed, bool has_pipeline) {
+    const auto& regs = maxwell3d.regs;
+    const auto& draw = maxwell3d.draw_manager.draw_state;
+    const auto& rt = regs.rt[0];
+    const auto& vp = regs.viewport_transform[0];
+    LOG_INFO(HW_GPU,
+             "FE draw{} n={} inst={} topo={} pipe={} | rts={} rt0={:#x} {}x{} f{:#x} | z={} {:#x} "
+             "f{:#x} test={} func={:#x} write={} | vp sz={} tz={} range={}..{} z01={} mode={} "
+             "| vs={:#x} ps={:#x}",
+             is_indexed ? "I" : "", is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count,
+             draw.instance_count, static_cast<u32>(draw.topology), has_pipeline,
+             regs.rt_control.count.Value(), rt.Address(), rt.width, rt.height,
+             static_cast<u32>(rt.format), regs.zeta_enable, regs.zeta.Address(),
+             static_cast<u32>(regs.zeta.format), regs.depth_test_enable,
+             static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled, vp.scale_z,
+             vp.translate_z, regs.viewports[0].depth_range_near, regs.viewports[0].depth_range_far,
+             regs.viewport_clip_control.depth_0_to_1.Value(), static_cast<u32>(regs.depth_mode),
+             StageProgram(regs, 1), StageProgram(regs, 5));
+    // EDEN_FRAME_EVENTS_PS=<address>: also describe draws with that pixel shader in detail.
+    static const u64 detail_ps = [] {
+        const char* value = std::getenv("EDEN_FRAME_EVENTS_PS");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    // EDEN_FRAME_EVENTS_DETAIL=1: describe every draw in detail.
+    static const bool detail_all = std::getenv("EDEN_FRAME_EVENTS_DETAIL") != nullptr;
+    if (detail_all || vp.scale_z == 0.0f || (detail_ps != 0 && StageProgram(regs, 5) == detail_ps)) {
+        const auto& sc = regs.scissor_test[0];
+        LOG_INFO(HW_GPU,
+                 "FE   state stencil={} func={:#x} ref={:#x} fmask={:#x} wmask={:#x} ops={}/{}/{} | cull={} face={:#x} "
+                 "front={:#x} | cmask_common={} cmask0={:#x} | scissor={} {}..{} {}..{} | vp xy scale={} {} tr={} {} "
+                 "offset_en={} | alpha_test={} rasterize={} zclip_geom={}",
+                 regs.stencil_enable, static_cast<u32>(regs.stencil_front_op.func), regs.stencil_front_ref,
+                 regs.stencil_front_func_mask, regs.stencil_front_mask,
+                 static_cast<u32>(regs.stencil_front_op.fail), static_cast<u32>(regs.stencil_front_op.zfail),
+                 static_cast<u32>(regs.stencil_front_op.zpass), regs.gl_cull_test_enabled,
+                 static_cast<u32>(regs.gl_cull_face), static_cast<u32>(regs.gl_front_face),
+                 regs.color_mask_common, regs.color_mask[0].raw, sc.enable, sc.min_x.Value(),
+                 sc.max_x.Value(), sc.min_y.Value(), sc.max_y.Value(), vp.scale_x, vp.scale_y,
+                 vp.translate_x, vp.translate_y, regs.viewport_scale_offset_enabled,
+                 regs.alpha_test_enabled, regs.rasterize_enable,
+                 static_cast<u32>(regs.viewport_clip_control.geometry_clip.Value()));
+        const auto& pt = regs.blend_per_target[0];
+        LOG_INFO(HW_GPU,
+                 "FE   blend enable0={} per_target={} common op={:#x} src={:#x} dst={:#x} aop={:#x} asrc={:#x} "
+                 "adst={:#x} sep={} | rt0 op={:#x} src={:#x} dst={:#x} aop={:#x} asrc={:#x} adst={:#x} sep={} | "
+                 "rt_map0={} | blend_color={} {} {} {}",
+                 regs.blend.enable[0], regs.blend_per_target_enabled, static_cast<u32>(regs.blend.color_op),
+                 static_cast<u32>(regs.blend.color_source), static_cast<u32>(regs.blend.color_dest),
+                 static_cast<u32>(regs.blend.alpha_op), static_cast<u32>(regs.blend.alpha_source),
+                 static_cast<u32>(regs.blend.alpha_dest), regs.blend.separate_alpha,
+                 static_cast<u32>(pt.color_op), static_cast<u32>(pt.color_source),
+                 static_cast<u32>(pt.color_dest), static_cast<u32>(pt.alpha_op),
+                 static_cast<u32>(pt.alpha_source), static_cast<u32>(pt.alpha_dest), pt.separate_alpha,
+                 regs.rt_control.Map(0), regs.blend_color.r, regs.blend_color.g, regs.blend_color.b,
+                 regs.blend_color.a);
+    }
+}
+} // Anonymous namespace
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
@@ -287,6 +385,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
+    if (FrameEventsActive()) [[unlikely]] {
+        LogFrameDraw(*maxwell3d, is_indexed, pipeline != nullptr);
+    }
     if (!pipeline) {
         // A draw withheld for an asynchronous pipeline build is not a failure of the native work.
         submitted = pipeline_cache.TakeDeferredDraw();
@@ -884,6 +985,14 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                  regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
+    if (FrameEventsActive()) [[unlikely]] {
+        const auto& clear_regs = maxwell3d->regs;
+        LOG_INFO(HW_GPU, "FE clear surface={:#x} rt0={:#x} {}x{} f{:#x} colour={} {} {} {} depth={} z={:#x}",
+                 clear_regs.clear_surface.raw, clear_regs.rt[0].Address(), clear_regs.rt[0].width,
+                 clear_regs.rt[0].height, static_cast<u32>(clear_regs.rt[0].format),
+                 clear_regs.clear_color[0], clear_regs.clear_color[1], clear_regs.clear_color[2],
+                 clear_regs.clear_color[3], clear_regs.clear_depth, clear_regs.zeta.Address());
+    }
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -971,6 +1080,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         return;
     }
 
+    if (FrameEventsActive()) [[unlikely]] {
+        LOG_INFO(HW_GPU, "FE clear-area render={}x{} rect=({},{} {}x{}) scissor={} zeta_size={}x{} depth={} stencil={} z_aspect={}",
+                 render_area.width, render_area.height, clear_rect.rect.offset.x, clear_rect.rect.offset.y,
+                 clear_rect.rect.extent.width, clear_rect.rect.extent.height,
+                 regs.clear_control.use_scissor.Value(), regs.zeta_size.width, regs.zeta_size.height,
+                 use_depth, use_stencil, framebuffer->HasAspectDepthBit());
+    }
     const bool clear_covers_render_area =
         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
         clear_rect.rect.extent.width >= render_area.width &&
@@ -1082,6 +1198,9 @@ void RasterizerVulkan::DispatchCompute() {
     gpu_memory->FlushCaching();
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
+    if (FrameEventsActive()) [[unlikely]] {
+        LOG_INFO(HW_GPU, "FE dispatch pipe={}", pipeline != nullptr);
+    }
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
@@ -1166,6 +1285,10 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
+std::optional<u32> RasterizerVulkan::PendingSemaphoreRelease(DAddr addr) {
+    return query_cache.PendingRelease(addr);
+}
+
 void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                  u32 size) {
     buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
@@ -1212,6 +1335,13 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    {
+        // Guest CPU reads of buffer memory decide which GPU-written buffer data is copied back.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.NoteCpuRead(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
+                                 Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
+                                     Common::AlignDown(addr, Core::DEVICE_PAGESIZE));
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         auto area = texture_cache.GetFlushArea(addr, size);
@@ -1332,6 +1462,24 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     {
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.WriteMemory(addr, size);
+    }
+    pipeline_cache.InvalidateRegion(addr, size);
+}
+
+void RasterizerVulkan::OnCachedWrite(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    WatchCpuWrite(gpu_memory, "cached write", addr, size);
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.WriteMemory(addr, size);
+    }
+    {
+        // Copies just these bytes in: marking the pages CPU-modified instead re-uploads them
+        // whole from guest memory, over what the GPU wrote there and never copied back.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.CachedWriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
 }

@@ -64,6 +64,12 @@ public:
     virtual void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                        VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) = 0;
 
+    /// The payload of a semaphore release to addr that the GPU processed but has not written to
+    /// guest memory yet, since that waits for the host GPU to finish the work before it.
+    [[nodiscard]] virtual std::optional<u32> PendingSemaphoreRelease(DAddr addr) {
+        return std::nullopt;
+    }
+
     /// Signal an uniform buffer binding
     virtual void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                            u32 size) = 0;
@@ -113,6 +119,12 @@ public:
 
     /// Notify rasterizer that any caches of the specified region are desync with guest
     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
+
+    /// A guest CPU write to GPU-written memory, held back until now (InvalidateGPUCache, on the
+    /// GPU thread): only those bytes changed.
+    virtual void OnCachedWrite(DAddr addr, u64 size) {
+        OnCacheInvalidation(addr, size);
+    }
 
     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;

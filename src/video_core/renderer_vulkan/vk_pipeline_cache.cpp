@@ -946,6 +946,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
+        Shader::Backend::SPIRV::debug_shader_hash = key.unique_hashes[index];
+        // EDEN_DEBUG_SHADER_IR=1 with EDEN_DEBUG_SHADER=<hash>[,...] (diagnostic): write those
+        // shaders' IR to shader-<hash>.ir.txt in the working directory.
+        if (std::getenv("EDEN_DEBUG_SHADER_IR") != nullptr) {
+            if (const char* hashes = std::getenv("EDEN_DEBUG_SHADER");
+                hashes != nullptr &&
+                std::string_view{hashes}.find(fmt::format("{:016x}", key.unique_hashes[index])) !=
+                    std::string_view::npos) {
+                std::ofstream dump(fmt::format("shader-{:016x}.ir.txt", key.unique_hashes[index]));
+                dump << Shader::IR::DumpProgram(program);
+            }
+        }
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);

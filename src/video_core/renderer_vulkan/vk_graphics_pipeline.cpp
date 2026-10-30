@@ -552,6 +552,31 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // EDEN_DRAW_TEXTURE_LOG=1: creating draw-textures.request logs the next 20000 draws once, with
     // each sampled view's format, type, size, layers, address and how much of its first page is
     // non-zero in guest memory (meaningful for textures the CPU or DMA filled).
+    // EDEN_DEBUG_SHADER=<hash>[,...] (diagnostic): log the first words of the fragment stage's
+    // constant buffers 0-4 for draws with those fragment shaders (guest memory, then the buffer
+    // cache's copy where the GPU wrote it).
+    if (static const char* const debug_hashes = std::getenv("EDEN_DEBUG_SHADER");
+        debug_hashes != nullptr &&
+        std::string_view{debug_hashes}.find(fmt::format("{:016x}", key.unique_hashes[5])) != std::string_view::npos) {
+        static u32 logged{};
+        if (logged++ < 12) {
+            const auto& fs_cbufs{maxwell3d->state.shader_stages[4].const_buffers};
+            for (u32 bank = 0; bank < 5; ++bank) {
+                const auto& cb = fs_cbufs[bank];
+                if (!cb.enabled || cb.size == 0) continue;
+                std::array<u32, 12> words{};
+                const size_t bytes = std::min<size_t>(cb.size, sizeof(words));
+                if (const auto device = gpu_memory->GpuToCpuAddress(cb.address)) {
+                    buffer_cache.DownloadMemory(*device, bytes);
+                }
+                gpu_memory->ReadBlockUnsafe(cb.address, words.data(), bytes);
+                std::array<f32, 12> floats{};
+                std::memcpy(floats.data(), words.data(), sizeof(words));
+                LOG_INFO(HW_GPU, "Debug shader {:016x} cbuf {} @{:#x} size {:#x}: {}", key.unique_hashes[5], bank,
+                         cb.address, cb.size, fmt::join(floats, " "));
+            }
+        }
+    }
     static const bool texture_log = std::getenv("EDEN_DRAW_TEXTURE_LOG") != nullptr;
     static u32 texture_log_remaining{};
     if (texture_log) {

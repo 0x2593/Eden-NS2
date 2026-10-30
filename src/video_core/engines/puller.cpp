@@ -172,8 +172,16 @@ bool Puller::CanResumeNativeAcquire(DmaPusher& dma_pusher) const {
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadNativeSemaphoreWord asks are its state).
     DrainBack();
-    return !dma_pusher.memory_manager.IsShuttingDown() &&
-           native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address));
+    if (dma_pusher.memory_manager.IsShuttingDown()) {
+        return false;
+    }
+    if (native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address))) {
+        return true;
+    }
+    const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(native_acquire->address);
+    const auto pending = cpu_address ? dma_pusher.rasterizer->PendingSemaphoreRelease(*cpu_address)
+                                     : std::nullopt;
+    return pending && native_acquire->Matches(*pending);
 }
 
 bool Puller::ResumeNativeAcquire(DmaPusher& dma_pusher) {
@@ -227,6 +235,22 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     if (op == GpuSemaphoreOperation::AcquireMask) return (word & regs.semaphore_sequence) != 0;
                     return false;
                 };
+                if (!ready()) {
+                    // A release the GPU already processed may only wait for the host GPU to
+                    // write it (accurate GPU mode). Work after this acquire runs after the work
+                    // before that release on the host anyway: no need to wait for the host GPU.
+                    if (const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(
+                            regs.semaphore_address.SemaphoreAddress())) {
+                        if (const auto pending =
+                                dma_pusher.rasterizer->PendingSemaphoreRelease(*cpu_address)) {
+                            const u32 written = word;
+                            word = *pending;
+                            if (!ready()) {
+                                word = written;
+                            }
+                        }
+                    }
+                }
                 if (!ready()) {
                     dma_pusher.rasterizer->ReleaseFences(true);
                     word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());

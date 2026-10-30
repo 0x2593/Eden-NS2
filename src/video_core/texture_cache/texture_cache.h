@@ -1545,6 +1545,29 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const TICEntry config = TextureViewHeader(raw_config, native);
     const ImageInfo info(config);
+    // EDEN_DEBUG_TIC_SIZE=<width>x<height> (diagnostic): log the texture headers of views that size.
+    static const std::pair<u32, u32> debug_tic_size = [] {
+        u32 width{}, height{};
+        if (const char* value = std::getenv("EDEN_DEBUG_TIC_SIZE")) {
+            std::sscanf(value, "%ux%u", &width, &height);
+        }
+        return std::pair{width, height};
+    }();
+    if (debug_tic_size.first != 0 && info.size.width == debug_tic_size.first &&
+        info.size.height == debug_tic_size.second) {
+        static u32 logged{};
+        if (logged++ < 32) {
+            LOG_INFO(HW_GPU, "TIC {:#x}: raw {:016x} {:016x} {:016x} {:016x} format {} "
+                             "types {}/{}/{}/{} swizzle {}/{}/{}/{} srgb {} type {} pixel format {}",
+                     config.Address(), config.raw[0], config.raw[1], config.raw[2], config.raw[3],
+                     static_cast<u32>(config.format.Value()), static_cast<u32>(config.r_type.Value()),
+                     static_cast<u32>(config.g_type.Value()), static_cast<u32>(config.b_type.Value()),
+                     static_cast<u32>(config.a_type.Value()), static_cast<u32>(config.x_source.Value()),
+                     static_cast<u32>(config.y_source.Value()), static_cast<u32>(config.z_source.Value()),
+                     static_cast<u32>(config.w_source.Value()), config.srgb_conversion.Value(),
+                     static_cast<u32>(config.texture_type.Value()), static_cast<u32>(info.format));
+        }
+    }
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
@@ -1556,6 +1579,18 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
         return NULL_IMAGE_VIEW_ID;
     }
     ImageBase& image = slot_images[image_id];
+    if (debug_tic_size.first != 0 && info.size.width == debug_tic_size.first &&
+        info.size.height == debug_tic_size.second) {
+        static u32 logged{};
+        if (logged++ < 32) {
+            std::array<u8, 64> bytes{};
+            gpu_memory->ReadBlockUnsafe(config.Address(), bytes.data(), bytes.size());
+            LOG_INFO(HW_GPU, "TIC {:#x}: image {:#x} {}x{} format {} flags {:#x}, guest bytes {:02x}",
+                     config.Address(), image.gpu_addr, image.info.size.width, image.info.size.height,
+                     static_cast<u32>(image.info.format), static_cast<u32>(image.flags),
+                     fmt::join(bytes, ""));
+        }
+    }
     const SubresourceBase base = image.TryFindBase(config.Address()).value();
     ASSERT(base.level == 0);
     const ImageViewInfo view_info(config, base.layer);
