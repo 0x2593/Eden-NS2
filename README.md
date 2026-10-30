@@ -18,7 +18,7 @@ Nintendo Switch 2 games.
 ### Known issues
 
 - **Donkey Kong Bananza:** some destructible terrain is drawn as black patches.
-- **Mario Kart World:** the first run compiles shaders for several minutes on the loading map.
+- **Mario Kart World:** loading into a Grand Prix hangs on a black screen.
   Recommended per-game settings: GPU accuracy Low, asynchronous shaders on, and ASTC
   recompression BC3 (needed on GPUs with less than 8 GB of video memory). Some geometry
   (task/mesh shaders) is missing.
