@@ -12,15 +12,16 @@ Nintendo Switch 2 games.
 | Game | State |
 | --- | --- |
 | Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Gameplay, 3D world renders |
-| Mario Kart World (`0400C3F00006E000`, v1.8.0) | Reaches the 3D attract scene |
+| Mario Kart World (`0400C3F00006E000`, v1.8.0) | Gameplay, text rendering issues |
 | Pokémon Pokopia (`0400A3A01EE4C000`) | Gameplay, 3D world renders |
 
 ### Known issues
 
 - **Donkey Kong Bananza:** some destructible terrain is drawn as black patches.
 - **Mario Kart World:** the first run compiles shaders for several minutes on the loading map.
-  On GPUs with less than 8 GB of video memory, set ASTC recompression to BC3 for it. Some
-  geometry (task/mesh shaders) is missing.
+  Recommended per-game settings: GPU accuracy Low, asynchronous shaders on, and ASTC
+  recompression BC3 (needed on GPUs with less than 8 GB of video memory). Some geometry
+  (task/mesh shaders) is missing.
 
 ## Building (Windows, MSYS2 MINGW64)
 

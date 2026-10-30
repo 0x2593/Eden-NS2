@@ -307,7 +307,22 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    const VkResult result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    VkResult result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // Video memory is full: place the buffer in system memory the GPU can read (slower than
+        // VRAM, but the game keeps running instead of aborting).
+        VmaAllocationCreateInfo host_ci = alloc_ci;
+        host_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        host_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        host_ci.preferredFlags = 0;
+        host_ci.memoryTypeBits = 0;
+        result = vmaCreateBuffer(allocator, &ci, &host_ci, &handle, &allocation, &alloc_info);
+        static u32 logged{};
+        if (logged++ < 16) {
+            LOG_WARNING(Render_Vulkan, "Video memory full: buffer of {} bytes placed in system memory ({})",
+                        ci.size, result == VK_SUCCESS ? "ok" : "failed");
+        }
+    }
     if (result != VK_SUCCESS) {
         LOG_CRITICAL(Render_Vulkan, "Buffer allocation failed: bytes={}, usage={}, buffer_flags={:#x}, result={}",
                      ci.size, static_cast<u32>(usage), ci.usage, static_cast<s32>(result));

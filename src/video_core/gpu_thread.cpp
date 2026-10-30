@@ -17,6 +17,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -38,22 +39,31 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 
         auto current_context = context.Acquire();
         CommandDataContainer next;
+        namespace Profile = VideoCommon::Nx2Profile;
         while (!stop_token.stop_requested()) {
+            Profile::Report();
             if (scheduler.HasPendingNativeChannels()) {
-                scheduler.ResumePending(system.GPU());
+                {
+                    Profile::Scope scope{Profile::Zone::ResumePending};
+                    scheduler.ResumePending(system.GPU());
+                }
                 if (!state.queue.TryPop(next)) {
+                    Profile::Scope scope{Profile::Zone::PendingSleep};
                     std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     continue;
                 }
             } else {
+                Profile::Scope scope{Profile::Zone::Idle};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
                 break;
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                Profile::Scope scope{Profile::Zone::Push};
                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                Profile::Scope scope{Profile::Zone::Tick};
                 system.GPU().TickWork();
             } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
                 renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
