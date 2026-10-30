@@ -982,7 +982,7 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(
         const u32 band_bytes = level_sizes[level] / num_bands;
         const u32 blocks_per_band = band_bytes / block_bytes;
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
-            const u64 segment_begin = u64{layer} * layer_stride + level_offset;
+            const u64 segment_begin = static_cast<u64>(layer) * layer_stride + level_offset;
             const u64 segment_end = segment_begin + level_sizes[level];
             bool any = false;
             for (const auto& [begin, end] : dirty_ranges) {
