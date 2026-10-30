@@ -303,7 +303,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         }
         const bool uniform_predicate_bank = original_opcode == 0x290 || original_opcode == 0x890 || original_opcode == 0x892;
         if (uniform_predicate_bank) {
-            const auto map = [](u32 code) { return ((code & 7) == 7 ? 7U : 6U - (code & 7)) | (code & 8); };
+            const auto map = [](u32 c) { return ((c & 7) == 7 ? 7U : 6U - (c & 7)) | (c & 8); };
             const u32 execution = map(insn.Bits(12, 4));
             insn.words[0] = (insn.words[0] & ~0xf000U) | (execution << 12);
             const u32 first = map(insn.Bits(81, 3));
