@@ -1,0 +1,46 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install Choco Dependencies
+      shell: cmd
+      run: choco install cmake ninja --installargs "ADD_CMAKE_TO_PATH=System" -y
+
+    - name: Install Vulkan SDK
+      uses: humbletim/install-vulkan-sdk@v1.2
+      with:
+        version: latest
+        cache: true
+
+    - name: Add Vulkan SDK to PATH
+      shell: pwsh
+      run: |
+        echo "$env:VULKAN_SDK\Bin" >> $env:GITHUB_PATH
+        & "$env:VULKAN_SDK\Bin\glslangValidator.exe" --version
+
+    - name: Configure Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Build with MSVC Script
+      shell: cmd
+      run: build-eden-msvc.bat 4 < NUL
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Eden-NS2-Windows
+        path: build-msvc-gui-relwithdebinfo/bin/
+        if-no-files-found: error

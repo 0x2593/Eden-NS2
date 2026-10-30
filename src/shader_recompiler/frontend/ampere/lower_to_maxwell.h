@@ -303,7 +303,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         }
         const bool uniform_predicate_bank = original_opcode == 0x290 || original_opcode == 0x890 || original_opcode == 0x892;
         if (uniform_predicate_bank) {
-            const auto map = [](u32 code) { return ((code & 7) == 7 ? 7U : 6U - (code & 7)) | (code & 8); };
+            const auto map = [](u32 c) { return ((c & 7) == 7 ? 7U : 6U - (c & 7)) | (c & 8); };
             const u32 execution = map(insn.Bits(12, 4));
             insn.words[0] = (insn.words[0] & ~0xf000U) | (execution << 12);
             const u32 first = map(insn.Bits(81, 3));
@@ -2801,7 +2801,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         }
         case 0x209: case 0x809: case 0xa09: case 0xc09: { // FMNMX, register/imm/cbuf/uniform operand
             // The uniform form sets bit 91 as part of the operand form.
-            if (insn.Bits(74, 6) || insn.Bits(82, 5) || insn.Bits(91, 1) != (opcode == 0xc09))
+            if (insn.Bits(74, 6) || insn.Bits(82, 5) || (insn.Bits(91, 1) != 0) != (opcode == 0xc09))
                 return fail(index, "native floating min/max mode");
             const u32 a = operand(0), b = operand(1);
             const bool propagate_nan = insn.Bits(81, 1);
