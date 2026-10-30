@@ -31,6 +31,9 @@ public:
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
 
 private:
+    /// Binds the GPU's current channel, on the split GPU thread's back half when it runs.
+    void BindChannel(GPU& gpu, s32 bind_id);
+
     ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
     std::mutex scheduling_guard;
     std::vector<std::shared_ptr<ChannelState>> pending_native_channels;

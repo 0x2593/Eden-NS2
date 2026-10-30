@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -173,7 +174,9 @@ private:
         size_t prefix_size;
         std::string error;
     };
-    ::Common::unordered_map<u64, RejectedShader> rejected_shaders;
+    /// Ordered by address: invalidations (every guest write to a cached page) look up only the
+    /// entries they can overlap.
+    std::map<u64, RejectedShader> rejected_shaders;
 };
 
 } // namespace VideoCommon

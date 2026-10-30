@@ -991,6 +991,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     fs.executing_macro.reset();
 #endif
     fs.parameters.clear();
+    split.AfterMacro();
 }
 
 } // namespace Tegra::Engines

@@ -17,6 +17,10 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// Set once a channel with the native (Switch 2) ABI binds its 3D engine: the GPU thread split
+// (gpu_split.h) starts for those titles.
+inline std::atomic<bool> g_native_channels{false};
+
 // NVN2 queues release their progress values into the second page of a two-page GPU-accessible
 // region and GPU acquires read the same offsets in the first page (the CPU polls the second).
 // Something on the console copies one into the other; until that is known, the puller mirrors

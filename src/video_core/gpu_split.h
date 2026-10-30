@@ -90,6 +90,33 @@ public:
     }
     void DeferFunction(std::function<void()>&& func);
 
+    /// A macro the front ran ended: the hook of SetAfterMethod runs after its writes.
+    void AfterMacro() {
+        if (front_after_method != nullptr) {
+            Defer([this] {
+                if (after_method != nullptr) {
+                    after_method(after_method_context);
+                }
+            });
+        }
+    }
+
+    /// Runs `hook(context)` on the back after every command from here on: an executable method
+    /// or run sent from the command list, or a macro run on the front (AfterMacro), in order
+    /// with what was sent before; null stops it. DmaPusher checks for failed native work there,
+    /// which one thread does after every command.
+    void SetAfterMethod(void (*hook)(void*), void* context) {
+        if (hook == front_after_method && context == front_after_context) {
+            return;
+        }
+        front_after_method = hook;
+        front_after_context = context;
+        Defer([this, hook, context] {
+            after_method = hook;
+            after_method_context = context;
+        });
+    }
+
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
     static inline bool check_owner{};
@@ -161,9 +188,13 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    void (*front_after_method)(void*){};
+    void* front_after_context{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
+    void (*after_method)(void*){};
+    void* after_method_context{};
 
     static GpuSplit instance;
 

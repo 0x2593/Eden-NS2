@@ -163,6 +163,7 @@ void BufferCache<P>::TickFrame() {
 
 template <class P>
 void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size) {
+    mapping_generation.fetch_add(1, std::memory_order_release);
     if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
         virtual_ranges.Unmap(as_id, gpu_addr, size);
     }
@@ -2295,6 +2296,31 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 }
 
 template <class P>
+u32 BufferCache<P>::MappedStoragePrefix(GPUVAddr gpu_addr, u32 size) const {
+    // Read before the walk: a mapping change during it leaves this entry stale, not wrong.
+    const u64 generation = mapping_generation.load(std::memory_order_acquire);
+    const u64 key = (static_cast<u64>(gpu_memory->GetID()) << 48) ^ gpu_addr;
+    if (const auto it = mapped_prefixes.find(key); it != mapped_prefixes.end() &&
+        it->second.generation == generation && it->second.gpu_addr == gpu_addr &&
+        it->second.size == size) {
+        return it->second.prefix;
+    }
+    u32 prefix = size;
+    if (!gpu_memory->IsFullyMappedRange(gpu_addr, size)) {
+        prefix = 0;
+        for (const auto& [address, length] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
+            if (address != gpu_addr + prefix) break;
+            prefix += static_cast<u32>(length);
+        }
+    }
+    if (mapped_prefixes.size() >= 4096) {
+        mapped_prefixes.clear();
+    }
+    mapped_prefixes.insert_or_assign(key, MappedPrefix{generation, gpu_addr, size, prefix});
+    return prefix;
+}
+
+template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                              bool is_written, bool native_pointer) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
@@ -2323,13 +2349,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     const u64 mapped_size = gpu_memory->GetMemoryLayoutSize(gpu_addr);
     const u64 following_word = native_pointer ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
     u32 size = StorageBufferSize(mapped_size, following_word, native_pointer);
-    if (native_pointer && size && !gpu_memory->IsFullyMappedRange(gpu_addr, size)) {
-        u32 mapped_prefix = 0;
-        for (const auto& [address, length] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
-            if (address != gpu_addr + mapped_prefix) break;
-            mapped_prefix += static_cast<u32>(length);
-        }
-        size = mapped_prefix;
+    if (native_pointer && size) {
+        size = MappedStoragePrefix(gpu_addr, size);
     }
 
     // Alignment only applies to the offset of the buffer

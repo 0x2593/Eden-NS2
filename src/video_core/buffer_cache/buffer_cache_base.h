@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <array>
 #include <bit>
@@ -485,6 +486,10 @@ private:
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
+    /// How much of [gpu_addr, gpu_addr + size) is mapped from its start, remembered until a GPU
+    /// mapping changes.
+    [[nodiscard]] u32 MappedStoragePrefix(GPUVAddr gpu_addr, u32 size) const;
+
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                                bool is_written, bool native_pointer) const;
 
@@ -568,6 +573,17 @@ private:
     };
     Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache;
     VirtualRangeCache virtual_ranges;
+    /// Native storage buffers bind an 8 MiB window from the pointer; checking that it is mapped
+    /// walked every page of it on each bind (~15% of the GPU thread in Mario Kart World).
+    struct MappedPrefix {
+        u64 generation;
+        GPUVAddr gpu_addr;
+        u32 size;
+        u32 prefix;
+    };
+    mutable ::Common::unordered_map<u64, MappedPrefix> mapped_prefixes;
+    /// Bumped by UnmapGPUMemory (any thread), whenever a GPU page's mapping type changes.
+    std::atomic<u64> mapping_generation{1};
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;

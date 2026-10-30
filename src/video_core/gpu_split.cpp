@@ -88,7 +88,14 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         return value != nullptr ? value[0] : '2';
     }();
     const bool wanted = mode == '1' || mode == '2';
-    if (active || !wanted || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+    if (active || !wanted || !(Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+                               Tegra::g_native_channels.load(std::memory_order_relaxed))) {
+        return;
+    }
+    // EDEN_NATIVE_STRICT stalls a channel on failed native work, which only the thread that
+    // parses its commands can do.
+    static const bool strict = std::getenv("EDEN_NATIVE_STRICT") != nullptr;
+    if (strict) {
         return;
     }
     // The front reads command lists straight from guest memory; a read that flushes the caches
@@ -249,7 +256,9 @@ size_t GpuSplit::Execute(const u64* entry) {
             engine->ConsumeSink(*system);
             engine->CallMethod(*system, method, argument, true);
         } else if (!engine->execution_mask[method]) {
+            // A state write: nothing runs that could fail.
             engine->method_sink.emplace_back(method, argument);
+            return (head & HasSegment) != 0 ? 2 : 1;
         } else {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
@@ -257,6 +266,10 @@ size_t GpuSplit::Execute(const u64* entry) {
                 engine->current_dma_segment = entry[1];
             }
             engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
+        }
+        // A macro's writes (Direct) are one command together: AfterMacro follows them.
+        if (after_method != nullptr && (head & Direct) == 0) {
+            after_method(after_method_context);
         }
         return (head & HasSegment) != 0 ? 2 : 1;
     }
@@ -272,6 +285,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         }
         engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
                                 amount, static_cast<u32>(entry[1]));
+        if (after_method != nullptr) {
+            after_method(after_method_context);
+        }
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {

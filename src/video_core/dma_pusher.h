@@ -145,6 +145,12 @@ private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool HasFailedNativeWork() const;
+    /// HasFailedNativeWork's check itself; with the GPU thread split the back thread runs it
+    /// after every engine method (FailedNativeWorkHook), where the failures happen.
+    bool CheckFailedNativeWork() const;
+    static void FailedNativeWorkHook(void* dma_pusher);
+    /// Whether the current method carries a DMA segment its engine reads.
+    [[nodiscard]] bool WantsSegment() const;
     bool Step();
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
     size_t command_resume_offset{};

@@ -205,9 +205,13 @@ void ShaderCache::ThrowIfRejected(VAddr cpu_addr, GPUVAddr gpu_addr) {
 
 void ShaderCache::DropRejections(VAddr addr, size_t size) {
     std::scoped_lock lock{lookup_mutex};
-    for (auto it = rejected_shaders.begin(); it != rejected_shaders.end();) {
+    // A remembered prefix is at most REJECT_PREFIX_BYTES long: only entries starting that far
+    // before the range can reach into it.
+    const VAddr first = addr > REJECT_PREFIX_BYTES ? addr - REJECT_PREFIX_BYTES : 0;
+    for (auto it = rejected_shaders.lower_bound(first);
+         it != rejected_shaders.end() && it->first < addr + size;) {
         const auto current = it++;
-        if (current->first < addr + size && addr < current->first + current->second.prefix_size) {
+        if (addr < current->first + current->second.prefix_size) {
             rejected_shaders.erase(current);
         }
     }
