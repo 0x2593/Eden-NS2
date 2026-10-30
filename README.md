@@ -12,7 +12,7 @@ Nintendo Switch 2 games.
 | Game | State |
 | --- | --- |
 | Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Gameplay, 3D world renders |
-| Mario Kart World (`0400C3F00006E000`, v1.8.0) | Gameplay, text rendering issues |
+| Mario Kart World (`0400C3F00006E000`, v1.8.0) | Playable in Free Roam; Grand Prix hangs on a black screen |
 | Pokémon Pokopia (`0400A3A01EE4C000`) | Gameplay, 3D world renders |
 
 ### Known issues
