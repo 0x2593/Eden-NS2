@@ -5,7 +5,7 @@ Nintendo Switch 2 games.
 
 ![Donkey Kong Bananza gameplay](docs/ns2/screenshots/bananza-gameplay.png)
 
-![Pokémon Pokopia first-run screen](docs/ns2/screenshots/pokopia-boot.png)
+![Mario Kart World gameplay](docs/ns2/screenshots/mario-kart-world-gameplay.png)
 
 ## Status
 
