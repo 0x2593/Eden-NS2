@@ -55808,7 +55808,7 @@ index 8a2318c..a2292ca 100644
      Common::SlotVector<Image> slot_images;
      Common::SlotVector<ImageMapView> slot_map_views;
 diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
-index e55d075..94e841e 100644
+index e55d075..cb19756 100644
 --- a/src/video_core/texture_cache/util.cpp
 +++ b/src/video_core/texture_cache/util.cpp
 @@ -11,6 +11,7 @@
@@ -55934,7 +55934,7 @@ index e55d075..94e841e 100644
 +        const u32 band_bytes = level_sizes[level] / num_bands;
 +        const u32 blocks_per_band = band_bytes / block_bytes;
 +        for (s32 layer = 0; layer < info.resources.layers; ++layer) {
-+            const u64 segment_begin = u64{layer} * layer_stride + level_offset;
++            const u64 segment_begin = static_cast<u64>(layer) * layer_stride + level_offset;
 +            const u64 segment_end = segment_begin + level_sizes[level];
 +            bool any = false;
 +            for (const auto& [begin, end] : dirty_ranges) {
