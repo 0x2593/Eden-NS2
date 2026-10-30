@@ -122,12 +122,21 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
                 u8 flush_wave_buffer_count;
                 u16 reserved2;
                 VoiceInfo::Flags flags;
+                u8 reserved_after_flags;
                 SrcQuality src_quality;
+                u8 crossfade_curve;
                 u32 external_ctx;
                 u32 external_ctx_size;
                 u32 reserved3[2];
             };
+            static_assert(sizeof(VoiceInParameterV2) == 0x188);
+            static_assert(offsetof(VoiceInParameterV2, crossfade_curve) == 0x177);
             const auto* vin = reinterpret_cast<const VoiceInParameterV2*>(input + i * in_stride);
+            if (behaviour.GetUserRevisionNum() >= 16 && vin->in_use && vin->crossfade_curve != 0) {
+                LOG_ERROR(Service_Audio, "Unsupported voice biquad crossfade curve {}",
+                          vin->crossfade_curve);
+                return Service::Audio::ResultInvalidUpdateInfo;
+            }
             local_in.id = vin->id;
             local_in.node_id = vin->node_id;
             local_in.is_new = vin->is_new;
@@ -583,16 +592,16 @@ Result InfoUpdater::UpdatePerformanceBuffer(std::span<u8> performance_output,
 
 Result InfoUpdater::UpdateBehaviorInfo(BehaviorInfo& behaviour_) {
     const auto in_params{reinterpret_cast<const BehaviorInfo::InParameter*>(input)};
-    LOG_DEBUG(Service_Audio, "revision={:#x}, user_revision={:#x}, behaviour_size={:#x}",
-              in_params->revision, behaviour_.GetUserRevision(), in_header->behaviour_size);
 
     if (!CheckValidRevision(in_params->revision)) {
         return Service::Audio::ResultInvalidUpdateInfo;
     }
 
-    // Newer SDKs set bit 21 of the magic ("Rev" instead of "REV") in per-update parameters, so
-    // only the revision number itself has to match the one the renderer was opened with.
+    // Compare revision numbers: Switch 2 opens the renderer with 'REV?' but tags its updates
+    // 'REv?' (lowercase v) for the same revision.
     if (GetRevisionNum(in_params->revision) != GetRevisionNum(behaviour_.GetUserRevision())) {
+        LOG_ERROR(Service_Audio, "BehaviorInfo revision {:08X} does not match the renderer's {:08X}",
+                  in_params->revision, behaviour_.GetUserRevision());
         return Service::Audio::ResultInvalidUpdateInfo;
     }
 

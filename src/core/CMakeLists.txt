@@ -347,6 +347,10 @@ add_library(core STATIC
     hle/kernel/physical_core.cpp
     hle/kernel/physical_core.h
     hle/kernel/slab_helpers.h
+    hle/dlss_trace.cpp
+    hle/dlss_trace.h
+    hle/guest_hooks.cpp
+    hle/guest_hooks.h
     hle/kernel/svc.cpp
     hle/kernel/svc.h
     hle/kernel/svc/svc_activity.cpp
@@ -467,6 +471,9 @@ add_library(core STATIC
     hle/service/am/service/graphics_session.cpp
     hle/service/am/service/graphics_session.h
     hle/service/am/service/graphics_supervisor.cpp
+    hle/service/am/service/native_video_decoder.cpp
+    hle/service/am/service/native_video_layout.h
+    hle/service/am/service/native_video_decoder.h
     hle/service/am/service/graphics_supervisor.h
     hle/service/am/service/graphics_supervisor_protocol.h
     hle/service/am/service/graphics_syncpoint_cache.h
@@ -1192,6 +1199,8 @@ endif()
 
 if (WIN32)
     target_compile_definitions(core PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+    # dlss_trace.cpp symbolises host backtraces; MinGW ignores its #pragma comment(lib).
+    target_link_libraries(core PRIVATE dbghelp)
 
     if(TARGET iw)
         target_link_libraries(core PRIVATE iw)
@@ -1231,7 +1240,11 @@ else()
     target_link_libraries(core PUBLIC Boost::headers)
 endif()
 
+set_source_files_properties(hle/service/am/service/native_video_decoder.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "$<TARGET_PROPERTY:libgav1_static,INTERFACE_INCLUDE_DIRECTORIES>")
+
 target_link_libraries(core PRIVATE
+    "$<LINK_ONLY:libgav1_static>"
     OpenSSL::SSL
     fmt::fmt
     nlohmann_json::nlohmann_json

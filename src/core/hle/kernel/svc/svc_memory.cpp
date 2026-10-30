@@ -151,22 +151,8 @@ Result SetGpuMemoryAttribute(Core::System& system, u64 address, u64 size, u32 ma
              ResultInvalidCombination);
     auto& page_table = process.GetPageTable();
     R_UNLESS(page_table.Contains(address, size), ResultInvalidCurrentMemory);
-    const Result result = page_table.SetMemoryAttribute(
-        address, size, static_cast<KMemoryAttribute>(mask), static_cast<KMemoryAttribute>(attr));
-    if (result.IsError()) {
-        LOG_WARNING(Kernel_SVC, "GPU memory attribute failed: address={:#x}, size={:#x}, mask={:#x}, attr={:#x}, result={:#x}",
-                    address, size, mask, attr, result.raw);
-        for (u64 cur = address; cur < address + size;) {
-            KMemoryInfo info{};
-            PageInfo page{};
-            if (page_table.QueryInfo(&info, &page, cur).IsError() || info.m_size == 0) break;
-            LOG_WARNING(Kernel_SVC, "  block {:#x}+{:#x}: state={:#x}, perm={:#x}, attr={:#x}",
-                        info.m_address, info.m_size, static_cast<u32>(info.m_state),
-                        static_cast<u32>(info.m_permission), static_cast<u32>(info.m_attribute));
-            cur = info.m_address + info.m_size;
-        }
-    }
-    R_RETURN(result);
+    R_RETURN(page_table.SetMemoryAttribute(address, size, static_cast<KMemoryAttribute>(mask),
+                                           static_cast<KMemoryAttribute>(attr)));
 }
 
 /// Maps a memory range into a different range.

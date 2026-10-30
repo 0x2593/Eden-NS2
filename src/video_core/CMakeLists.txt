@@ -90,17 +90,25 @@ add_library(video_core STATIC
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_memo.h
+    macro_turing.h
     fence_manager.h
     gpu.cpp
     gpu.h
     native_query_trace.h
+    native_root_table.h
     native_semaphore.h
+    gpu_split.cpp
+    gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
     guest_memory.h
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    native_qmd.h
+    nx2.h
+    nx2_profile.h
     present.h
     pte_kind.h
     query_cache/bank_base.h

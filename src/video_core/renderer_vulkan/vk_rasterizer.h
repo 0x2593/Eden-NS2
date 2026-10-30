@@ -155,17 +155,6 @@ private:
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
-    // Opt-in (EDEN_NATIVE_FRAME_STATS) per-display work counters for native titles.
-    struct FrameStats {
-        u32 draws{};
-        u32 clears{};
-        u32 dispatches{};
-        std::array<GPUVAddr, 8> targets{};
-        size_t target_count{};
-    };
-    FrameStats frame_stats;
-    void RecordFrameTarget();
-
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
 

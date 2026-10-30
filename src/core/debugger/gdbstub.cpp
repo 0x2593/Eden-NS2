@@ -25,7 +25,10 @@
 #include "core/debugger/gdbstub_arch.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_event.h"
+#include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/loader/loader.h"
 #include "core/memory.h"
 
@@ -731,8 +734,26 @@ void GDBStub::HandleRcmd(const std::vector<u8>& command) {
                 break;
             cur_addr = next_address;
         }
+    } else if (command_str == "handles" || command_str == "get handles") {
+        // Every handle of the process: its object type and, for service events, their name.
+        reply = "Handles:\n";
+        auto& handle_table = debug_process->GetHandleTable();
+        for (size_t i = 0; i < handle_table.GetTableSize(); ++i) {
+            Kernel::Handle handle{};
+            auto object = handle_table.GetObjectByIndex(system.Kernel(), std::addressof(handle), i);
+            if (object.IsNull()) {
+                continue;
+            }
+            std::string name;
+            if (auto* readable = object->DynamicCast<Kernel::KReadableEvent*>(); readable != nullptr) {
+                name = Service::KernelHelpers::ServiceContext::GetEventName(readable->GetParent());
+            } else if (auto* event = object->DynamicCast<Kernel::KEvent*>(); event != nullptr) {
+                name = Service::KernelHelpers::ServiceContext::GetEventName(event);
+            }
+            reply += fmt::format("  {:#010x} {} {}\n", handle, object->GetTypeObj().GetName(), name);
+        }
     } else {
-        reply += "Commands: fastmem, info, mappings\n";
+        reply += "Commands: fastmem, info, mappings, handles\n";
     }
 
     std::span<const u8> reply_span{reinterpret_cast<u8*>(&reply.front()), reply.size()};

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/native_diagnostics.h"
 #include <cstring>
 #include <fstream>
 #include <cstdlib>
@@ -291,7 +292,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
                 LOG_ERROR(HW_GPU, "Native graphics shaders require the experimental Vulkan path");
                 return;
             }
-            if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
+            if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
                 static thread_local std::set<std::array<GPUVAddr, Maxwell3D::Regs::MaxShaderProgram>> captured;
                 std::array<GPUVAddr, Maxwell3D::Regs::MaxShaderProgram> programs{};
                 for (size_t stage = 0; stage < programs.size(); ++stage) {

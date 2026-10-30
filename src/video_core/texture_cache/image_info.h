@@ -54,6 +54,8 @@ struct ImageInfo {
     bool forced_flushed = false;
     bool dma_downloaded = false;
     bool is_sparse = false;
+    // ASTC data whose blocks carry no alpha: re-compressed to BC1 instead of BC3 (half the size).
+    bool astc_opaque = false;
 };
 
 } // namespace VideoCommon

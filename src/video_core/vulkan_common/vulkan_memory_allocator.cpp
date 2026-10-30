@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <limits>
 #include <optional>
@@ -205,10 +206,12 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci) const
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
-            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+            .flags = static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
+                     (dedicated ? VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT}
+                               : VmaAllocationCreateFlags{0}),
             .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
             .requiredFlags = 0,
             .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -221,7 +224,53 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci) const
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
-    vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+    // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
+    // backed: VMA would quietly place them in system memory once VRAM is full. They take the
+    // unbacked sparse fallback below.
+    const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
+    const bool huge = texels > (u64{1} << 28);
+    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+        // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
+        // it out rather than failing the draw and aborting.
+        static u32 logged{};
+        if (logged++ < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "Image {}x{}x{} ({} levels, {} layers, format {}) is over the memory "
+                        "budget; allocating it anyway",
+                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                        ci.arrayLayers, static_cast<u32>(ci.format));
+        }
+        VmaAllocationCreateInfo relaxed = alloc_ci;
+        relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+    }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
+        // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
+        // 68 layers, ~23 GB): on the console only resident tiles have memory. Create a sparse
+        // resident image with nothing bound, so views and copies still work; reads of it return
+        // zero and writes are dropped, instead of aborting.
+        VkImageCreateInfo sparse_ci = ci;
+        sparse_ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+        VkImage sparse{};
+        if (device.GetDispatchLoader().vkCreateImage(*device.GetLogical(), &sparse_ci, nullptr,
+                                                     &sparse) == VK_SUCCESS) {
+            LOG_WARNING(Render_Vulkan,
+                        "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
+                        "unbacked sparse image",
+                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                        ci.arrayLayers, static_cast<u32>(ci.format));
+            return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
+                             device.GetDispatchLoader());
+        }
+    }
+    if (result != VK_SUCCESS) {
+        LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",
+                     ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                     ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));
+    }
+    vk::Check(result);
 
     // Log GPU memory allocation for images
     if (GPU::Logging::IsActive() &&
@@ -408,6 +457,31 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
     vk::Check(res);
     vk::Check(vmaBindBufferMemory2(allocator, a, 0, raw, nullptr));
     return MemoryCommit(allocator, a, info);
+}
+
+void LogMemoryStatistics(const Device& device) {
+    const VmaAllocator allocator = device.GetAllocator();
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(allocator, &stats);
+    for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
+        const VmaStatistics& s = stats.memoryType[type].statistics;
+        if (s.blockCount == 0) {
+            continue;
+        }
+        LOG_INFO(Render_Vulkan, "VMA type {} (heap {}, flags {:#x}): {} blocks {} MiB, {} allocations {} MiB",
+                 type, properties->memoryTypes[type].heapIndex,
+                 static_cast<u32>(properties->memoryTypes[type].propertyFlags), s.blockCount,
+                 s.blockBytes >> 20, s.allocationCount, s.allocationBytes >> 20);
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+        LOG_INFO(Render_Vulkan, "VMA heap {}: usage {} MiB of budget {} MiB, VMA blocks {} MiB",
+                 heap, budgets[heap].usage >> 20, budgets[heap].budget >> 20,
+                 budgets[heap].statistics.blockBytes >> 20);
+    }
 }
 
 } // namespace Vulkan

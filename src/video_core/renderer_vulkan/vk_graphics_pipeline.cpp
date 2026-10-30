@@ -4,20 +4,24 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "shader_recompiler/frontend/ampere/program_capture.h"
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
-#include <set>
 #include <span>
-#include <tuple>
+#include <filesystem>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/gpu_write_watch.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -27,12 +31,16 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_notify.h"
+#include "video_core/native_vprs.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "video_core/nx2_profile.h"
 
-#if defined(_MSC_VER) && defined(NDEBUG)
+#if defined(__clang__) && defined(NDEBUG)
+#define LAMBDA_FORCEINLINE __attribute__((always_inline))
+#elif defined(_MSC_VER) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE [[msvc::forceinline]]
 #else
 #define LAMBDA_FORCEINLINE
@@ -352,12 +360,45 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+    if (std::any_of(stage_infos.begin(), stage_infos.end(), [](const auto& info) {
+            return info.stores[Shader::IR::Attribute::VprsTableIndex];
+        })) {
+        if (!maxwell3d->GetNativeMacroEngine().native_turing)
+            throw Shader::RuntimeError("VPRS table-index output requires native graphics state");
+        std::array<u32, 16> controls{}, rates_a{}, rates_b{};
+        for (u32 table = 0; table < controls.size(); ++table) {
+            const u32 base = 0x2a00 / 4 + table * 4;
+            controls[table] = maxwell3d->regs.reg_array[base];
+            rates_a[table] = maxwell3d->regs.reg_array[base + 1];
+            rates_b[table] = maxwell3d->regs.reg_array[base + 2];
+        }
+        const auto state = Tegra::ClassifyNativeVprs(controls, rates_a, rates_b);
+        const auto& fragment = stage_infos.back();
+        const auto writable = [](const auto& descriptors) {
+            return std::any_of(descriptors.begin(), descriptors.end(), [](const auto& desc) { return desc.is_written; });
+        };
+        const bool writes = fragment.stores_global_memory || writable(fragment.storage_buffers_descriptors) ||
+                            writable(fragment.image_descriptors) || writable(fragment.image_buffer_descriptors);
+        if (!state.AllowsFullRate(writes))
+            throw Shader::RuntimeError("Native VPRS full-rate fallback is unsafe: enabled={:#x}, coarse={:#x}, unsupported={:#x}, fragment_writes={}",
+                                       state.enabled, state.coarse, state.unsupported, writes);
+        static thread_local u32 traces{};
+        if (VideoCommon::NativeDrawDiagnosticsEnabled() && traces++ < 8)
+            LOG_INFO(Render_Vulkan, "Native VPRS uses full pixel rate: enabled_tables={:#x}, coarse_tables={:#x}, select={:#x}",
+                     state.enabled, state.coarse, maxwell3d->regs.reg_array[0x2cc / 4]);
+    }
+
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
+    boost::container::small_vector<size_t, 64> excluded_views;
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
-    texture_cache.SynchronizeDescriptors(false);
+    namespace Profile = VideoCommon::Nx2Profile;
+    {
+        Profile::Scope scope{Profile::Zone::SyncDescriptors};
+        texture_cache.SynchronizeDescriptors(false);
+    }
 
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
 
@@ -378,6 +419,42 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
             ASSERT(cbufs[desc.cbuf_index].enabled);
+            if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
+                if (desc.buffer_source.enabled) {
+                    const auto& source = desc.buffer_source;
+                    const GPUVAddr root = cbufs[desc.cbuf_index].address + desc.cbuf_offset;
+                    const GPUVAddr base = gpu_memory->Read<u64>(root);
+                    if (gpu_memory->Read<u64>(root + 8) != source.size || !base ||
+                        base + source.size < base || !gpu_memory->IsFullyMappedRange(base, source.size))
+                        throw Shader::RuntimeError("Buffer-backed texture array changed or is unmapped");
+                    if (index == 0) {
+                        GPUVAddr expected = base;
+                        for (const auto& [range_address, range_size] : gpu_memory->GetSubmappedRange(base, source.size)) {
+                            const auto device_address = gpu_memory->GpuToCpuAddress(range_address);
+                            if (range_address != expected || !range_size || !device_address)
+                                throw Shader::RuntimeError("Unmapped texture-handle buffer segment");
+                            buffer_cache.DownloadMemory(*device_address, range_size);
+                            expected += range_size;
+                        }
+                        if (expected != base + source.size)
+                            throw Shader::RuntimeError("Incomplete texture-handle buffer mapping");
+                        if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
+                            std::vector<u8> bytes(source.size);
+                            gpu_memory->ReadBlock(base, bytes.data(), bytes.size());
+                            std::ofstream dump(fmt::format("native-buffer-textures-{}-{}-{:x}-{:x}.bin", stage,
+                                desc.cbuf_index, desc.cbuf_offset, source.offset), std::ios::binary);
+                            dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                        }
+                    }
+                    const u64 offset = source.offset + u64{index} * source.stride;
+                    if (offset + sizeof(u32) > source.size)
+                        throw Shader::RuntimeError("Texture-handle record outside buffer");
+                    const auto pair = TexturePair(gpu_memory->Read<u32>(base + offset), via_header_index);
+                    if (pair.first > regs.tex_header.limit || pair.second > regs.tex_sampler.limit)
+                        throw Shader::RuntimeError("Buffer-backed texture handle outside descriptor tables");
+                    return pair;
+                }
+            }
             const u32 index_offset{index << desc.size_shift};
             const u32 offset{desc.cbuf_offset + index_offset};
             const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
@@ -420,23 +497,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
-                views.push_back({handle.first});
-                static const bool handle_trace = std::getenv("EDEN_NATIVE_HANDLE_TRACE") != nullptr;
-                if (handle_trace) {
-                    static std::set<std::tuple<size_t, u32, u32, u32>> seen;
-                    const GPUVAddr tic_address = regs.tex_header.Address() + u64{handle.first} * sizeof(Tegra::Texture::TICEntry);
-                    Tegra::Texture::TICEntry entry{};
-                    gpu_memory->ReadBlockUnsafe(tic_address, &entry, sizeof(entry));
-                    if (seen.size() < 600 && seen.emplace(stage, desc.cbuf_index, desc.cbuf_offset, handle.first).second) {
-                        std::array<u32, 8> tsc{};
-                        gpu_memory->ReadBlockUnsafe(regs.tex_sampler.Address() + u64{handle.second} * 32, tsc.data(), sizeof(tsc));
-                        const auto& program = regs.pipelines[stage + 1]; // slot 0 is VertexA
-                        LOG_INFO(Render_Vulkan, "Native texture handle: stage={}, program={:#x}, cbuf={}:{:#x}, tic={}, tsc={}, texture={:#x} {}x{}, tsc_raw={:08x}",
-                                 stage, (u64{program.reserved[0] & 0xff} << 32) | program.reserved[1],
-                                 desc.cbuf_index, desc.cbuf_offset, handle.first, handle.second,
-                                 entry.Address(), entry.Width(), entry.Height(), fmt::join(tsc, ","));
+                if (desc.buffer_source.enabled) {
+                    const auto& source = desc.buffer_source;
+                    const GPUVAddr base = gpu_memory->Read<u64>(cbufs[desc.cbuf_index].address + desc.cbuf_offset);
+                    for (const auto& exclusion : source.exclusions) {
+                        if (!exclusion.mask) continue;
+                        if (exclusion.offset > source.stride || source.stride - exclusion.offset < sizeof(u32))
+                            throw Shader::RuntimeError("Invalid buffer texture exclusion field");
+                        const u32 word = gpu_memory->Read<u32>(base + u64{index} * source.stride + exclusion.offset);
+                        if (exclusion.Matches(word)) {
+                            excluded_views.push_back(views.size());
+                            break;
+                        }
                     }
                 }
+                views.push_back({handle.first});
 
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
                 samplers.push_back(sampler);
@@ -450,24 +525,216 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
         return true;
     }};
-    if constexpr (Spec::enabled_stages[0]) {
-        config_stage(0);
-    }
-    if constexpr (Spec::enabled_stages[1]) {
-        config_stage(1);
-    }
-    if constexpr (Spec::enabled_stages[2]) {
-        config_stage(2);
-    }
-    if constexpr (Spec::enabled_stages[3]) {
-        config_stage(3);
-    }
-    if constexpr (Spec::enabled_stages[4]) {
-        config_stage(4);
+    {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        if constexpr (Spec::enabled_stages[0]) {
+            config_stage(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            config_stage(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            config_stage(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            config_stage(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            config_stage(4);
+        }
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
     texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);
+    // These slots cannot reach this operation under the shader's own branch
+    // conditions. Preserve array indexing and use a correctly typed null view.
+    for (const size_t index : excluded_views) views[index].id = VideoCommon::NULL_IMAGE_VIEW_ID;
+    // EDEN_DRAW_TEXTURE_LOG=1: creating draw-textures.request logs the next 20000 draws once, with
+    // each sampled view's format, type, size, layers, address and how much of its first page is
+    // non-zero in guest memory (meaningful for textures the CPU or DMA filled).
+    static const bool texture_log = std::getenv("EDEN_DRAW_TEXTURE_LOG") != nullptr;
+    static u32 texture_log_remaining{};
+    if (texture_log) {
+        std::error_code error;
+        if (!texture_log_remaining && std::filesystem::remove("draw-textures.request", error))
+            texture_log_remaining = 20000;
+        if (texture_log_remaining) {
+            --texture_log_remaining;
+            const auto& draw = maxwell3d->draw_manager.draw_state;
+            std::string line = fmt::format("Draw textures: vs={:016x} fs={:016x} rt0={:#x} idx={} n={} inst={} topo={} views={}",
+                                           key.unique_hashes[1], key.unique_hashes[5],
+                                           static_cast<u32>(regs.rt[0].format), is_indexed,
+                                           is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count,
+                                           draw.instance_count, static_cast<u32>(draw.topology), views.size());
+            for (size_t i = 0; i < views.size(); ++i) {
+                if (!views[i].id || views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                    line += fmt::format(" [{}:{} null]", i, views[i].index);
+                    continue;
+                }
+                const auto& view = texture_cache.GetImageView(views[i].id);
+                u32 nonzero{};
+                if (view.gpu_addr && gpu_memory->IsFullyMappedRange(view.gpu_addr, 4096)) {
+                    std::array<u8, 4096> page{};
+                    gpu_memory->ReadBlockUnsafe(view.gpu_addr, page.data(), page.size());
+                    nonzero = static_cast<u32>(std::count_if(page.begin(), page.end(), [](u8 b) { return b != 0; }));
+                }
+                line += fmt::format(" [{}:{} f{} t{} {}x{}x{} L{} @{:x} nz{}]", i, views[i].index,
+                                    static_cast<u32>(view.format), static_cast<u32>(view.type),
+                                    view.size.width, view.size.height, view.size.depth,
+                                    view.range.extent.layers, view.gpu_addr, nonzero);
+            }
+            // Vertex shader inputs: generic attributes it reads, and its storage buffers (cbuf slot,
+            // pointer value and how much of the pointed-to page is non-zero after a download).
+            {
+                const Shader::Info& vs_info{stage_infos[0]};
+                u32 generics{};
+                for (u32 index = 0; index < 32; ++index) generics |= (vs_info.loads.Generic(index) ? 1U : 0U) << index;
+                line += fmt::format(" vsgen={:#x} vsssbo={}", generics, vs_info.storage_buffers_descriptors.size());
+                const auto& vs_cbufs = maxwell3d->state.shader_stages[0].const_buffers;
+                for (const auto& desc : vs_info.storage_buffers_descriptors) {
+                    const GPUVAddr slot = vs_cbufs[desc.cbuf_index].address + desc.cbuf_offset;
+                    const GPUVAddr pointer = gpu_memory->Read<u64>(slot);
+                    u32 nonzero{};
+                    if (pointer && gpu_memory->IsFullyMappedRange(pointer, 4096)) {
+                        if (const auto device_address = gpu_memory->GpuToCpuAddress(pointer))
+                            buffer_cache.DownloadMemory(*device_address, 4096);
+                        std::array<u8, 4096> page{};
+                        gpu_memory->ReadBlockUnsafe(pointer, page.data(), page.size());
+                        nonzero = static_cast<u32>(std::count_if(page.begin(), page.end(), [](u8 b) { return b != 0; }));
+                    }
+                    line += fmt::format(" ss c{}[{:#x}]={:x}{} nz{}", desc.cbuf_index, desc.cbuf_offset, pointer,
+                                        desc.is_written ? "w" : "", nonzero);
+                }
+            }
+            // Pointer tables (c0[0x110] of the vertex stage): entries pointing into the mesh pools.
+            {
+                const auto& vs_cbufs = maxwell3d->state.shader_stages[0].const_buffers;
+                if (vs_cbufs[0].enabled && vs_cbufs[0].size > 0x118) {
+                    const GPUVAddr table = gpu_memory->Read<u64>(vs_cbufs[0].address + 0x110);
+                    if (table && gpu_memory->IsFullyMappedRange(table, 64 * 8)) {
+                        std::array<u64, 64> entries{};
+                        gpu_memory->ReadBlockUnsafe(table, entries.data(), sizeof(entries));
+                        u32 pool_entries{};
+                        u64 first_pool{};
+                        for (const u64 entry : entries) {
+                            if (entry >= 0x29f0000000ULL && entry < 0x2a00000000ULL) {
+                                if (!pool_entries++) first_pool = entry;
+                            }
+                        }
+                        line += fmt::format(" ptab={:x} poolptrs={} first={:x}", table, pool_entries, first_pool);
+                    }
+                }
+            }
+            // Vertex inputs: attribute layout and how much of each stream's first page holds data
+            // (GPU-written streams are downloaded first, so this reflects their real contents).
+            u32 used_streams{};
+            for (u32 attribute = 0; attribute < regs.vertex_attrib_format.size(); ++attribute) {
+                const auto& format = regs.vertex_attrib_format[attribute];
+                if (!format.hex || format.constant) continue;
+                used_streams |= 1U << format.buffer;
+                line += fmt::format(" a{}:{}+{} s{:#x} t{}", attribute, format.buffer.Value(),
+                                    format.offset.Value(), static_cast<u32>(format.size.Value()),
+                                    static_cast<u32>(format.type.Value()));
+            }
+            for (u32 stream = 0; stream < 32; ++stream) {
+                if (!(used_streams & (1U << stream)) || stream >= regs.vertex_streams.size()) continue;
+                const auto& config = regs.vertex_streams[stream];
+                u32 nonzero{};
+                bool image_modified{};
+                const GPUVAddr address = config.Address();
+                if (address && gpu_memory->IsFullyMappedRange(address, 4096)) {
+                    if (const auto device_address = gpu_memory->GpuToCpuAddress(address)) {
+                        buffer_cache.DownloadMemory(*device_address, 4096);
+                        // Data written as an image lives in the texture cache, not in guest memory.
+                        image_modified = texture_cache.IsRegionGpuModified(*device_address, 4096);
+                    }
+                    std::array<u8, 4096> page{};
+                    gpu_memory->ReadBlockUnsafe(address, page.data(), page.size());
+                    nonzero = static_cast<u32>(std::count_if(page.begin(), page.end(), [](u8 b) { return b != 0; }));
+                }
+                u32 backing{9};
+                if (address) {
+                    if (const auto device_address = gpu_memory->GpuToCpuAddress(address)) {
+                        backing = gpu_memory->GetDeviceMemory().ProbeBacking(*device_address);
+                        if (nonzero == 0) VideoCommon::WatchDeviceRange(*device_address, 4096);
+                    }
+                }
+                // Data at the first vertex this draw actually uses (base vertex / first vertex).
+                u32 used_nonzero{};
+                const u64 first_vertex = is_indexed ? draw.base_index : draw.vertex_buffer.first;
+                const GPUVAddr used_address = address + first_vertex * config.stride.Value();
+                if (address && first_vertex && gpu_memory->IsFullyMappedRange(used_address, 256)) {
+                    std::array<u8, 256> used{};
+                    gpu_memory->ReadBlockUnsafe(used_address, used.data(), used.size());
+                    used_nonzero = static_cast<u32>(std::count_if(used.begin(), used.end(), [](u8 b) { return b != 0; }));
+                }
+                line += fmt::format(" vs{}:@{:x} st{} nz{} bk{}{} base{} unz{}", stream, address, config.stride.Value(),
+                                    nonzero, backing, image_modified ? " IMG" : "", first_vertex, used_nonzero);
+            }
+            LOG_INFO(Render_Vulkan, "{}", line);
+        }
+    }
+    if (texture_cache.CaptureNativeGpuTexture(std::span(views.data(), views.size()))) {
+        std::ofstream capture("native-gpu-texture-shaders.txt");
+        std::ofstream cbuf_layout("native-gpu-texture-cbuf-layout.txt");
+        for (size_t stage = 0; stage < key.unique_hashes.size(); ++stage)
+            capture << stage << ' ' << std::hex << key.unique_hashes[stage] << '\n';
+        VideoCommon::NativeTextureCapture::Write("native-gpu-texture-registers.bin", &regs, sizeof(regs));
+        const auto& draw = maxwell3d->draw_manager.draw_state;
+        capture << "draw " << std::dec << draw.vertex_buffer.first << ' ' << draw.vertex_buffer.count
+                << ' ' << draw.base_index << ' ' << draw.index_buffer.first << ' ' << draw.index_buffer.count << '\n';
+        for (u32 stream = 0; stream < 4; ++stream) {
+            const auto& config = regs.vertex_streams[stream];
+            if (!config.IsEnabled()) continue;
+            const GPUVAddr address = config.Address();
+            capture << "vertex " << stream << ' ' << std::hex << address << '\n';
+            if (!gpu_memory->IsFullyMappedRange(address, 1024)) continue;
+            std::array<u8, 1024> data{};
+            gpu_memory->ReadBlock(address, data.data(), data.size());
+            VideoCommon::NativeTextureCapture::Write("native-gpu-texture-vertex-" + std::to_string(stream) + ".bin", data.data(), data.size());
+        }
+        for (u32 stage : {1U, 5U}) {
+            const auto& config = regs.pipelines[stage];
+            const GPUVAddr address = (u64{config.reserved[0] & 0xff} << 32) | config.reserved[1];
+            if (!gpu_memory->IsFullyMappedRange(address, 128)) continue;
+            capture << "program " << stage << ' ' << std::hex << address << '\n';
+            std::vector<u8> source(128);
+            gpu_memory->ReadBlock(address, source.data(), source.size());
+            Shader::Ampere::ProgramCaptureState state;
+            for (u32 index = 0; index < 4096; ++index) {
+                Shader::Ampere::Instruction instruction;
+                const GPUVAddr pc = address + 128 + index * sizeof(instruction);
+                if (!gpu_memory->IsFullyMappedRange(pc, sizeof(instruction))) break;
+                gpu_memory->ReadBlock(pc, &instruction, sizeof(instruction));
+                const auto* bytes = reinterpret_cast<const u8*>(&instruction);
+                source.insert(source.end(), bytes, bytes + sizeof(instruction));
+                const auto status = state.Observe(instruction, index);
+                if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) break;
+                if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) {
+                    VideoCommon::NativeTextureCapture::Write("native-gpu-texture-shader-" + std::to_string(stage) + ".bin", source.data(), source.size());
+                    break;
+                }
+            }
+            const auto& constants = maxwell3d->state.shader_stages[stage == 1 ? 0 : 4].const_buffers;
+            for (u32 bank = 0; bank < constants.size(); ++bank) {
+                if (Tegra::NativeRootTables::IsBank(bank)) {
+                    const auto& words = maxwell3d->native_root_tables.Data(bank);
+                    cbuf_layout << stage << ' ' << bank << " 1 root 100\n";
+                    VideoCommon::NativeTextureCapture::Write("native-gpu-texture-cbuf-" + std::to_string(stage) + "-" + std::to_string(bank) + ".bin", words.data(), sizeof(words));
+                    continue;
+                }
+                const auto& buffer = constants[bank];
+                cbuf_layout << stage << ' ' << bank << ' ' << buffer.enabled << ' '
+                            << std::hex << buffer.address << ' ' << buffer.size << std::dec << '\n';
+                const size_t capture_size = std::min<size_t>(buffer.size, 65536);
+                if (!buffer.enabled || !capture_size ||
+                    !gpu_memory->IsFullyMappedRange(buffer.address, capture_size)) continue;
+                std::vector<u8> data(capture_size);
+                gpu_memory->ReadBlock(buffer.address, data.data(), data.size());
+                VideoCommon::NativeTextureCapture::Write("native-gpu-texture-cbuf-" + std::to_string(stage) + "-" + std::to_string(bank) + ".bin", data.data(), data.size());
+            }
+        }
+    }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
     const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
@@ -511,30 +778,39 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
         }
     }};
-    if constexpr (Spec::enabled_stages[0]) {
-        bind_stage_info(0);
-    }
-    if constexpr (Spec::enabled_stages[1]) {
-        bind_stage_info(1);
-    }
-    if constexpr (Spec::enabled_stages[2]) {
-        bind_stage_info(2);
-    }
-    if constexpr (Spec::enabled_stages[3]) {
-        bind_stage_info(3);
-    }
-    if constexpr (Spec::enabled_stages[4]) {
-        bind_stage_info(4);
+    {
+        Profile::Scope scope{Profile::Zone::TextureBuffers};
+        if constexpr (Spec::enabled_stages[0]) {
+            bind_stage_info(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            bind_stage_info(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            bind_stage_info(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            bind_stage_info(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            bind_stage_info(4);
+        }
     }
 
     if (regs.transform_feedback_enabled != 0) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
 
-    buffer_cache.UpdateGraphicsBuffers(is_indexed);
-    buffer_cache.BindHostGeometryBuffers(is_indexed);
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        buffer_cache.BindHostGeometryBuffers(is_indexed);
+    }
 
-    guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    {
+        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
 
     RescalingPushConstant rescaling;
     RenderAreaPushConstant render_area;
@@ -542,13 +818,81 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         buffer_cache.BindHostStageBuffers(stage);
-        PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
-                             samplers_it, views_it);
+        const auto* stage_views = views_it;
+        try {
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
+                                 samplers_it, views_it);
+        } catch (const Shader::Exception&) {
+            static u32 diagnostic_count{};
+            if (diagnostic_count++ < 8) {
+                if (std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND")) {
+                    const auto& config = regs.pipelines[stage == 4 ? 5 : 1];
+                    const GPUVAddr address = (GPUVAddr{config.reserved[0] & 0xff} << 32) | config.reserved[1];
+                    size_t length{};
+                    while (length < 0x20000 && gpu_memory->IsFullyMappedRange(address + length, 0x1000))
+                        length += 0x1000;
+                    std::vector<u8> bytes(length);
+                    gpu_memory->ReadBlock(address, bytes.data(), bytes.size());
+                    std::ofstream shader(fmt::format("native-binding-error-shader-{}-{:x}.bin", stage, address), std::ios::binary);
+                    shader.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                    for (u32 bank = 0; bank < 18; ++bank) {
+                        const auto& cb = maxwell3d->state.shader_stages[stage].const_buffers[bank];
+                        if (!cb.enabled || !cb.size || cb.size > 65536 ||
+                            !gpu_memory->IsFullyMappedRange(cb.address, cb.size)) continue;
+                        bytes.resize(cb.size);
+                        gpu_memory->ReadBlock(cb.address, bytes.data(), bytes.size());
+                        std::ofstream file(fmt::format("native-binding-error-cbuf-{}-{}.bin", stage, bank), std::ios::binary);
+                        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                    }
+                }
+                const auto& info = stage_infos[stage];
+                const auto* texture_views = stage_views +
+                    Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                    Shader::NumDescriptors(info.image_buffer_descriptors);
+                for (const auto& desc : info.texture_descriptors) {
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        const auto& view = *texture_views++;
+                        if (!desc.buffer_source.enabled || view.id == VideoCommon::NULL_IMAGE_VIEW_ID)
+                            continue;
+                        auto& cached = texture_cache.GetImageView(view.id);
+                        if (!VideoCore::Surface::IsPixelFormatInteger(cached.format) &&
+                            cached.Handle(desc.type) != VK_NULL_HANDLE)
+                            continue;
+                        const auto tic_address = regs.tex_header.Address() +
+                            u64{view.index} * sizeof(Tegra::Texture::TICEntry);
+                        Tegra::Texture::TICEntry tic{};
+                        gpu_memory->ReadBlock(tic_address, &tic, sizeof(tic));
+                        const auto& cbuf = maxwell3d->state.shader_stages[stage].const_buffers[desc.cbuf_index];
+                        const auto base = gpu_memory->Read<u64>(cbuf.address + desc.cbuf_offset);
+                        const auto size = gpu_memory->Read<u64>(cbuf.address + desc.cbuf_offset + 8);
+                        LOG_ERROR(Render_Vulkan,
+                            "Texture binding evidence: stage {} entry {} TIC {} at {:#x} raw {:016x} {:016x} {:016x} {:016x}; cached type {} format {}; CB{}+{:#x} base {:#x} size {:#x} stride {:#x} field {:#x}",
+                            stage, index, view.index, tic_address, tic.raw[0], tic.raw[1], tic.raw[2], tic.raw[3],
+                            static_cast<u32>(cached.type), static_cast<u32>(cached.format),
+                            desc.cbuf_index, desc.cbuf_offset, base, size,
+                            desc.buffer_source.stride, desc.buffer_source.offset);
+                        if (size == desc.buffer_source.size && size <= 16 * 1024 * 1024 &&
+                            base && base + size >= base && gpu_memory->IsFullyMappedRange(base, size)) {
+                            std::vector<u8> bytes(size);
+                            gpu_memory->ReadBlock(base, bytes.data(), bytes.size());
+                            std::ofstream dump(fmt::format("native-binding-error-{}-{}-{:x}-{:x}-{:x}.bin",
+                                stage, desc.cbuf_index, desc.cbuf_offset, base, desc.buffer_source.offset),
+                                std::ios::binary);
+                            dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                        }
+                    }
+                }
+            }
+            throw;
+        }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
             render_area.uses_render_area = true;
-            render_area.words = {static_cast<float>(regs.surface_clip.width),
-                                 static_cast<float>(regs.surface_clip.height)};
+            // Switch 2 titles may never program the surface clip; use colour target 0 then.
+            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                                 static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
         }
     }};
     if constexpr (Spec::enabled_stages[0]) {
@@ -570,12 +914,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
-    texture_cache.UpdateRenderTargets(false);
-    texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
-                                                                                 views.size()});
+    {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        texture_cache.UpdateRenderTargets(false);
+        texture_cache.CheckFeedbackLoop(
+            std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
+    }
     if (IsBuilt() && !pipeline) {
         return false;
     }
+    Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
 }
 

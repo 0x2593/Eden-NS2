@@ -10,6 +10,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/devices/nvhost_gpu.h"
+#include "core/hle/service/nvdrv/devices/native_gpu_context.h"
 #include "core/hle/service/nvdrv/devices/nvhost_tsg_gpu.h"
 
 namespace Service::Nvidia::Devices {
@@ -44,27 +45,25 @@ NvResult nvhost_tsg_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> 
     LOG_DEBUG(Service_NVDRV, "native TSG ioctl={:#x}, input={}, output={}, words={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
               command.raw, input.size(), output.size(), words[0], words[1], words[2], words[3],
               words[4], words[5], words[6], words[7]);
-    if (command.group != 'T' || command.cmd < 1 || command.cmd > 0xb) { return NvResult::NotImplemented; }
-    if (command.cmd >= 3 && command.cmd <= 0xa) {
-        // Enable/disable/preempt and scheduling controls have no effect on the emulated GPU.
-        std::fill(output.begin(), output.end(), u8{0});
-        std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
+    // 0xc0045408 is NVGPU_TSG_IOCTL_SET_TIMESLICE (nr 8): one u32 microsecond value. The guest
+    // scheduler is not time-sliced, so the value is only recorded.
+    if (command.raw == 0xc0045408) {
+        if (input.size() != 4 || output.size() != 4 || words[0] == 0) { return NvResult::BadParameter; }
+        timeslice_us = words[0];
+        std::copy(input.begin(), input.end(), output.begin());
         return NvResult::Success;
     }
-    const bool bind_ex = command.cmd == 0xb;
-    if (!process || (bind_ex ? input.size() < 8 : input.size() != 4) ||
-        output.size() > input.size()) {
-        return NvResult::BadParameter;
-    }
-    const DeviceFD channel_fd = static_cast<s32>(words[0]);
-    // BIND_CHANNEL_EX carries a subcontext (VEID) after the fd; all subcontexts share one context here.
-    if (command.cmd == 1 || bind_ex) {
+    if (command.raw != 0xc0045401 && command.raw != 0xc0045402 && command.raw != 0xc018540b) { return NvResult::NotImplemented; }
+    const auto binding = DecodeNativeTsgBinding(input, command.raw == 0xc018540b);
+    if (!process || !binding || output.size() != input.size()) { return NvResult::BadParameter; }
+    const DeviceFD channel_fd = binding->channel_fd;
+    if (command.cmd == 1 || command.cmd == 0xb) {
         if (channels.contains(channel_fd)) { return NvResult::Busy; }
         if (channels.size() >= 64) { return NvResult::InsufficientMemory; }
         const auto device = module.GetDevice<nvdevice>(channel_fd);
         if (!device || device->GetType() != Type::GpuChannel) { return NvResult::BadParameter; }
         const auto channel = std::static_pointer_cast<nvhost_gpu>(device);
-        const auto result = channel->BindToTsg(fd, process, native_macros);
+        const auto result = channel->BindToTsg(fd, process, native_macros, binding->subcontext_id);
         if (result != NvResult::Success) { return result; }
         channels.emplace(channel_fd, channel);
     } else {
@@ -73,7 +72,7 @@ NvResult nvhost_tsg_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> 
         it->second->UnbindFromTsg(fd);
         channels.erase(it);
     }
-    std::copy_n(input.begin(), output.size(), output.begin());
+    std::copy(input.begin(), input.end(), output.begin());
     return NvResult::Success;
 }
 

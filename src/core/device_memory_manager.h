@@ -59,6 +59,11 @@ public:
 
     void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
 
+    /// Diagnostic: backing state of a device page. 0 = backed and current, 1 = never backed,
+    /// 2 = unbacked although its CPU page is backed now, 3 = backed by a page the CPU address no
+    /// longer maps to.
+    u32 ProbeBacking(DAddr address);
+
     void Unmap(DAddr address, size_t size);
 
     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
@@ -132,6 +137,27 @@ private:
         u8* host_ptr{};
     };
 
+    /// A thread's last four page translations of one manager. Several threads read through
+    /// them (the GPU thread, the fencing thread, service threads): one cache shared by all was
+    /// cleared by Map on a service thread between the GPU thread's null check of an entry and
+    /// its use, and the GPU thread copied from address 0 (title 1 crashed every few minutes).
+    struct TranslationCache {
+        const void* owner{};
+        u64 generation{};
+        std::array<TranslationEntry, 4> slots{};
+        u32 cursor{};
+    };
+    static inline thread_local TranslationCache t_cache{};
+
+    /// This thread's translations, emptied when Map or Unmap ran since they were made.
+    TranslationCache& Translations() {
+        const u64 current = translation_generation.load(std::memory_order_acquire);
+        if (t_cache.owner != this || t_cache.generation != current) {
+            t_cache = TranslationCache{.owner = this, .generation = current};
+        }
+        return t_cache;
+    }
+
     // Internal helper that performs the update assuming the caller already holds the necessary lock.
     void UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta);
 
@@ -139,7 +165,7 @@ private:
     static constexpr size_t device_virtual_bits = Traits::device_virtual_bits;
     static constexpr size_t device_as_size = 1ULL << device_virtual_bits;
     static constexpr size_t physical_min_bits = 32;
-    static constexpr size_t physical_max_bits = 33;
+    static constexpr size_t physical_max_bits = 35; // covers the 12 GiB layout plus nx2 graphics server memory
     static constexpr size_t page_bits = 12;
     static constexpr size_t page_size = 1ULL << page_bits;
     static constexpr size_t page_mask = page_size - 1ULL;
@@ -204,8 +230,7 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
-    std::array<TranslationEntry, 4> t_slot{};
-    u32 cache_cursor = 0;
+    std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;
     static constexpr size_t subentries = 8 / sizeof(CounterType);

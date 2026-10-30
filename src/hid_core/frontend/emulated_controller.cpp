@@ -1837,11 +1837,32 @@ static bool AutoPressA() {
     });
 }
 
+// EDEN_AUTO_HOLD_PLUS=<start>,<end>[;...]: holds + between the two times (seconds after launch), for
+// unattended runs that have to skip "hold + to skip" screens.
+static bool AutoHoldPlus() {
+    static const auto windows = [] {
+        std::vector<std::array<double, 2>> parsed;
+        for (const char* cursor = std::getenv("EDEN_AUTO_HOLD_PLUS"); cursor && *cursor;) {
+            std::array<double, 2> window{};
+            if (std::sscanf(cursor, "%lf,%lf", &window[0], &window[1]) == 2) parsed.push_back(window);
+            cursor = std::strchr(cursor, ';');
+            if (cursor) ++cursor;
+        }
+        return parsed;
+    }();
+    if (windows.empty()) return false;
+    const double now =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
+    return std::any_of(windows.begin(), windows.end(),
+                       [now](const auto& window) { return now >= window[0] && now <= window[1]; });
+}
+
 NpadButtonState EmulatedController::GetNpadButtons() const {
     if (is_configuring)
         return {};
     NpadButtonState state{controller.npad_button_state.raw & GetTurboButtonMask()};
     if (AutoPressA()) state.a.Assign(1);
+    if (AutoHoldPlus()) state.plus.Assign(1);
     return state;
 }
 

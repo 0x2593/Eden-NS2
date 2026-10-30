@@ -13,6 +13,7 @@ class System;
 }
 
 #include <span>
+#include <string>
 
 #include "common/common_types.h"
 #include "core/hle/kernel/svc_types.h"
@@ -532,6 +533,9 @@ void SvcWrap_SendSyncRequestLight64(Core::System& system, std::span<uint64_t, 8>
 // Defined in svc_secure_monitor_call.cpp.
 void SvcWrap_CallSecureMonitor64From32(Core::System& system, std::span<uint64_t, 8> args);
 void SvcWrap_CallSecureMonitor64(Core::System& system, std::span<uint64_t, 8> args);
+
+// Diagnostic (EDEN_DIAG_SVC=1): the SVC a guest thread is currently inside, for the thread dump.
+std::string DescribeDiagSvc(u64 thread_id);
 
 // Perform a supervisor call by index.
 void Call(Core::System& system, u32 imm);

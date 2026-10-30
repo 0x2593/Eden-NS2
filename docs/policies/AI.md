@@ -128,7 +128,7 @@ Assisted-by: <model> (<what it was used for>)
 For instance:
 
 ```txt
-Assisted-by: ExampleModel 1.0 (initial draft and code review)
+Assisted-by: Claude Opus 5.5 (initial draft and code review)
 ```
 
 Contributions without a commit message (e.g. issues/comments) should instead use a plain sentence in the text body such as `I used <model> to help with <X>`. PRs and commit messages may opt to use this format as well.

@@ -14,14 +14,16 @@ struct NativeImageRequirements {
     u64 alignment;
 };
 
-// Experimental inter-module block image layout, restricted to the observed
-// four-byte color format. Row pitch is in 64-byte GOBs; block height is in pixels.
+// Inter-module block image layout, restricted to the observed four-byte color formats. Row pitch is
+// in 64-byte GOBs; block height is in pixels. Matches the gsv sizers (commands 435 and 1510, run
+// against the real module): the size is one image's padded block storage times the request's
+// count word, the format word does not scale it, and the alignment is always one page.
 inline std::optional<NativeImageRequirements> CalculateNativeImageRequirements(
     std::span<const u32> preference, u32 count) {
-    if (preference.size() != 16 || count != 1 || preference[0] != 0 ||
-        (preference[1] != 1 && preference[1] != 2) || preference[3] != 0 || preference[6] == 0 ||
-        preference[6] > 64 || preference[7] == 0 || preference[7] > 64 || preference[4] < 3 ||
-        preference[4] > 8) {
+    if (preference.size() != 16 || count == 0 || preference[0] != 0 ||
+        (preference[1] != 1 && preference[1] != 2) || preference[3] != 0 ||
+        (preference[6] != 1 && preference[6] != 4) ||
+        preference[7] != 1 || preference[4] < 3 || preference[4] > 8) {
         return std::nullopt;
     }
     for (size_t i = 8; i < preference.size(); ++i) {
@@ -35,9 +37,11 @@ inline std::optional<NativeImageRequirements> CalculateNativeImageRequirements(
     }
     const u64 block_height = 1ULL << preference[4];
     const u64 aligned_height = (height + block_height - 1) & ~(block_height - 1);
-    // Words 6 and 7 are unconfirmed (layers or mip levels); scaling by both never under-allocates.
-    const u64 surfaces = u64{preference[6]} * preference[7];
-    return NativeImageRequirements{pitch_gobs * 64 * aligned_height * surfaces, 64 * block_height};
+    const u64 image_size = pitch_gobs * 64 * aligned_height;
+    if (image_size > (1ULL << 48) / count) {
+        return std::nullopt;
+    }
+    return NativeImageRequirements{image_size * count, 4096};
 }
 
 } // namespace Service::AM

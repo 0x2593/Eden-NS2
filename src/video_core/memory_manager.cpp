@@ -16,6 +16,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
+#include "core/hle/dlss_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -120,12 +121,27 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
     }
+    // Pages whose entry type changes are reported to the rasterizer in contiguous runs instead of one call
+    // per page (the cache invalidation behind each call is expensive for large sparse reservations).
+    GPUVAddr run_start{};
+    u64 run_size{};
+    const auto flush_run = [&] {
+        if (run_size != 0) {
+            rasterizer->ModifyGPUMemory(unique_identifier, run_start, run_size);
+            run_size = 0;
+        }
+    };
     for (u64 offset{}; offset < size; offset += page_size) {
         const GPUVAddr current_gpu_addr = gpu_addr + offset;
         [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, false);
         SetEntry(current_gpu_addr, entry_type, false);
         if (current_entry_type != entry_type) {
-            rasterizer->ModifyGPUMemory(unique_identifier, current_gpu_addr, page_size);
+            if (run_size == 0) {
+                run_start = current_gpu_addr;
+            }
+            run_size += page_size;
+        } else {
+            flush_run();
         }
         if (entry_type == EntryType::Mapped) {
             const DAddr current_dev_addr = dev_addr + offset;
@@ -135,6 +151,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         }
         remaining_size -= page_size;
     }
+    flush_run();
     kind_map.Map(gpu_addr, gpu_addr + size, kind);
     return gpu_addr;
 }
@@ -184,39 +201,7 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
     rasterizer = rasterizer_;
 }
 
-void MemoryManager::TrackNativeMapping(GPUVAddr gpu_addr, std::size_t size, bool mapped) {
-    // Recorded before native tiling is known to be enabled; only native titles query it.
-    if (size == 0) return;
-    const GPUVAddr end = gpu_addr + size;
-    std::scoped_lock lock{native_mapping_guard};
-    auto it = native_mappings.lower_bound(gpu_addr);
-    if (it != native_mappings.begin()) {
-        auto previous = std::prev(it);
-        if (previous->second > gpu_addr) {
-            // Keep the part of an overlapped mapping before and after the new range.
-            const GPUVAddr previous_end = previous->second;
-            previous->second = gpu_addr;
-            if (previous_end > end) native_mappings.emplace(end, previous_end);
-        }
-    }
-    for (it = native_mappings.lower_bound(gpu_addr); it != native_mappings.end() && it->first < end;) {
-        if (it->second > end) native_mappings.emplace(end, it->second);
-        it = native_mappings.erase(it);
-    }
-    if (mapped) native_mappings.emplace(gpu_addr, end);
-}
-
-std::optional<size_t> MemoryManager::GetNativeMappingSizeFrom(GPUVAddr gpu_addr) const {
-    std::scoped_lock lock{native_mapping_guard};
-    auto it = native_mappings.upper_bound(gpu_addr);
-    if (it == native_mappings.begin()) return std::nullopt;
-    --it;
-    if (gpu_addr >= it->second) return std::nullopt;
-    return static_cast<size_t>(it->second - gpu_addr);
-}
-
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
-    TrackNativeMapping(gpu_addr, size, true);
     if (is_big_pages)
         return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
     return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
@@ -232,13 +217,15 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
     if (size == 0) {
         return;
     }
-    TrackNativeMapping(gpu_addr, size, false);
-    GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
+    // Local scratch (not the shared member): Unmap runs on service threads while the GPU thread flushes
+    // the invalidation accumulator, and a shared small_vector corrupted under that overlap (host access
+    // violation in GetSubmappedRangeImpl during MKW's native compute).
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash_local;
+    GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash_local);
 
-    for (const auto& [map_addr, map_size] : page_stash) {
+    for (const auto& [map_addr, map_size] : page_stash_local) {
         rasterizer->UnmapMemory(map_addr, map_size);
     }
-    page_stash.clear();
 
     BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
     PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
@@ -275,7 +262,7 @@ template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
     if constexpr (sizeof(T) == sizeof(u32)) {
         const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
-        if (shim && addr >= shim && addr - shim < 192 * sizeof(u32) &&
+        if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
             Common::IsAligned(addr - shim, sizeof(u32))) {
             return static_cast<T>(system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
                 static_cast<u32>((addr - shim) / sizeof(u32))));
@@ -289,7 +276,10 @@ T MemoryManager::Read(GPUVAddr addr) const {
         return value;
     }
 
-    ASSERT(false);
+    static std::atomic<u32> reported{};
+    if (reported.fetch_add(1) < 16) {
+        LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, addr);
+    }
 
     return {};
 }
@@ -298,6 +288,7 @@ template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
+        Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::Write<T>", page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
@@ -441,6 +432,16 @@ void MemoryManager::ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::siz
 }
 
 void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, const std::size_t size) const {
+    // Small reads within one 4 KiB page (texture and sampler descriptors, several per draw): one
+    // translation and a copy, as Read<T> does, instead of the page walk (~3% of the GPU thread
+    // in title 1). Anything else, unmapped or sparse pages included, takes the full path.
+    constexpr std::size_t SmallPage = 0x1000;
+    if (size <= SmallPage && (gpu_src_addr & (SmallPage - 1)) + size <= SmallPage) {
+        if (const u8* const pointer = GetPointer(gpu_src_addr)) {
+            std::memcpy(dest_buffer, pointer, size);
+            return;
+        }
+    }
     ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
 }
 
@@ -454,6 +455,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
         u8* physical = memory.GetPointer<u8>(dev_addr_base);
+        Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::WriteBlock", physical, copy_amount);
         std::memcpy(physical, src_buffer, copy_amount);
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -466,7 +468,8 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
         } else {
             u8* physical = memory.GetPointer<u8>(dev_addr_base);
-            std::memcpy(physical, src_buffer, copy_amount);
+            Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::WriteBlock", physical, copy_amount);
+        std::memcpy(physical, src_buffer, copy_amount);
         }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -761,11 +764,11 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 
 void MemoryManager::FlushCaching() {
     // Flush from the invalidate accumulator
-    if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
-        GetSubmappedRangeImpl<false>(addr, size, page_stash2);
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash_local;
+    if (accumulator.InvalidateAll([this, &page_stash_local](GPUVAddr addr, size_t size) {
+        GetSubmappedRangeImpl<false>(addr, size, page_stash_local);
     })) {
-        rasterizer->InnerInvalidation(page_stash2);
-        page_stash2.clear();
+        rasterizer->InnerInvalidation(page_stash_local);
     }
 }
 

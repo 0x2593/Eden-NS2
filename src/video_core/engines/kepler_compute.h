@@ -7,9 +7,11 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <memory>
 #include <optional>
-#include <unordered_set>
+#include <span>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
@@ -24,6 +26,10 @@ namespace Core {
 class System;
 }
 
+namespace VideoCommon {
+class GpuSplit;
+}
+
 namespace Tegra {
 class MemoryManager;
 }
@@ -33,6 +39,9 @@ class RasterizerInterface;
 }
 
 namespace Tegra::Engines {
+
+/// Draws left to trace after an upscale fallback (debug aid).
+extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
 
 /**
  * This Engine is known as GK104_Compute. Documentation can be found in:
@@ -54,6 +63,8 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// The channel's MME data RAM, shared with its 3D engine.
+    void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) { native_data_ram = data_ram; }
     void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions, NativeMacroContext* context = nullptr) {
         if (native_context != context) native_compute_uploaded = false;
         native_context = context;
@@ -232,21 +243,46 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
 
+    /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
+    /// the front instead of CallMethod for native compute engines: runs their macros and macro
+    /// uploads against a copy of the registers and sends the register writes to the back.
+    bool FrontRunsMacros() const { return native_mode; }
+    void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                         u32 argument, bool is_last_call, const GPUVAddr* segment);
+    void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                              const u32* base_start, u32 amount, u32 methods_pending,
+                              const GPUVAddr* segment);
+
 private:
+    struct FrontState;
+    FrontState& Front(VideoCommon::GpuSplit& split);
+    void FrontApply(FrontState& state, u32 method, u32 argument);
+    MacroEngine& FrontMacroEngine(FrontState& state);
+    std::span<u32> FrontMacroPositions(FrontState& state);
+    void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    std::unique_ptr<FrontState> front;
+    bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
+
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+    void ProcessNativeReportSemaphore(u32 argument);
+    void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+    bool UpscaleInsteadOfNativeProgram();
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
-    std::unordered_set<GPUVAddr> failed_native_programs;
+    std::array<u32, 0xc00>* native_data_ram{};
+    bool native_mme_dumped{};
+    std::optional<u32> native_executing_macro_logged;
     bool native_mode{};
     NativeMacroContext* native_context{};
     bool native_compute_uploaded{};
     MacroEngine* native_macro{};
-    // Macro code is shared by the channel group, but the macro data RAM holds per-channel
-    // state (the SDK keeps each queue's QMD ring there), so every channel executes with its own.
-    TuringMacroInterpreter native_interpreter;
     std::array<u32, 0x1000> native_registers{};
+    /// Native methods that only store their value (no macro, QMD, upload, semaphore or code
+    /// side effect): CallMethod writes those directly.
+    std::bitset<0xe00> native_plain_methods;
     std::span<u32> native_macro_positions;
     std::vector<u32> native_parameters;
+    std::vector<u32> native_memo_parameters; ///< The current call's parameters, for the memo
     std::optional<u32> native_executing_macro;
     u32 native_bind_pointer{};
 

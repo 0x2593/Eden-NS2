@@ -36,6 +36,9 @@ struct OverlapResult {
 
 [[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept;
 
+/// True if no 16-byte ASTC block in `data` decodes to alpha below 1.
+[[nodiscard]] bool AstcDataLooksOpaque(std::span<const u8> data) noexcept;
+
 [[nodiscard]] u32 CalculateLayerStride(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateLayerSize(const ImageInfo& info) noexcept;
@@ -68,6 +71,9 @@ struct OverlapResult {
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output);
+
+/// Rewrites `copies` (from UnswizzleImage) to the layout ConvertImage produces, without converting.
+void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies);
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies);

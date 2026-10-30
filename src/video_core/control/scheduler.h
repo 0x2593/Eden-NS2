@@ -27,8 +27,6 @@ public:
 
     void ResumePending(GPU& gpu);
     [[nodiscard]] bool HasPendingNativeChannels() const { return !pending_native_channels.empty(); }
-    /// Logs each parked native channel's semaphore wait (diagnostics).
-    void ReportPending() const;
 
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
 

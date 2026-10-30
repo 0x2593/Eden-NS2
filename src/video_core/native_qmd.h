@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <cstdlib>
 #include <array>
 #include <cstdint>
 #include <string_view>
@@ -8,10 +9,6 @@
 #include <unordered_map>
 
 namespace Tegra {
-// First word of each release slot: {address low, address high | flags, payload}. The SDK's
-// cross-queue signals also patch a third slot at word 52.
-inline constexpr std::array<std::uint32_t, 3> NativeQmdReleaseSlots{24, 28, 52};
-
 
 // Native QMD 3.0 dependency scheduling; nonempty grids require a dispatch backend.
 class NativeQmdScheduler {
@@ -19,6 +16,19 @@ public:
     using Word = std::uint32_t;
     using Address = std::uint64_t;
     using Descriptor = std::array<Word, 64>;
+    static constexpr std::array<Word, 3> ReleaseWords{24, 28, 52};
+    struct DiagnosticState {
+        std::int32_t dependencies{};
+        std::int32_t deferred{};
+        Word flags{};
+    };
+    DiagnosticState Inspect(Address address) const {
+        const auto it = states.find(address);
+        if (it == states.end()) return {};
+        const auto& state = it->second;
+        return {state.dependencies, state.deferred,
+                Word(state.loaded) | Word(state.scheduled) << 1 | Word(state.completed) << 2};
+    }
     struct RejectShaderDispatch { bool operator()(const Descriptor&) const { return false; } };
     template <typename Read, typename Release>
     std::string_view Signal(Address address, Word argument, Read read, Release release) {
@@ -27,12 +37,15 @@ public:
     template <typename Read, typename Release, typename Dispatch>
     std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
         struct Pending { Address address; Word action; Word count; };
+        // Outside EDEN_NATIVE_STRICT, a dispatch the backend cannot run is skipped but still
+        // completes, so its semaphore releases and dependent QMDs do not leave the game waiting.
+        static const bool strict = std::getenv("EDEN_NATIVE_STRICT") != nullptr;
+        bool dispatch_skipped = false;
         std::array<Pending, 256> pending{};
         std::size_t count = 1;
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
-            if (states.size() >= 4096 && !states.contains(request.address)) return "QMD cache limit";
             auto& state = states[request.address];
             if (request.action == 3 || request.action == 2) {
                 if (request.action == 3 || !state.loaded) {
@@ -66,8 +79,8 @@ public:
             const auto qmd = state.descriptor;
             if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
             // Validate every release slot before making any visible.
-            for (const Word slot : NativeQmdReleaseSlots) {
-                const Word flags = qmd[slot + 1];
+            for (const Word base : ReleaseWords) {
+                const Word flags = qmd[base + 1];
                 if (!(flags & (1U << 23))) continue;
                 const bool add = (flags & (1U << 26)) != 0;
                 if ((flags & (0x3bU << 24)) || (flags >> 30) != 1 ||
@@ -78,22 +91,19 @@ public:
                 }
             }
             if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff) && !dispatch(qmd)) {
-                // Without a real dispatch backend, refuse the QMD entirely.
-                if constexpr (std::is_same_v<Dispatch, RejectShaderDispatch>)
-                    return "native shader dispatch required";
-                // A rejected shader skips only the work; its releases and dependent QMDs
-                // still run so that queues waiting on them make progress.
+                if (strict) return "native shader dispatch required";
+                dispatch_skipped = true;
             }
             state.completed = true;
-            for (const Word slot : NativeQmdReleaseSlots) {
-                const Word flags = qmd[slot + 1];
+            for (const Word base : ReleaseWords) {
+                const Word flags = qmd[base + 1];
                 if (!(flags & (1U << 23))) continue;
-                const Address destination = (Address{flags & 0xff} << 32) | qmd[slot];
+                const Address destination = (Address{flags & 0xff} << 32) | qmd[base];
                 bool released{};
                 if constexpr (std::is_invocable_r_v<bool, Release, Address, Word, Word>) {
-                    released = release(destination, qmd[slot + 2], flags);
+                    released = release(destination, qmd[base + 2], flags);
                 } else {
-                    released = release(destination, qmd[slot + 2]);
+                    released = release(destination, qmd[base + 2]);
                 }
                 if (!released) return "unmapped QMD release";
             }
@@ -105,7 +115,7 @@ public:
             }
             if (qmd[16] & (1U << 5)) return "second dependent QMD unsupported";
         }
-        return {};
+        return dispatch_skipped ? std::string_view{"native shader dispatch skipped"} : std::string_view{};
     }
 private:
     struct State {
@@ -118,5 +128,4 @@ private:
     };
     std::unordered_map<Address, State> states;
 };
-
 } // namespace Tegra

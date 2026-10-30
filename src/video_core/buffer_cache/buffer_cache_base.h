@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <functional>
@@ -21,6 +22,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include "common/spin_recursive_mutex.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
@@ -53,9 +55,9 @@ constexpr u32 NUM_VERTEX_BUFFERS = 16;
 constexpr u32 NUM_VERTEX_BUFFERS = 32;
 #endif
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
-constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
+constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 32;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
-// Native compute shaders bind up to 18 global memory ranges; the enable masks are 32 bits wide.
+// Native compute shaders bind more than 16 global memory ranges; the enable masks are 32 bits wide.
 constexpr u32 NUM_STORAGE_BUFFERS = 32;
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
@@ -88,6 +90,9 @@ struct Binding {
     BufferId buffer_id;
     u32 segment_first{};
     u32 segment_count{};
+    u32 segment_offset{};
+    u32 segment_size{};
+    bool segment_written{};
 };
 
 struct MultiRangeSegment {
@@ -229,6 +234,9 @@ public:
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
                                std::span<const MultiRangeSegment> pool);
 
+    void PrepareGroupedStorage(std::span<const std::pair<Binding*, bool>> bindings,
+                               std::vector<MultiRangeSegment>& pool);
+
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
 
@@ -241,6 +249,11 @@ public:
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
+
+    /// Makes a storage buffer pointer in guest memory current before it is read: GPU-driven
+    /// dispatches have their pointer arguments written by earlier GPU work, which only the
+    /// cached buffer holds until it is downloaded.
+    void SynchronizeStoragePointer(GPUVAddr pointer_address);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
@@ -340,7 +353,7 @@ public:
         } while (channel_state->has_deleted_buffers);
     }
 
-    std::recursive_mutex mutex;
+    Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
 
@@ -377,7 +390,7 @@ private:
                ((device_addr + size) & ~Core::DEVICE_PAGEMASK);
     }
 
-    void RunGarbageCollector();
+    void RunGarbageCollector(bool aggressive_gc);
 
     void BindHostIndexBuffer();
 
@@ -467,10 +480,13 @@ private:
 
     void DownloadBufferMemory(Buffer& buffer_id, DAddr device_addr, u64 size);
 
+    /// Downloads the GPU-written data of several buffers with one wait for the GPU.
+    void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
+
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written) const;
+                                               bool is_written, bool native_pointer) const;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
@@ -514,6 +530,24 @@ private:
 
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
+
+    /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
+    /// otherwise only when something flushes them (as upstream yuzu below High GPU accuracy).
+    /// Not for Switch 2 titles: title 1 had 250-330 MB/s copied back (a fence per compute
+    /// dispatch, the fencing thread holding the buffer cache while it wrote them), while its CPU
+    /// read GPU-written memory at most 64 times in 200 s (counted with reactive flushing) and
+    /// the native MME's DMA reads never touched those pages. Without them a fence costs ~1 us
+    /// instead of ~5 and draw setup ~7% less. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
+    bool AsyncBufferDownloads() const {
+        static const int forced = [] {
+            const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
+            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
+        }();
+        if (forced >= 0) {
+            return forced == 1;
+        }
+        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
+    }
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
@@ -538,6 +572,7 @@ private:
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
     u64 total_used_memory = 0;
+    u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
     u64 minimum_memory = 0;
     u64 critical_memory = 0;
     BufferId inline_buffer_id;
@@ -545,7 +580,8 @@ private:
     bool immediately_free = false;
 #endif
 
-    std::array<BufferId, ((1ULL << 34) >> CACHING_PAGEBITS)> page_table;
+    // Covers the device address space (MaxwellDeviceTraits::device_virtual_bits).
+    std::array<BufferId, ((1ULL << 36) >> CACHING_PAGEBITS)> page_table;
     Common::ScratchBuffer<u8> tmp_buffer;
 };
 

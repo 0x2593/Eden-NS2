@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -114,6 +115,9 @@ class RenderdocAPI;
 }
 
 namespace Core {
+
+/// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
+extern std::atomic<u64> g_nx2_present_count;
 
 class CpuManager;
 class Debugger;

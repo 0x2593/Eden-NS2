@@ -33,6 +33,7 @@ private:
     Kernel::KProcess* process{};
     DeviceFD group_fd{-1};
     std::map<DeviceFD, std::shared_ptr<nvhost_gpu>> channels;
+    u32 timeslice_us{};
 };
 
 } // namespace Service::Nvidia::Devices

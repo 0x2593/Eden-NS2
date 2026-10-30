@@ -24,6 +24,12 @@ inline std::optional<u32> NativeProgramAddress(std::span<const u64> code, u32 ad
     const size_t start = code.size() - static_cast<size_t>(count) - 2;
     const u64 target = code[start + address / 16];
     if (target < 0x50 || target >= start * 8 || target % 8 || target % 32 == 0) return {};
+    // A computed entry at this barrier would bypass its required outer SYNC.
+    if (address >= 16 && code[target / 8] == 0xef98000000070100ULL) {
+        const u64 previous = code[start + address / 16 - 1];
+        if (previous >= 0x50 && previous < start * 8 && previous % 8 == 0 &&
+            code[previous / 8] == 0xf0f800000007000fULL) return {};
+    }
     return static_cast<u32>(target);
 }
 } // namespace Shader::Ampere

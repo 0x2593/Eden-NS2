@@ -4,8 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <span>
 #include <vector>
@@ -212,6 +214,19 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     }
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+
+    // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
+    if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr; meter) {
+        for (size_t i = 0; i < num_frames * frame_size; ++i) {
+            level_peak = std::max<s32>(level_peak, std::abs(static_cast<s32>(output_buffer[i])));
+        }
+        level_frames += num_frames;
+        if (level_frames >= TargetSampleRate * 2) {
+            LOG_INFO(Audio, "Audio output peak over {} frames: {} of 32767", level_frames, level_peak);
+            level_frames = 0;
+            level_peak = 0;
+        }
+    }
 
     {
         std::scoped_lock lk{sample_count_lock};

@@ -23,6 +23,7 @@
 #include "core/perf_stats.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/native_query_trace.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -78,6 +79,10 @@ struct GPU::Impl {
             bound_channel = channel_id;
             current_channel = it->second.get();
             renderer->ReadRasterizer()->BindChannel(*current_channel);
+        }
+        if (current_channel->native_abi) {
+            VideoCommon::TraceNativeQuery(17, current_channel->memory_manager->GetID(),
+                                          0, 0, 0, channel_id, 0);
         }
     }
 
@@ -217,6 +222,13 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
+        // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
+        // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
+        if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
+            LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
+                     raster_area.start_address, raster_area.end_address,
+                     reads.load(std::memory_order_relaxed));
+        }
         const u64 fence = RequestSyncOperation([this, &raster_area]() {
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
@@ -405,6 +417,10 @@ u64 GPU::RequestFlush(DAddr addr, std::size_t size) {
     return impl->RequestSyncOperation([this, addr, size]() {
         impl->renderer->ReadRasterizer()->FlushRegion(addr, size);
     });
+}
+
+u64 GPU::RunOnGpuThread(std::function<void()>&& action) {
+    return impl->RequestSyncOperation(std::move(action));
 }
 
 u64 GPU::CurrentSyncRequestFence() const {

@@ -171,7 +171,7 @@ struct KernelCore::Impl {
             schedulers[core_id].reset();
         }
 
-        // Next host thead ID to use, 0-3 IDs represent core threads, >3 represent others
+        // Next host thead ID to use, IDs below NUM_CPU_CORES represent core threads, the rest others
         next_host_thread_id = Core::Hardware::NUM_CPU_CORES;
 
         // Close kernel objects that were not freed on shutdown
@@ -369,7 +369,7 @@ struct KernelCore::Impl {
         // This should only be called during core init.
         ASSERT(tls_data.host_thread_id == UINT8_MAX);
 
-        // The first four slots are reserved for CPU core threads
+        // The first NUM_CPU_CORES slots are reserved for CPU core threads
         ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
         tls_data.host_thread_id = u8(core_id);
         return tls_data.host_thread_id;
@@ -801,7 +801,7 @@ struct KernelCore::Impl {
 
     std::array<std::optional<Kernel::PhysicalCore>, Core::Hardware::NUM_CPU_CORES> cores;
 
-    // Next host thead ID to use, 0-3 IDs represent core threads, >3 represent others
+    // Next host thead ID to use, IDs below NUM_CPU_CORES represent core threads, the rest others
     std::atomic<u32> next_host_thread_id{Core::Hardware::NUM_CPU_CORES};
 
     // Kernel memory management
@@ -944,7 +944,8 @@ const Kernel::PhysicalCore& KernelCore::PhysicalCore(std::size_t id) const {
 size_t KernelCore::CurrentPhysicalCoreIndex() const {
     const u32 core_id = impl->GetCurrentHostThreadID();
     if (core_id >= Core::Hardware::NUM_CPU_CORES) {
-        return Core::Hardware::NUM_CPU_CORES - 1;
+        // Host (service) threads count as the system core.
+        return Core::Hardware::SYSTEM_CPU_CORE;
     }
     return core_id;
 }

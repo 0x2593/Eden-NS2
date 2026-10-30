@@ -23,6 +23,7 @@
 #include "common/swap.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/hle/service/nvdrv/devices/nvdevice.h"
+#include "core/hle/service/nvdrv/devices/native_sparse_remap.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -65,9 +66,14 @@ public:
     Kernel::KEvent* QueryEvent(u32 event_id) override;
 
     NvResult MapNative4K(u32 handle, u64 address, u64 buffer_offset, u64 size, u8 kind);
+    NvResult MapNativeImage(u32 handle, u64 buffer_offset, u64 size, u64& address);
     NvResult UnmapNative4K(u64 address, u64 size);
+    NvResult ReserveNativeSparse4K(u64 address, u64 size);
     NvResult GetNativeSyncpointShim(u64& address, u32& stride, u32& count);
     NvResult ModifyNativeKind(u64 address, u64 size, u8 requested, u8 fallback);
+    NvResult RemapNativeSparse(std::span<NativeSparseRemapEntry> entries) {
+        return NativeRemap(entries);
+    }
 
     struct VaRegion {
         u64 offset;
@@ -172,6 +178,7 @@ private:
     NvResult AllocAsEx(IoctlAllocAsEx& params);
     NvResult AllocateSpace(IoctlAllocSpace& params);
     NvResult Remap(std::span<IoctlRemapEntry> params);
+    NvResult NativeRemap(std::span<NativeSparseRemapEntry> params);
     NvResult MapBufferEx(IoctlMapBufferEx& params);
     NvResult UnmapBuffer(IoctlUnmapBuffer& params);
     NvResult FreeSpace(IoctlFreeSpace& params);
@@ -214,6 +221,8 @@ private:
     //!< This maps the base addresses of mapped buffers to their total sizes and
     //!< mapping type, this is needed as what was originally a single buffer may
     //!< have been split into multiple GPU side buffers with the remap flag.
+    NativeSparseMappingTable native_sparse_mappings;
+    std::map<u32, DAddr> native_sparse_pins;
     std::map<u64, Mapping> mapping_map;
     //!< Holds allocations created by AllocSpace from
     //!< which fixed buffers can be mapped into

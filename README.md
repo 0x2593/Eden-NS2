@@ -1,14 +1,17 @@
-# Eden NS2 — Donkey Kong Bananza progress build
+# Eden NS2 — Switch 2 progress build
 
-An experimental fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator,
-built on top of a community "Switch 2 support" patch, with a set of fixes that get
-**Donkey Kong Bananza** (title `040074A01BF12000`, update v7.0.0) from a black screen, through its
-mode-select menu (60 FPS) and first load, **into gameplay with the 3D world rendering, on
-Windows**. Gameplay is slow (5-8 FPS) and in-game videos are not decoded yet.
+An experimental fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator
+that runs Switch 2 games. It combines three things:
 
-![Gameplay with the 3D world rendering](docs/ns2/screenshots/gameplay-3d.png)
+- a community "Switch 2 support" patch (the NS2 patch),
+- fixes that get **Donkey Kong Bananza** (title `040074A01BF12000`, update v7.0.0) into gameplay
+  with the 3D world rendering,
+- the GPU and compatibility work of the **eden-nx2** fork (a separate Switch 2 fork aimed at other
+  titles).
 
-![Mode-select menu](docs/ns2/screenshots/mode-select-menu.png)
+![Donkey Kong Bananza gameplay](docs/ns2/screenshots/bananza-gameplay.png)
+
+![Pokémon Pokopia first-run screen](docs/ns2/screenshots/pokopia-boot.png)
 
 > This is research-grade work. It is not affiliated with the Eden project or Nintendo, it does not
 > include any game data, keys or firmware, and nothing here is meant for upstream as-is.
@@ -16,81 +19,90 @@ Windows**. Gameplay is slow (5-8 FPS) and in-game videos are not decoded yet.
 
 ## Status
 
-| Stage | State |
+| Game | State |
 | --- | --- |
-| Boot, audio, GPU queues, shaders | Working |
-| Mode-select menu ("Normal Mode / Assist Mode / Options") | **Working, 60 FPS, text readable** |
-| Selecting Normal Mode → loading screen ("Golden Bananas?!") | Working |
-| Finishing the first load | Working |
-| Gameplay ("Explore the mining tunnel") | **3D world and HUD render**; 5-8 FPS |
-| In-game video (tutorial panel) | Not decoded (stand-in codec service) |
+| Donkey Kong Bananza (`040074A01BF12000`) | Boots, menus, loading and **gameplay with the 3D world rendering** |
+| Pokémon Pokopia (`0400A3A01EE4C000`) | Boots to the first-run language screen (not tested further) |
 
 Tested on Windows 11 with an NVIDIA Turing-class GPU. **Multi-core CPU mode is required**
-(`use_multi_core=true`); single-core mode freezes at the menu.
+(`use_multi_core=true`).
 
 ### Known issues
 
-- **Slow in gameplay** (5-8 FPS). Three host threads are saturated; it looks CPU-bound.
-- **Videos are not decoded.** The video codec service is a stand-in that accepts every request, so
-  video panels show a flat colour.
-- **Occasional fault during the menu-to-loading transition** (a bad guest pointer; the loading
-  screen then never finishes). Seen in about one run in five, mostly when A is pressed again during
-  the transition.
-- Four rare shader forms still fail to lower (one ATOM form, three shaders reading constant
-  buffer 24); those draws are skipped.
+- **Donkey Kong Bananza: black patches in the destructible terrain.** Some voxel terrain chunks are
+  never drawn: their vertex data is still empty when the draws happen. Shader translation, texture
+  decoding and every GPU write path have been ruled out; see [docs/ns2/NOTES.md](docs/ns2/NOTES.md).
+- Pokémon Pokopia has only been run as far as its first screen.
+- One Bananza shader form still fails to translate; that draw is skipped.
 
-## Reaching gameplay
+## What is in this build
 
-On a save that has already picked a mode, the menu still appears: press A (keyboard `C`) twice to
-pick Normal Mode and start. Loading takes about 30 s.
+### Base: the NS2 patch
 
-## What changed (on top of the NS2 patch)
+Switch 2 program loading, the graphics supervisor and GPU worker services, the NVN2 command
+streams (Ampere engines, Turing macros, QMDs), a native Ampere shader frontend and an Ampere →
+Maxwell shader lowering, sparse GPU regions, six emulated CPU cores, and AV1/H.264/VP9 video
+decoding through FFmpeg and libgav1.
+
+### Donkey Kong Bananza fixes
 
 Highlights; [docs/ns2/NOTES.md](docs/ns2/NOTES.md) lists every fix with the reasoning behind it.
 
-- **Audio:** newer SDKs mark per-update BehaviorInfo with a different magic ("Rev" vs "REV");
-  only the revision number is compared now. This removed ~600k errors per run.
-- **Shader lowering (Ampere → Maxwell):** PLOP3 from any uniform predicate, TEX 3D and non-scalar
-  cube-array forms, TLD4 → TLD4S, IPA with a multiplier register, generic RED, SHF right shifts,
-  and the `.F16` packed-result bit on TEX/TLD/TLD4 (this was why all text drew as solid blocks).
-- **Hang at ~40 s:** the compute macro data RAM was shared by every channel of a TSG, so one
-  channel's QMD-ring state was clobbered and its sync object never signalled. Each compute engine
-  now has its own macro interpreter state.
-- **Black screen:** GPU command 214 reserves the VA ranges where the SDK places its render targets;
-  they were left unbacked, so every clear and draw went nowhere. They are now backed with memory.
-- **Loading:** the VFS file cache now stays below the C runtime's stream limit (MSVCRT caps it at
-  2048 on MinGW builds), fixing "Too many open files" while streaming assets.
-- **Crash during the first load:** the GPU worker service refused new mappings after 1024 per
-  worker, so NVN failed one effect's shader-code memory pool (GPU address 0) and the game used the
-  broken shader program. The limit is now 65536.
-- **Deadlock on the first gameplay frame:** the graphics and compute queues hand off through
-  semaphores. Compute macros write that signal by patching a QMD with the inline-to-memory upload
-  engine and scheduling it. The native compute engine dropped those uploads, and the QMD scheduler
-  only read release slots at words 24/28, not the one at word 52. Both work now.
-- **More shader lowering:** FMNMX with a uniform register, IADD3/IADD3.X carry chains (uniform and
-  normal), IMAD.WIDE.U32, IABS, 8/16-bit global loads and stores, F2I to 8 bits, any PLOP3 truth
-  table, BREAK out of a reconvergence scope (PBK/BRK), RET without the copied link, TLD4 with a
-  partial mask, TEX on 2D arrays with explicit LOD, AST of RZ, texture descriptors in any constant
-  buffer, and uniform registers UR0–UR22.
-- **Multi-core gameplay:** Dynarmic now decodes all ARMv8.1 LSE register atomics (LDADD, LDCLR,
-  LDEOR, LDSET, LDSMAX, LDSMIN, LDUMAX, LDUMIN); the game uses LDSETH and crashed without it.
-- **Gameplay start aborts (2001-0033 / 2001-0114):** the video codec's supervisor commands (901,
-  902/905, 991, 1001, 1002) and its root/service sessions are answered by a stand-in, including the
-  completion event it waits on; the syncpoint supervisor's event query (22) is implemented.
-- **3D world:** geometry shaders are accepted by the native path (OUT, ISBERD, invocation special
-  registers, the LEPC prologue), Eden's Maxwell translator gained PRMT and 8-bit F2I, and more forms
-  are lowered (LOP3/ULOP3 with predicate output, TMML, IMNMX with constant buffers, SHF.L.HI, PRMT
-  selectors, 16-bit F2I, array depth-compare TEX with LOD zero, ...).
-- **Buffer cache:** up to 32 storage buffers per stage, and storage buffers with no size in the
-  constant buffer stop at the end of their native mapping instead of spanning neighbouring pools.
-- Opt-in diagnostics (environment variables): `EDEN_NATIVE_FRAME_STATS`, `EDEN_NATIVE_TIC_TRACE`,
-  `EDEN_NATIVE_HANDLE_TRACE`, `EDEN_NATIVE_SUBMIT_TRACE`, `EDEN_NATIVE_DISPLAY_OVERRIDE=<addr>`,
-  `EDEN_UNMAPPED_BACKTRACE`, `EDEN_NATIVE_SEM_WATCH=<page,...>` (semaphore writers and waiters),
-  `EDEN_NATIVE_STALL_WATCH=<addr,...>` (report parked channels after 8 s idle),
-  `EDEN_NATIVE_METHOD_TRACE` (recent methods per channel at a watched wait),
-  `EDEN_NATIVE_NO_SSBO_WRITEBACK`, `EDEN_NATIVE_SHADER_DUMP_DIR=<dir>` (save every captured native
-  shader for offline lowering tests), `EDEN_AUTO_PRESS_A=<start>,<interval>,<end>[;...]` (taps A for
-  unattended runs; several windows separated by `;`), plus the existing `EDEN_NATIVE_FRAME_CAPTURE` / `_DRAW_DIAGNOSTICS`.
+- **Shader lowering:** many more Ampere instruction forms (LDG/STG widths, FSET, FMNMX, F2I, IABS,
+  TXQ masks, array 2D depth-compare and explicit-LOD TEX, PRMT, IMAD.X, conditional BREAK out of a
+  reconvergence scope, EXIT inside a scope, uniform-register forms) and geometry shaders
+  (OUT, ISBERD, invocation special registers, the LEPC prologue).
+- **Storage buffers:** native storage pointers are tracked from 64-bit constant-buffer bases and
+  never through values loaded from memory; up to 32 storage buffers per stage; pointer slots are
+  synchronised before binding.
+- **Gameplay start:** the VP9 video decoder path the game opens at gameplay start is handled.
+- Opt-in diagnostics for chasing missing geometry (see below).
+
+### From eden-nx2
+
+- **Macro engine:** the Turing macro (MME) interpreter decodes each instruction once, repeated
+  calls are replayed from a cache, and on x86-64 macros are compiled to native code
+  (`EDEN_NX2_MME_JIT=0` and `EDEN_NX2_MME_MEMO=0` turn these off).
+- **Macro data RAM** is per channel and shared by its 3D and compute engines, as on hardware.
+- **Compute:** report-semaphore releases from the compute class, and QMD "max" releases that never
+  move a counter backwards.
+- **GPU thread work:** cheaper fences and cache locks (spinning recursive mutex, batched fence
+  release), same-value register writes skipped (`EDEN_NX2_SKIP_SAME=0` off), fewer buffer
+  copy-backs at fences (`EDEN_NX2_BUFFER_DOWNLOADS=0/1` forces), a race-free device-memory
+  translation cache, and integer/pointer hashing that skips FNV on MSVC.
+- **Textures:** very large virtual ASTC arrays are kept on the host from the first level that fits,
+  ASTC without alpha can be recompressed to BC1 (`EDEN_NX2_ASTC_BC1=0` off), GPU BC recompression
+  (`bc_encoder.comp`), and fixes for decodes racing image deletion.
+- **CPU (Dynarmic):** the remaining ARMv8.1 atomics (LDSMAX/LDSMIN/LDUMAX/LDUMIN), CASP,
+  pointer-authenticated branches and loads (BRAA/BLRAA/LDRAA…) and the ARMv8.5 memory-tagging
+  instructions.
+- **Shader lowering:** MUFU.SIN/COS now take their argument in turns as on SM70+ (they were
+  computed in radians), and IMAD by a power of two lowers to a shift.
+- **Kernel:** extra CPU core ids are folded onto the six emulated cores, and the guest counter
+  yields while a game spins on it.
+
+Not taken from eden-nx2: its second GPU thread (it depends on its own command-stream suspension
+model) and its system-service layer (this build keeps the NS2 patch's). Its own notes are kept in
+[NX2_NOTES.md](NX2_NOTES.md) and [NX2_GPU_THREAD_SPLIT.md](NX2_GPU_THREAD_SPLIT.md).
+
+## Diagnostics
+
+All off unless the environment variable is set:
+
+| Variable | Effect |
+| --- | --- |
+| `EDEN_NATIVE_DRAW_DIAGNOSTICS`, `EDEN_NATIVE_FRAME_CAPTURE` | Draw/QMD tracing and frame captures |
+| `EDEN_NATIVE_SHADER_OVERRIDE_DIR=<dir>` | With draw diagnostics: save captured native shaders for offline lowering tests |
+| `EDEN_NATIVE_LOWER_DISABLE=<group,...>` | Switch individual lowering fixes off to bisect a regression |
+| `EDEN_NATIVE_LOWER_GS=0` / `=1` | Geometry-stage lowering off / also tessellation |
+| `EDEN_DRAW_TEXTURE_LOG` | Creating `draw-textures.request` logs the next 20000 draws with their textures, vertex streams and storage buffers |
+| `EDEN_GPU_WRITE_WATCH=<va>-<va>` | Log every GPU-side write (DMA, inline upload, storage, texel buffers) into a range |
+| `EDEN_POINTER_CHASE_LOG` | Log global writes whose address comes from a loaded pointer |
+| `EDEN_THREAD_TRACE` | Log guest thread creation and core moves |
+| `EDEN_DEBUG_CLEAR_MAGENTA` | Clear render targets to magenta to tell holes from black geometry |
+| `EDEN_NX2_GPU_PROFILE` | GPU-thread zone timers |
+| `EDEN_AUTO_PRESS_A=<start>,<interval>,<end>[;...]` | Tap A for unattended runs |
+| `EDEN_AUTO_HOLD_PLUS=<start>,<end>[;...]` | Hold + for unattended runs |
 
 ## Repository layout
 
@@ -98,14 +110,13 @@ This is a normal Eden source tree; the additions are:
 
 | Path | Contents |
 | --- | --- |
-| `patches/eden-ns2-dkb.patch` | All changes in this repository as one diff against upstream Eden master. |
+| `patches/eden-ns2-dkb.patch` | All source changes in this repository as one diff against upstream Eden master. |
+| `NS2.patch` | The original community Switch 2 patch this work started from. |
+| `NX2_NOTES.md`, `NX2_GPU_THREAD_SPLIT.md` | The eden-nx2 fork's own work log and design notes. |
 | `tools/ns2/` | Scripts used during debugging (run/capture loop, GDB remote client, breakpoint tracer, pushbuffer decoder, ...). |
-| `docs/ns2/NOTES.md` | Chronological work log: every fix, why, and what was ruled out. |
+| `docs/ns2/NOTES.md` | Chronological work log: every Bananza fix, why, and what was ruled out. |
 
 ## Building (Windows, MSYS2 MINGW64)
-
-This is the route that was used; MSVC builds of the original patch also work but were not used for
-these fixes.
 
 1. Install [MSYS2](https://www.msys2.org) and, in a **MINGW64** shell, install the MinGW toolchain,
    CMake, Ninja, Qt 6, FFmpeg, SDL3, Boost, OpenSSL and the Vulkan headers, plus git and autotools
@@ -123,10 +134,11 @@ these fixes.
 3. Copy the MinGW runtime DLLs (Qt and its dependencies) next to `build/bin/eden.exe` and add a
    `build/bin/qt.conf` containing `[Paths]` / `Plugins = plugins` (see [docs/ns2/NOTES.md](docs/ns2/NOTES.md)).
 
+The NS2 patch's MSVC script (`build-eden-msvc.bat`) is included but has not been tried with this tree.
+
 ## Building (Linux)
 
-Not tested yet, but nothing in the changes is Windows-only (the open-file limit fix is behind
-`#ifdef _WIN32`), and the original NS2 patch was Linux-first.
+Not tested yet; nothing in the changes is Windows-only.
 
 1. Install the dependencies for your distribution; [docs/Deps.md](docs/Deps.md) has full commands for
    Arch, Debian/Ubuntu/Mint, Fedora, Gentoo and others. For example:
@@ -138,8 +150,6 @@ Not tested yet, but nothing in the changes is Windows-only (the open-file limit 
         vulkan-headers vulkan-utility-libraries libusb spirv-tools spirv-headers
    ```
 
-   Debian/Ubuntu needs Ubuntu 26.04, Mint 22.3 or Debian 13 or later; the `apt-get` line is in
-   [docs/Deps.md](docs/Deps.md).
 2. Configure and build from the repository root:
 
    ```sh
@@ -155,23 +165,28 @@ Not tested yet, but nothing in the changes is Windows-only (the open-file limit 
 
 ## Running
 
-You need your own legally dumped game, keys and firmware. The game is loaded from an extracted dump:
+You need your own legally dumped games, keys and firmware. Games are loaded from an extracted dump
+(the `romfs` folder next to `exefs` is picked up automatically):
 
 ```sh
-build/bin/eden.exe -g "<dump>/updates/458752/exefs/main"   # Windows
-build/bin/eden -g "<dump>/updates/458752/exefs/main"       # Linux
+build/bin/eden.exe -g "<dump>/updates/<version>/exefs/main"   # Windows
+build/bin/eden -g "<dump>/updates/<version>/exefs/main"       # Linux
 ```
 
 Settings used: Vulkan, 12 GB memory layout (`memory_layout_mode=4`), GPU accuracy High, multi-core
-CPU (`use_multi_core=true`).
-The menu appears about 70–80 s after launch on the first run (shader cache cold).
+CPU (`use_multi_core=true`), reactive flushing on.
 Default keyboard: A = `C`, B = `X`, + = `M`, − = `N`, left stick = W/A/S/D.
+
+In Donkey Kong Bananza, on a save that has already picked a mode, the mode menu still appears:
+press A twice to pick Normal Mode and start.
 
 ## Credits and licence
 
 - [Eden](https://git.eden-emu.dev/eden-emu/eden) and the yuzu/Citra projects it derives from.
 - The Switch 2 support patch, by an unknown author; it was originally shared on a social media
   account that has since been deleted.
-- Instruction encodings cross-checked against Mesa's NAK compiler (MIT).
+- The eden-nx2 fork, for its macro engine, GPU-thread, texture and CPU work.
+- Instruction encodings cross-checked against Mesa's NAK compiler (MIT); Turing macro semantics
+  from Mesa's `mme_tu104` (MIT).
 
 The code is licensed like Eden: **GPL-3.0-or-later** (see [LICENSE.txt](LICENSE.txt)).

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "video_core/engines/fermi_2d.h"
@@ -59,6 +60,27 @@ void Fermi2D::ConsumeSinkImpl(Core::System& system) {
 }
 
 void Fermi2D::Blit() {
+    if (static const u64 trace_destination = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+            return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        trace_destination != 0 && regs.dst.Address() >= trace_destination &&
+        regs.dst.Address() < trace_destination + (32ULL << 20)) {
+        static u32 traced_destination{};
+        if (traced_destination++ < 40) {
+            LOG_INFO(HW_GPU, "nx2 2D blit to traced dst: {:#x} {}x{} -> {:#x} {}x{}",
+                     regs.src.Address(), regs.src.width, regs.src.height, regs.dst.Address(),
+                     regs.dst.width, regs.dst.height);
+        }
+    }
+    if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
+        static u32 traced{};
+        if (traced++ < 64) {
+            LOG_INFO(HW_GPU, "nx2 2D blit {:#x} {}x{} -> {:#x} {}x{}", regs.src.Address(),
+                     regs.src.width, regs.src.height, regs.dst.Address(), regs.dst.width,
+                     regs.dst.height);
+        }
+    }
     LOG_DEBUG(HW_GPU, "called. source address={:#x}, destination address={:#x}", regs.src.Address(), regs.dst.Address());
 
     UNIMPLEMENTED_IF_MSG(regs.operation != Operation::SrcCopy, "Operation is not copy");

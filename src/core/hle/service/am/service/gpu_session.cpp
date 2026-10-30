@@ -2,19 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <vector>
-#include <optional>
 #include "common/swap.h"
 #include "common/alignment.h"
-#include "common/scope_exit.h"
-#include "core/hle/kernel/k_memory_manager.h"
-#include "core/hle/kernel/k_page_group.h"
-#include "core/hle/kernel/k_system_resource.h"
-#include "core/hle/kernel/kernel.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_process.h"
@@ -64,11 +60,16 @@ public:
             {211, &IGpuWorker::NormalMapGpuMemory4K, "NormalMapGpuMemory4K"},
             {212, &IGpuWorker::NormalModifyGpuMemory4K, "NormalModifyGpuMemory4K"},
             {213, &IGpuWorker::NormalUnmapGpuMemory4K, "NormalUnmapGpuMemory4K"},
-            {214, &IGpuWorker::Unknown214, "Unknown214"},
+            {214, &IGpuWorker::CreateSparseRegion, "CreateSparseRegion"},
+            {215, &IGpuWorker::DestroySparseRegion, "DestroySparseRegion"},
+            {216, &IGpuWorker::ExecuteSparseMapRequests, "ExecuteSparseMapRequests"},
         };
         RegisterHandlersTipc(functions);
     }
     ~IGpuWorker() override {
+        if (m_release_poll) {
+            system.CoreTiming().UnscheduleEvent(m_release_poll);
+        }
         for (const auto& mapping : m_mappings) {
             if (auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(mapping.as_id)) {
                 as->UnmapNative4K(mapping.address, mapping.size);
@@ -100,9 +101,6 @@ public:
         return system.IsPoweredOn() ? ctx.WriteToOutgoingCommandBuffer() : ResultSuccess;
     }
 private:
-    // Bounds per worker. Level loads keep well over a thousand pools mapped at once (the first
-    // Donkey Kong Bananza load passes 1024), and NVN reports a refused map as a failed pool init.
-    static constexpr size_t MaxObjects = 0x10000;
     struct Mapping { u32 as_id; u64 address; u64 size; u32 memory_id; };
     std::vector<Mapping> m_mappings;
     static u64 ReadPair(const u32* packet, size_t index) {
@@ -129,7 +127,6 @@ private:
         R_UNLESS(kind, Kernel::ResultNotImplemented);
         const u64 begin = ReadPair(packet, 3), end = ReadPair(packet, 5);
         R_UNLESS(end >= begin && end != ~u64{0}, Kernel::ResultInvalidSize);
-        R_UNLESS(m_mappings.size() < MaxObjects, Kernel::ResultOutOfResource);
         const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(packet[2]);
         R_UNLESS(as, Kernel::ResultNotFound);
         const auto result = as->MapNative4K(packet[7], begin, ReadPair(packet, 8),
@@ -156,136 +153,9 @@ private:
                       packet[2], packet[7], ReadPair(packet, 3), ReadPair(packet, 5), packet[10],
                       packet[11], packet[12], packet[13], packet[14], packet[16], packet[17], selected_kind, result.raw);
         }
-        if (result.IsError()) {
-            LOG_WARNING(Service_AM, "GPU map4K rejected: result={:#x}, words={:08x}", result.raw,
-                        fmt::join(std::span{ctx.CommandBuffer(), 18}, ","));
-        }
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(result.raw);
         rb.Push<u32>(selected_kind);
-    }
-    // Maps freshly allocated pages as Insecure memory in a free block of the alias-code region that
-    // lies outside the heap and alias regions (the whole region is not a valid Insecure range).
-    Result MapSystemPages(u64 size, u64& out_address) {
-        auto& page_table = m_process->GetPageTable();
-        const u64 region_begin = GetInteger(page_table.GetAliasCodeRegionStart());
-        const u64 region_end = region_begin + page_table.GetAliasCodeRegionSize();
-        const std::array<std::pair<u64, u64>, 2> excluded{{
-            {GetInteger(page_table.GetHeapRegionStart()),
-             GetInteger(page_table.GetHeapRegionStart()) + page_table.GetHeapRegionSize()},
-            {GetInteger(page_table.GetAliasRegionStart()),
-             GetInteger(page_table.GetAliasRegionStart()) + page_table.GetAliasRegionSize()},
-        }};
-        constexpr u64 Guard = 0x10000;
-        std::optional<u64> found;
-        for (u64 address = region_begin; address < region_end && !found;) {
-            Kernel::KMemoryInfo info{};
-            Kernel::Svc::PageInfo page{};
-            R_TRY(page_table.QueryInfo(&info, &page, address));
-            const u64 block_end = std::min<u64>(info.m_address + info.m_size, region_end);
-            if (info.m_state == Kernel::KMemoryState::Free) {
-                u64 candidate = Common::AlignUp(std::max<u64>(info.m_address, region_begin) + Guard, Guard);
-                for (bool moved = true; moved && candidate + size + Guard <= block_end;) {
-                    moved = false;
-                    for (const auto& [begin, end] : excluded) {
-                        if (begin != end && candidate < end && candidate + size + Guard > begin) {
-                            candidate = Common::AlignUp(end + Guard, Guard);
-                            moved = true;
-                        }
-                    }
-                }
-                if (candidate + size + Guard <= block_end) found = candidate;
-            }
-            R_UNLESS(info.m_address + info.m_size > address, Kernel::ResultInvalidCurrentMemory);
-            address = info.m_address + info.m_size;
-        }
-        R_UNLESS(found, Kernel::ResultOutOfMemory);
-        // Taking this from the system pool starves HLE services (emulation hangs), so it comes
-        // from the application pool even though the SDK does not budget for it there.
-        Kernel::KPageGroup pg(kernel, kernel.GetSystemSystemResource().GetBlockInfoManagerPointer());
-        R_TRY(kernel.MemoryManager().AllocateAndOpen(&pg, size / Kernel::PageSize,
-                                                     m_process->GetAllocateOption()));
-        SCOPE_EXIT { pg.Close(kernel); };
-        R_TRY(page_table.MapPageGroup(*found, pg, Kernel::KMemoryState::Insecure,
-                                      Kernel::KMemoryPermission::UserReadWrite));
-        out_address = *found;
-        R_SUCCEED();
-    }
-    // Commits system-allocated memory behind a GPU VA range. The SDK places render targets in
-    // these ranges without mapping any memory object of its own there.
-    Result BackGpuRange(u32 as_id, u64 begin, u64 end) {
-        R_UNLESS(OwnsAddressSpace(as_id), Kernel::ResultNotFound);
-        R_UNLESS(end >= begin && end != ~u64{0}, Kernel::ResultInvalidSize);
-        const u64 size = end - begin + 1;
-        R_UNLESS(Common::IsAligned(begin, Kernel::PageSize) && Common::IsAligned(size, Kernel::PageSize),
-                 Kernel::ResultInvalidSize);
-        R_UNLESS(m_memory.size() < MaxObjects && m_mappings.size() < MaxObjects,
-                 Kernel::ResultOutOfResource);
-        const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(as_id);
-        R_UNLESS(as, Kernel::ResultNotFound);
-        auto& page_table = m_process->GetPageTable();
-        u64 address{};
-        R_TRY(MapSystemPages(size, address));
-        const Kernel::KProcessAddress backing{address};
-        if (!m_nv_session) {
-            m_nv_session = m_module->GetContainer().OpenSession(m_process).id;
-        }
-        auto& nvmap = m_module->GetContainer().GetNvMapFile();
-        std::shared_ptr<Nvidia::NvCore::NvMap::Handle> handle;
-        if (nvmap.CreateHandle(size, handle) != Nvidia::NvResult::Success) {
-            page_table.UnmapPages(backing, size / Kernel::PageSize, Kernel::KMemoryState::Insecure);
-            R_THROW(Kernel::ResultOutOfResource);
-        }
-        bool is_io{};
-        if (const auto lock = page_table.LockForMapDeviceAddressSpace(
-                &is_io, address, size, Kernel::KMemoryPermission::None, true, true);
-            lock.IsError()) {
-            LOG_WARNING(Service_AM, "GPU range backing lock failed: backing={:#x}, result={:#x}", address, lock.raw);
-            nvmap.FreeHandle(handle->id, false);
-            page_table.UnmapPages(backing, size / Kernel::PageSize, Kernel::KMemoryState::Insecure);
-            R_RETURN(lock);
-        }
-        const auto alloc = handle->Alloc({}, Kernel::PageSize, 0, address, Nvidia::NvCore::SessionId{*m_nv_session});
-        const auto mapped = alloc == Nvidia::NvResult::Success
-            ? as->MapNative4K(handle->id, begin, 0, size, static_cast<u8>(Tegra::PTEKind::GENERIC_16BX2))
-            : alloc;
-        if (mapped != Nvidia::NvResult::Success) {
-            LOG_WARNING(Service_AM, "GPU range backing failed: backing={:#x}, alloc={}, map={}", address,
-                        static_cast<u32>(alloc), static_cast<u32>(mapped));
-            page_table.UnlockForDeviceAddressSpace(address, size);
-            nvmap.FreeHandle(handle->id, false);
-            page_table.UnmapPages(backing, size / Kernel::PageSize, Kernel::KMemoryState::Insecure);
-            R_THROW(Kernel::ResultInvalidCurrentMemory);
-        }
-        m_memory.push_back(handle->id);
-        m_mappings.push_back({as_id, begin, size, handle->id});
-        R_SUCCEED();
-    }
-    void Unknown214(HLERequestContext& ctx) {
-        const auto* packet = ctx.CommandBuffer();
-        const std::scoped_lock device_lock{m_devices->mutex};
-        Result result = Kernel::ResultInvalidCombination;
-        u32 kind{};
-        if (packet[0] == 0xe6 && packet[1] == 10 && packet[11] < m_devices->events.size() &&
-            m_devices->events[packet[11]]) {
-            kind = packet[7] & 0xff;
-            result = ResultSuccess;
-            if (const auto backed = BackGpuRange(packet[2], ReadPair(packet, 3), ReadPair(packet, 5));
-                backed.IsError()) {
-                // Keep the previous behaviour (an unbacked reservation) if no memory is available.
-                LOG_WARNING(Service_AM, "GPU command 214 range left unbacked: {:#x}", backed.raw);
-            }
-            m_devices->events[packet[11]]->Signal(kernel);
-        }
-        if (result.IsError()) {
-            LOG_WARNING(Service_AM, "GPU command 214 rejected: words={:08x}", fmt::join(std::span{packet, 12}, ","));
-        }
-        LOG_DEBUG(Service_AM, "GPU command 214 as={}, VA={:#x}..{:#x}, words={:08x}, result={:#x}",
-                  packet[2], ReadPair(packet, 3), ReadPair(packet, 5),
-                  fmt::join(std::span{packet + 7, 5}, ","), result.raw);
-        IPC::ResponseBuilder rb{ctx, 3};
-        rb.Push(result.raw);
-        rb.Push<u32>(kind);
     }
     void NormalModifyGpuMemory4K(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();
@@ -350,6 +220,121 @@ private:
         rb.Push(result.raw);
         rb.Push(unmapped);
     }
+    // Command 215 (raw 0xe7, 7 words) carries the same fields as 213: address space, region begin and
+    // end, a sync flag and the notification event index. It releases a region created by 214.
+    void DestroySparseRegion(HLERequestContext& ctx) {
+        const auto* packet = ctx.CommandBuffer();
+        const std::scoped_lock device_lock{m_devices->mutex};
+        Result result = Kernel::ResultInvalidCombination;
+        if (packet[0] == 0xe7 && packet[1] == 7 && (packet[7] & 0xff) <= 1 &&
+            packet[8] < m_devices->events.size() && m_devices->events[packet[8]]) {
+            const u64 begin = ReadPair(packet, 3), end = ReadPair(packet, 5);
+            const auto it = std::find_if(m_mappings.begin(), m_mappings.end(), [&](const auto& mapping) {
+                return mapping.as_id == packet[2] && mapping.address == begin &&
+                       end >= begin && end - begin + 1 == mapping.size;
+            });
+            result = Kernel::ResultNotFound;
+            if (it != m_mappings.end()) {
+                const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(it->as_id);
+                result = Kernel::ResultInvalidState;
+                if (as && as->UnmapNative4K(it->address, it->size) == Nvidia::NvResult::Success) {
+                    m_mappings.erase(it);
+                    result = ResultSuccess;
+                }
+            }
+            m_devices->events[packet[8]]->Signal(kernel);
+            LOG_DEBUG(Service_AM, "GPU sparse region destroy as={}, VA={:#x}..{:#x}, result={:#x}",
+                      packet[2], begin, end, result.raw);
+        }
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(result.raw);
+    }
+    void CreateSparseRegion(HLERequestContext& ctx) {
+        const auto request = DecodeGpuSparseRegion(
+            std::span<const u32>{ctx.CommandBuffer(), IPC::COMMAND_BUFFER_LENGTH});
+        const std::scoped_lock device_lock{m_devices->mutex};
+        Result result = Kernel::ResultInvalidCombination;
+        if (request && request->notification < m_devices->events.size() &&
+            m_devices->events[request->notification]) {
+            result = [&]() -> Result {
+                R_UNLESS(OwnsAddressSpace(request->address_space) &&
+                         request->device < m_devices->devices.size() &&
+                         m_devices->devices[request->device], Kernel::ResultNotFound);
+                R_UNLESS(IsValidGpuSparseRegionRange(*request), Kernel::ResultInvalidSize);
+                R_UNLESS(request->page_shift == 12 && request->allocation_mode <= 1 &&
+                         request->sync <= 1, Kernel::ResultNotImplemented);
+                const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(
+                    request->address_space);
+                R_UNLESS(as, Kernel::ResultNotFound);
+                const auto size = request->end - request->begin + 1;
+                R_UNLESS(as->ReserveNativeSparse4K(request->begin, size) ==
+                         Nvidia::NvResult::Success, Kernel::ResultInvalidCurrentMemory);
+                m_mappings.push_back({request->address_space, request->begin, size, 0});
+                R_SUCCEED();
+            }();
+            m_devices->events[request->notification]->Signal(kernel);
+        }
+        if (request) {
+            LOG_DEBUG(Service_AM, "GPU sparse region as={}, VA={:#x}..{:#x}, page_shift={}, mode={}, device={}, sync={}, notification={}, result={:#x}",
+                      request->address_space, request->begin, request->end, request->page_shift,
+                      request->allocation_mode, request->device, request->sync,
+                      request->notification, result.raw);
+        }
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(result.raw);
+    }
+    void ExecuteSparseMapRequests(HLERequestContext& ctx) {
+        const auto* packet = ctx.CommandBuffer();
+        const std::scoped_lock device_lock{m_devices->mutex};
+        u64 processed{};
+        std::vector<u8> selected;
+        const auto result = [&]() -> Result {
+            R_UNLESS(packet[0] == 0x011000e8 && packet[1] == 7,
+                     Kernel::ResultInvalidCombination);
+            const u64 count = ReadPair(packet, 8);
+            R_UNLESS(count && count <= 256 && ReadPair(packet, 11) == sizeof(GpuSparseMapRequest),
+                     Kernel::ResultInvalidSize);
+            R_UNLESS((packet[13] & 0xff) <= 1, Kernel::ResultNotImplemented);
+            R_UNLESS(OwnsAddressSpace(packet[10]) && packet[14] < m_devices->events.size() &&
+                     m_devices->events[packet[14]], Kernel::ResultNotFound);
+            const auto input = ctx.ReadBuffer();
+            R_UNLESS(input.size() == count * sizeof(GpuSparseMapRequest) &&
+                     ctx.GetWriteBufferSize() >= count, Kernel::ResultInvalidSize);
+            std::vector<Nvidia::Devices::NativeSparseRemapEntry> entries;
+            for (size_t i = 0; i < count; ++i) {
+                GpuSparseMapRequest request;
+                std::memcpy(&request, input.data() + i * sizeof(request), sizeof(request));
+                LOG_DEBUG(Service_AM, "GPU sparse entry VA={:#x}, size={:#x}, memory={}, source={:#x}, cache={}, read_only={}, kinds={:#x}/{:#x}, comptag={}, reserved={:#x}/{:#x}/{:#x}",
+                          u64{request.address}, u64{request.size}, u32{request.memory},
+                          u64{request.source_offset}, request.cache, request.read_only,
+                          request.kind, request.fallback_kind, request.comptag_mode,
+                          request.reserved0, u16{request.reserved1}, u32{request.reserved2});
+                const auto entry = DecodeGpuSparseMap(request);
+                R_UNLESS(entry, Kernel::ResultNotImplemented);
+                R_UNLESS(!entry->handle || std::find(m_memory.begin(), m_memory.end(),
+                         u32{entry->handle}) != m_memory.end(), Kernel::ResultNotFound);
+                entries.push_back(*entry);
+            }
+            const auto as = m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(packet[10]);
+            R_UNLESS(as, Kernel::ResultNotFound);
+            R_UNLESS(as->RemapNativeSparse(entries) == Nvidia::NvResult::Success,
+                     Kernel::ResultInvalidCurrentMemory);
+            for (const auto& entry : entries) {
+                selected.push_back(static_cast<u8>(u16{entry.fallback_kind}));
+            }
+            processed = count;
+            ctx.WriteBuffer(selected);
+            R_SUCCEED();
+        }();
+        if (packet[14] < m_devices->events.size() && m_devices->events[packet[14]]) {
+            m_devices->events[packet[14]]->Signal(kernel);
+        }
+        LOG_DEBUG(Service_AM, "GPU sparse map as={}, count={}, processed={}, result={:#x}",
+                  packet[10], ReadPair(packet, 8), processed, result.raw);
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(result.raw);
+        rb.Push(processed);
+    }
     Result RegisterMemory(u64 begin, u64 end, u32 flags, u32 device, u32& id) {
         R_UNLESS(flags == 0, Kernel::ResultNotImplemented);
         R_UNLESS(device < m_devices->devices.size(), Kernel::ResultNotFound);
@@ -359,7 +344,6 @@ private:
         const u64 size = end - begin + 1;
         R_UNLESS(Common::IsAligned(begin, Kernel::PageSize), Kernel::ResultInvalidAddress);
         R_UNLESS(Common::IsAligned(size, Kernel::PageSize), Kernel::ResultInvalidSize);
-        R_UNLESS(m_memory.size() < MaxObjects, Kernel::ResultOutOfResource);
         auto& page_table = m_process->GetPageTable();
         R_UNLESS(page_table.Contains(begin, size), Kernel::ResultInvalidCurrentMemory);
         for (u64 address = begin; address <= end;) {
@@ -403,25 +387,76 @@ private:
                  Kernel::ResultInvalidCombination);
         const auto it = std::find(m_memory.begin(), m_memory.end(), id);
         R_UNLESS(it != m_memory.end(), Kernel::ResultNotFound);
-        auto& nvmap = m_module->GetContainer().GetNvMapFile();
-        auto handle = nvmap.GetHandle(id);
-        R_UNLESS(handle, Kernel::ResultNotFound);
-        {
-            const std::scoped_lock handle_lock{handle->mutex};
-            // No asynchronous GPU work is implemented yet. Never report release
-            // completion for memory still retained or pinned by another user.
-            R_UNLESS(handle->pins == 0 && handle->internal_dupes == 0 && handle->dupes == 1,
-                     Kernel::ResultBusy);
+        R_UNLESS(std::ranges::none_of(m_pending_release,
+                                      [id](const PendingRelease& item) { return item.id == id; }),
+                 Kernel::ResultBusy);
+        const auto state = GetReleaseState(id);
+        R_UNLESS(state != ReleaseState::Shared, Kernel::ResultBusy);
+        if (state == ReleaseState::Retained) {
+            // Native image backings and display buffers retire from a timer. The release
+            // completes (and the notification fires) once they are gone.
+            m_pending_release.push_back({id, notification});
+            SchedulePendingRelease();
+            R_SUCCEED();
         }
-        // FreeHandle uses the final shared reference to decide when CPU memory
-        // may be unshared. Drop this temporary inspection reference first.
-        handle.reset();
-        const auto info = nvmap.FreeHandle(id, false);
+        R_RETURN(FinishRelease(id, notification));
+    }
+    enum class ReleaseState { Free, Retained, Shared };
+    ReleaseState GetReleaseState(u32 id) {
+        auto handle = m_module->GetContainer().GetNvMapFile().GetHandle(id);
+        if (!handle) {
+            return ReleaseState::Shared;
+        }
+        const std::scoped_lock handle_lock{handle->mutex};
+        if (handle->dupes != 1) {
+            return ReleaseState::Shared;
+        }
+        return handle->pins != 0 || handle->internal_dupes != 0 ? ReleaseState::Retained
+                                                                 : ReleaseState::Free;
+    }
+    Result FinishRelease(u32 id, u32 notification) {
+        const auto it = std::find(m_memory.begin(), m_memory.end(), id);
+        R_UNLESS(it != m_memory.end(), Kernel::ResultNotFound);
+        const auto info = m_module->GetContainer().GetNvMapFile().FreeHandle(id, false);
         R_UNLESS(info && info->can_unlock, Kernel::ResultInvalidState);
         m_memory.erase(it);
         R_TRY(m_process->GetPageTable().UnlockForDeviceAddressSpace(info->address, info->size));
         m_devices->events[notification]->Signal(kernel);
         R_SUCCEED();
+    }
+    void SchedulePendingRelease() {
+        if (m_release_scheduled) {
+            return;
+        }
+        if (!m_release_poll) {
+            m_release_poll = Core::Timing::CreateEvent(
+                "GpuMemoryRelease",
+                [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                    const auto guard = LockService();
+                    const std::scoped_lock device_lock{m_devices->mutex};
+                    std::erase_if(m_pending_release, [this](const PendingRelease& item) {
+                        const auto state = GetReleaseState(item.id);
+                        if (state == ReleaseState::Retained) {
+                            return false;
+                        }
+                        if (state == ReleaseState::Free) {
+                            const auto result = FinishRelease(item.id, item.notification);
+                            if (result.IsError()) {
+                                LOG_ERROR(Service_AM, "GPU memory release id={} failed: {:#x}",
+                                          item.id, result.raw);
+                            }
+                        }
+                        return true;
+                    });
+                    if (m_pending_release.empty()) {
+                        m_release_scheduled = false;
+                        return std::nullopt;
+                    }
+                    return std::chrono::milliseconds{1};
+                });
+        }
+        m_release_scheduled = true;
+        system.CoreTiming().ScheduleEvent(std::chrono::milliseconds{1}, m_release_poll);
     }
     void DestroyGpuAccessibleMemory(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();
@@ -441,10 +476,6 @@ private:
             LOG_DEBUG(Service_AM, "GPU memory {:#x}..{:#x}, device={}, raw_device={:#x}, flags={}, id={}, result={:#x}",
                       request->begin, request->end, request->device, packet[7], request->flags, id, result.raw);
         }
-        if (result.IsError()) {
-            LOG_WARNING(Service_AM, "GPU memory registration rejected: result={:#x}, words={:08x}", result.raw,
-                        fmt::join(std::span{packet, 8}, ","));
-        }
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(result.raw);
         rb.Push(id);
@@ -452,6 +483,10 @@ private:
     std::shared_ptr<GpuDeviceRegistry> m_devices;
     std::optional<size_t> m_nv_session;
     std::vector<u32> m_memory;
+    struct PendingRelease { u32 id; u32 notification; };
+    std::vector<PendingRelease> m_pending_release;
+    std::shared_ptr<Core::Timing::EventType> m_release_poll;
+    bool m_release_scheduled{};
     std::shared_ptr<Nvidia::Module> m_module;
     Kernel::KProcess* const m_process;
 };
@@ -491,6 +526,17 @@ Result IGpuSession::HandleSyncRequest(Kernel::KServerSession& session, HLEReques
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(Kernel::ResultNotImplemented.raw);
     return system.IsPoweredOn() ? ctx.WriteToOutgoingCommandBuffer() : ResultSuccess;
+}
+
+std::shared_ptr<Nvidia::Devices::nvhost_as_gpu> IGpuSession::GetRegisteredAddressSpace(u32 id) {
+    const auto guard = LockService();
+    const std::scoped_lock device_lock{m_devices->mutex};
+    for (size_t i = 0; i < m_devices->address_spaces.size(); ++i) {
+        if (m_devices->address_space_registered[i] && m_devices->address_spaces[i] &&
+            static_cast<u32>(*m_devices->address_spaces[i]) == id)
+            return m_module->GetDevice<Nvidia::Devices::nvhost_as_gpu>(id);
+    }
+    return {};
 }
 
 Result IGpuSession::RegisterAddressSpace(u32 id) {

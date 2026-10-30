@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -15,6 +19,12 @@
 #include "core/hle/service/kernel_helpers.h"
 
 namespace Service::KernelHelpers {
+
+namespace {
+// Event names for the debugger's handle listing.
+std::mutex event_names_mutex;
+std::unordered_map<const Kernel::KEvent*, std::string> event_names;
+} // namespace
 
 ServiceContext::ServiceContext(Core::System& system_, std::string name_)
     : kernel(system_.Kernel())
@@ -63,15 +73,34 @@ Kernel::KEvent* ServiceContext::CreateEvent(std::string&& name) {
 
     // Register the event.
     Kernel::KEvent::Register(kernel, event);
+    // Diagnostic only: EDEN_DIAG_WAITS=1 names every service event.
+    static const bool diag_waits = std::getenv("EDEN_DIAG_WAITS") != nullptr;
+    if (diag_waits) {
+        LOG_DEBUG(Service, "diag: created service event '{}' at {}", name, static_cast<const void*>(event));
+    }
 
+    {
+        std::scoped_lock lk{event_names_mutex};
+        event_names[event] = std::move(name);
+    }
     return event;
 }
 
 void ServiceContext::CloseEvent(Kernel::KEvent* event) {
     if (event) {
+        {
+            std::scoped_lock lk{event_names_mutex};
+            event_names.erase(event);
+        }
         event->GetReadableEvent().Close(kernel);
         event->Close(kernel);
     }
+}
+
+std::string ServiceContext::GetEventName(const Kernel::KEvent* event) {
+    std::scoped_lock lk{event_names_mutex};
+    const auto it = event_names.find(event);
+    return it == event_names.end() ? std::string{} : it->second;
 }
 
 } // namespace Service::KernelHelpers

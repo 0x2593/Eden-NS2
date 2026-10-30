@@ -525,3 +525,107 @@ TEST_CASE("A64: observed LDCLRL retries with a destination that is also its addr
     REQUIRE(jit.GetPstate() == 0xA0000000);
 }
 
+
+TEST_CASE("A64: LDEOR preserves operands on retry and toggles observed bits", "[a64][lse]") {
+    const bool wide = GENERATE(false, true);
+    const bool acquire = GENERATE(false, true);
+    const bool release = GENERATE(false, true);
+    const bool retry = GENERATE(false, true);
+    const bool overlap = GENERATE(false, true);
+    const size_t bytes = wide ? 8 : 4;
+    const u64 mask = wide ? ~u64{0} : 0xffffffffULL;
+    const u64 initial = 0xfedcba9876543210ULL & mask;
+    const u64 changed = 0x123456789abcdef0ULL & mask;
+    const u64 operand = 0x0002000200000002ULL & mask;
+    const u32 rt = overlap ? 1 : 2;
+    AtomicTestEnv env;
+    env.code_mem = {0xb8202000U | (u32(wide) << 30) | (u32(acquire) << 23) |
+                        (u32(release) << 22) | (1U << 16) | rt,
+                    0x14000000};
+    env.MemoryWrite(0x1000, initial, bytes);
+    env.fail_once = retry;
+    env.failure_value = changed;
+    Dynarmic::A64::UserConfig config;
+    config.callbacks = &env;
+    config.global_monitor = &env.monitor;
+    config.code_cache_size = 16 * 1024 * 1024;
+    Dynarmic::A64::Jit jit{config};
+    jit.SetRegister(0, 0x1000);
+    jit.SetRegister(1, operand);
+    jit.SetRegister(2, 0xabcd);
+    jit.SetPstate(0xa0000000);
+    if (retry) {
+        env.ticks_left = 1;
+        jit.Step();
+        REQUIRE(jit.GetPC() == 0);
+        REQUIRE(jit.GetRegister(1) == operand);
+        REQUIRE(jit.GetRegister(2) == 0xabcd);
+    }
+    env.ticks_left = 4;
+    jit.Run();
+    const u64 observed = retry ? changed : initial;
+    REQUIRE(jit.GetPC() == 4);
+    REQUIRE(jit.GetRegister(rt) == observed);
+    REQUIRE(jit.GetRegister(1) == (overlap ? observed : operand));
+    REQUIRE(jit.GetRegister(0) == 0x1000);
+    REQUIRE(jit.GetPstate() == 0xa0000000);
+    REQUIRE(env.MemoryRead(0x1000, bytes) == (observed ^ operand));
+    REQUIRE(env.writes == (retry ? 2U : 1U));
+}
+
+TEST_CASE("A64: small LDADD, LDCLR and LDSET preserve adjacent bytes and retry aliases", "[a64][lse]") {
+    const bool half = GENERATE(false, true);
+    const u32 operation = GENERATE(0U, 1U, 3U);
+    const bool acquire = GENERATE(false, true);
+    const bool release = GENERATE(false, true);
+    const bool retry = GENERATE(false, true);
+    // Separate result, source/result overlap, address/result overlap, and WZR result.
+    const u32 rt = GENERATE(10U, 9U, 8U, 31U);
+    const size_t bytes = half ? 2 : 1;
+    const u64 mask = half ? 0xffff : 0xff;
+    const u64 initial = 0xf3a5 & mask;
+    const u64 changed = 0xa55a & mask;
+    const u64 operand = 0xdeadbeef12340ff3ULL;
+    AtomicTestEnv env;
+    const u32 instruction = 0x38200000U | (u32(half) << 30) | (operation << 12) |
+                            (u32(acquire) << 23) | (u32(release) << 22) |
+                            (9U << 16) | (8U << 5) | rt;
+    env.code_mem = {instruction, 0x14000000};
+    env.MemoryWrite(0x1000, 0x1122334455667788ULL, 8);
+    env.MemoryWrite(0x1002, initial, bytes);
+    const u64 before = env.MemoryRead(0x1000, 8);
+    env.fail_once = retry;
+    env.failure_value = changed;
+    Dynarmic::A64::UserConfig config;
+    config.callbacks = &env;
+    config.global_monitor = &env.monitor;
+    config.code_cache_size = 16 * 1024 * 1024;
+    Dynarmic::A64::Jit jit{config};
+    jit.SetRegister(8, 0x1002);
+    jit.SetRegister(9, operand);
+    jit.SetRegister(10, ~u64{0});
+    jit.SetPstate(0xa0000000);
+    if (retry) {
+        env.ticks_left = 1;
+        jit.Step();
+        REQUIRE(jit.GetPC() == 0);
+        REQUIRE(jit.GetRegister(8) == 0x1002);
+        REQUIRE(jit.GetRegister(9) == operand);
+        REQUIRE(jit.GetRegister(10) == ~u64{0});
+        REQUIRE(jit.GetPstate() == 0xa0000000);
+    }
+    env.ticks_left = 4;
+    jit.Run();
+    const u64 observed = retry ? changed : initial;
+    const u64 replacement = (operation == 0 ? observed + operand : operation == 3 ? observed | operand : observed & ~operand) & mask;
+    REQUIRE(jit.GetPC() == 4);
+    if (rt != 31) {
+        REQUIRE(jit.GetRegister(rt) == observed);
+    }
+    REQUIRE(jit.GetRegister(8) == (rt == 8 ? observed : 0x1002));
+    REQUIRE(jit.GetRegister(9) == (rt == 9 ? observed : operand));
+    REQUIRE(jit.GetRegister(10) == (rt == 10 ? observed : ~u64{0}));
+    REQUIRE(jit.GetPstate() == 0xa0000000);
+    REQUIRE(env.MemoryRead(0x1000, 8) == ((before & ~(mask << 16)) | (replacement << 16)));
+    REQUIRE(env.writes == (retry ? 2U : 1U));
+}

@@ -17,6 +17,11 @@ add_executable(tests
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
+    core/audio_revision.cpp
+    core/vfs_file_limit.cpp
+    core/address_space.cpp
+    core/builtin_font.cpp
+    core/applet_id.cpp
     core/program_metadata.cpp
     core/native_gpu_characteristics.cpp
     core/graphics_supervisor.cpp

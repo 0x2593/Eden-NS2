@@ -27,6 +27,17 @@ constexpr u32 GetGpuAddressSpaceBigPageSize(bool extended, u32 requested) {
     return extended && requested == 0x1000 ? 0x10000 : requested;
 }
 
+constexpr bool IsSupportedNativeAddressSpaceView(u32 flags, u32 page_size, u32 reserved,
+                                                  GpuAddressSpaceLayout requested,
+                                                  GpuAddressSpaceLayout parent) {
+    const bool small_pages_only = (flags == 5 && requested.split == 0) ||
+                                  (flags == 0 && requested.split == requested.end);
+    return small_pages_only && page_size == 0x1000 && reserved == 0 &&
+           requested.start >= parent.start && requested.start < requested.end &&
+           requested.end <= parent.split && (requested.start & 0xfff) == 0 &&
+           (requested.end & 0xfff) == 0;
+}
+
 constexpr u64 GpuPageAddress(u32 page, u32 page_bits) {
     return static_cast<u64>(page) << page_bits;
 }

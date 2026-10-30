@@ -101,9 +101,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             R_SUCCEED();
         case InfoType::TotalMemorySize:
             *result = process->GetTotalUserPhysicalMemorySize(system.Kernel());
+            LOG_DEBUG(Kernel_SVC, "Process memory info_id={:#x}, value={:#x}", info_id, *result);
             R_SUCCEED();
         case InfoType::UsedMemorySize:
             *result = process->GetUsedUserPhysicalMemorySize(system.Kernel());
+            LOG_DEBUG(Kernel_SVC, "Process memory info_id={:#x}, value={:#x}", info_id, *result);
             R_SUCCEED();
         case InfoType::SystemResourceSizeTotal:
             *result = process->GetTotalSystemResourceSize();
@@ -119,9 +121,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             R_SUCCEED();
         case InfoType::TotalNonSystemMemorySize:
             *result = process->GetTotalNonSystemUserPhysicalMemorySize(system.Kernel());
+            LOG_DEBUG(Kernel_SVC, "Process memory info_id={:#x}, value={:#x}", info_id, *result);
             R_SUCCEED();
         case InfoType::UsedNonSystemMemorySize:
             *result = process->GetUsedNonSystemUserPhysicalMemorySize(system.Kernel());
+            LOG_DEBUG(Kernel_SVC, "Process memory info_id={:#x}, value={:#x}", info_id, *result);
             R_SUCCEED();
         case InfoType::IsApplication:
             *result = process->IsApplication();
@@ -187,7 +191,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         }
     }
     case InfoType::ThreadTickCount: {
-        constexpr u64 num_cpus = 4;
+        const u64 num_cpus = GetCurrentProcess(system.Kernel()).UsesPAuthReturns()
+                                 ? Core::Hardware::NUM_CPU_CORES
+                                 : Core::Hardware::NUM_LEGACY_CPU_CORES;
         if (info_sub_id != 0xFFFFFFFFFFFFFFFF && info_sub_id >= num_cpus) {
             LOG_ERROR(Kernel_SVC, "Core count is out of range, expected {} but got {}", num_cpus, info_sub_id);
             R_THROW(ResultInvalidCombination);

@@ -14,7 +14,9 @@ namespace Tegra {
 struct MaxwellDeviceMethods;
 
 struct MaxwellDeviceTraits {
-    static constexpr size_t device_virtual_bits = 34;
+    // 64 GiB: Switch 2 titles map most of their memory twice plus GPU-only regions (title 1
+    // ran out of 16 GiB).
+    static constexpr size_t device_virtual_bits = 36;
     using DeviceInterface = typename VideoCore::RasterizerInterface;
     using DeviceMethods = MaxwellDeviceMethods;
 };

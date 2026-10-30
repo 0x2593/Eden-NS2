@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
@@ -15,6 +16,7 @@
 #include <bit>
 #include <numeric>
 #include "common/cityhash.h"
+#include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/thread_worker.h"
@@ -63,7 +65,7 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 18;
+constexpr u32 CACHE_VERSION = 37;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -493,6 +495,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
         .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
+        .support_buffer_texture_handles = profile.support_sampled_image_array_nonuniform_indexing,
     };
     host_info.ApplyDescriptorLimitPolicy();
 
@@ -644,6 +647,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        if (env.IsStale()) {
+            return;
+        }
 
         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
@@ -663,6 +669,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
+        if (std::ranges::any_of(envs, &FileEnvironment::IsStale)) {
+            return;
+        }
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
             (key.state.extended_dynamic_state_2 != 0) !=
@@ -766,10 +775,66 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     });
 }
 
+namespace {
+// EDEN_NX2_PIPELINE_DIFF=1: for a new graphics pipeline whose shaders an earlier one uses too,
+// log which parts of the fixed state differ from that one (finds state that splits the same
+// draws into many pipelines, each translated on the GPU thread).
+void ReportNewPipelineKey(const GraphicsPipelineCacheKey& key) {
+    static const bool enabled = std::getenv("EDEN_NX2_PIPELINE_DIFF") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static std::unordered_map<u64, GraphicsPipelineCacheKey> last_by_shaders;
+    static u32 logged{};
+    const u64 shaders = Common::CityHash64(reinterpret_cast<const char*>(key.unique_hashes.data()),
+                                           sizeof(key.unique_hashes));
+    const auto [it, first] = last_by_shaders.try_emplace(shaders, key);
+    if (first) {
+        return;
+    }
+    const FixedPipelineState& now = key.state;
+    const FixedPipelineState& before = it->second.state;
+    std::string diffs;
+    if (now.raw1 != before.raw1) diffs += fmt::format(" raw1^{:#x}", now.raw1 ^ before.raw1);
+    if (now.raw2 != before.raw2) diffs += fmt::format(" raw2^{:#x}", now.raw2 ^ before.raw2);
+    if (now.color_formats != before.color_formats) {
+        diffs += fmt::format(" color_formats {:02x} -> {:02x}", fmt::join(before.color_formats, ""),
+                             fmt::join(now.color_formats, ""));
+    }
+    if (now.alpha_test_ref != before.alpha_test_ref) {
+        diffs += fmt::format(" alpha_test_ref {:#x} -> {:#x} (func {})", before.alpha_test_ref,
+                             now.alpha_test_ref, now.alpha_test_func.Value());
+    }
+    if (now.point_size != before.point_size) {
+        diffs += fmt::format(" point_size {:#x} -> {:#x}", before.point_size, now.point_size);
+    }
+    if (now.viewport_swizzles != before.viewport_swizzles) diffs += " viewport_swizzles";
+    if (now.attribute_types != before.attribute_types) {
+        diffs += fmt::format(" attribute_types^{:#x}", now.attribute_types ^ before.attribute_types);
+    }
+    if (std::memcmp(&now.dynamic_state, &before.dynamic_state, sizeof(now.dynamic_state)) != 0) {
+        diffs += " dynamic_state";
+    }
+    if (now.driver_id != before.driver_id || now.driver_version != before.driver_version) {
+        diffs += " driver";
+    }
+    const size_t size = now.Size();
+    if (diffs.empty() && size > offsetof(FixedPipelineState, attachments)) {
+        diffs = fmt::format(" past attachments (key size {})", size);
+    }
+    it->second = key;
+    if (logged++ < 400) {
+        LOG_INFO(Render_Vulkan, "New pipeline for known shaders {:016x} differs in:{}", shaders,
+                 diffs.empty() ? std::string{" nothing in the key prefix"} : diffs);
+    }
+}
+} // Anonymous namespace
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
+        ReportNewPipelineKey(graphics_key);
         pipeline = CreateGraphicsPipeline();
     }
     if (!pipeline) {
@@ -786,7 +851,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    if (maxwell3d->GetNativeMacroEngine().native_turing || !use_asynchronous_shaders) {
+    if (!use_asynchronous_shaders) {
         return pipeline;
     }
     // If something is using depth, we can assume that games are not rendering anything which
@@ -801,6 +866,9 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6) {
         return pipeline;
     }
+    // The draw is dropped until the pipeline exists. Native draws are dropped on purpose here, so the
+    // rasterizer must not report them as failed native work.
+    draw_deferred = true;
     return nullptr;
 }
 
@@ -923,14 +991,50 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ++env_index;
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-        env.Dump(hash, key.unique_hashes[index]);
+        // Rebuilding the CFG for the dump can throw the same error again; never let that escape
+        // the handler, or a single bad shader terminates the emulator instead of skipping a draw.
+        try {
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+            env.Dump(hash, key.unique_hashes[index]);
+        } catch (const Shader::Exception&) {
+        }
     }
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
     return nullptr;
 }
 
+namespace {
+// Pipelines built on the GPU thread at run time (shader translation; the driver compile is on
+// workers): every one over 2 ms is logged, and the total every 10 s, to tell how much of the
+// stutter on new content is translation.
+void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin) {
+    static std::chrono::steady_clock::duration total{};
+    static u32 count{}, logged{};
+    static auto window = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - begin;
+    total += elapsed;
+    ++count;
+    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    if (elapsed > std::chrono::milliseconds{2} && logged < 400) {
+        ++logged;
+        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms", kind, ms(elapsed));
+    }
+    if (now - window > std::chrono::seconds{10}) {
+        LOG_INFO(Render_Vulkan, "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread",
+                 count, ms(total));
+        total = {};
+        count = 0;
+        window = now;
+    }
+}
+} // Anonymous namespace
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+    const auto begin = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        ReportRuntimePipeline("Graphics", begin);
+    };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
 
@@ -956,6 +1060,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
 std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+    const auto begin = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        ReportRuntimePipeline("Compute", begin);
+    };
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};

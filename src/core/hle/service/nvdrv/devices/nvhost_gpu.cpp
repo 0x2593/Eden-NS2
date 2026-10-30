@@ -90,6 +90,11 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
             return WrapFixedVariable(this, &nvhost_gpu::SubmitGPFIFOBase1, input, output, fd, true);
         case 0x1d:
             return WrapFixed(this, &nvhost_gpu::ChannelSetTimeslice, input, output);
+        case 0x1f:
+            if (UsesNativeAbi() && command.raw == 0xc008481f) {
+                return WrapFixed(this, &nvhost_gpu::SetPreemptionModes, input, output);
+            }
+            break;
         default:
             break;
         }
@@ -168,14 +173,6 @@ NvResult nvhost_gpu::ZCullBind(IoctlZCullBind& params) {
 NvResult nvhost_gpu::SetErrorNotifier(IoctlSetErrorNotifier& params) {
     LOG_WARNING(Service_NVDRV, "(STUBBED) called, offset={:X}, size={:X}, mem={:X}", params.offset,
                 params.size, params.mem);
-    // Like the host driver, clear the notifier when it is installed: NVN polls its status word and
-    // treats a non-zero value (here: whatever the buffer held before) as a channel error.
-    if (const auto handle = nvmap.GetHandle(params.mem);
-        handle && handle->address && params.size && params.size <= 0x10000 &&
-        params.offset + params.size <= handle->size) {
-        const std::vector<u8> zeros(params.size);
-        system.ApplicationMemory().WriteBlock(handle->address + params.offset, zeros.data(), zeros.size());
-    }
     return NvResult::Success;
 }
 
@@ -367,13 +364,6 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
         system.GPU().InitChannel(*channel_state, channel_state->program_id);
     }
 
-    if (UsesNativeAbi() && std::getenv("EDEN_NATIVE_SUBMIT_TRACE")) {
-        LOG_INFO(Service_NVDRV, "native submit trace channel={}, entries={}, flags={:#x}, fence={}:{}, first={:#x}/{}",
-                 channel_state->bind_id, entries.command_lists.size(), params.flags.raw, params.fence.id,
-                 params.fence.value,
-                 entries.command_lists.empty() ? 0 : static_cast<u64>(entries.command_lists[0].addr),
-                 entries.command_lists.empty() ? 0 : static_cast<u64>(entries.command_lists[0].size));
-    }
     if (UsesNativeAbi() && native_submit_logs++ < 8) {
         LOG_DEBUG(Service_NVDRV, "native submit channel={}, initialized={}, entries={}, flags={:#x}, fence={}:{}",
                   channel_state->bind_id, channel_state->initialized, entries.command_lists.size(),
@@ -505,6 +495,26 @@ NvResult nvhost_gpu::GetWaitbase(IoctlGetWaitbase& params) {
     return NvResult::Success;
 }
 
+NvResult nvhost_gpu::SetPreemptionModes(IoctlPreemptionModes& params) {
+    LOG_DEBUG(Service_NVDRV, "native preemption graphics={}, compute={}", params.graphics,
+              params.compute);
+    if (!channel_state->initialized) {
+        return NvResult::InvalidState;
+    }
+    // Zero retains the current mode. Context switches follow complete commands,
+    // satisfying both wait-for-idle and compute thread-block boundaries.
+    if (params.graphics > 1 || params.compute > 2) {
+        return NvResult::NotSupported;
+    }
+    if (params.graphics != 0) {
+        graphics_preemption_mode = params.graphics;
+    }
+    if (params.compute != 0) {
+        compute_preemption_mode = params.compute;
+    }
+    return NvResult::Success;
+}
+
 NvResult nvhost_gpu::ChannelSetTimeout(IoctlChannelSetTimeout& params) {
     LOG_INFO(Service_NVDRV, "called, timeout={:#x}", params.timeout);
 
@@ -541,7 +551,7 @@ Kernel::KEvent* nvhost_gpu::QueryEvent(u32 event_id) {
     }
 }
 
-NvResult nvhost_gpu::BindToTsg(DeviceFD group, Kernel::KProcess* process, std::shared_ptr<Tegra::NativeMacroContext> macros) {
+NvResult nvhost_gpu::BindToTsg(DeviceFD group, Kernel::KProcess* process, std::shared_ptr<Tegra::NativeMacroContext> macros, u32 subcontext) {
     const std::scoped_lock lock{tsg_mutex};
     if (tsg_group) { return NvResult::Busy; }
     bool owned{};
@@ -556,13 +566,14 @@ NvResult nvhost_gpu::BindToTsg(DeviceFD group, Kernel::KProcess* process, std::s
             channel_state->payload->maxwell_3d.SetNativeMacroContext(channel_state->native_macro_context);
         }
     }
+    tsg_subcontext = subcontext;
     tsg_group = group;
     return NvResult::Success;
 }
 
 void nvhost_gpu::UnbindFromTsg(DeviceFD group) {
     const std::scoped_lock lock{tsg_mutex};
-    if (tsg_group == group) { tsg_group.reset(); }
+    if (tsg_group == group) { tsg_group.reset(); tsg_subcontext = 0; }
 }
 
 bool nvhost_gpu::UsesNativeAbi() const {

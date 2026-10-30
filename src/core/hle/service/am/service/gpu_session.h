@@ -14,6 +14,7 @@ class KProcess;
 class KEvent;
 }
 namespace Service::Nvidia { class Module; }
+namespace Service::Nvidia::Devices { class nvhost_as_gpu; }
 namespace Service::AM {
 
 struct GpuDeviceRegistry;
@@ -23,6 +24,7 @@ public:
     IGpuSession(Core::System& system, std::shared_ptr<Nvidia::Module> module,
                 Kernel::KProcess* process);
     ~IGpuSession() override;
+    std::shared_ptr<Nvidia::Devices::nvhost_as_gpu> GetRegisteredAddressSpace(u32 id);
     Result RegisterAddressSpace(u32 id);
     Result HandleSyncRequest(Kernel::KServerSession& session, HLERequestContext& ctx) override;
 

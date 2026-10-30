@@ -313,15 +313,8 @@ Result KMemoryManager::AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 op
     KScopedLightLock lk(m_pool_locks[static_cast<size_t>(pool)]);
 
     // Allocate the page group.
-    if (const Result result = this->AllocatePageGroupImpl(out, num_pages, pool, dir,
-            m_has_optimized_process[static_cast<size_t>(pool)], true); result.IsError()) {
-        static u32 failures{};
-        if (failures++ < 16) {
-            LOG_WARNING(Kernel, "Page allocation failed: pool={}, pages={:#x}, result={:#x}",
-                        static_cast<u32>(pool), num_pages, result.raw);
-        }
-        R_RETURN(result);
-    }
+    R_TRY(this->AllocatePageGroupImpl(out, num_pages, pool, dir,
+                                      m_has_optimized_process[static_cast<size_t>(pool)], true));
 
     // Open the first reference to the pages.
     for (const auto& block : *out) {

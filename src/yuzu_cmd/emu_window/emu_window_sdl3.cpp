@@ -4,12 +4,17 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
+#include <array>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_timer.h>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
 
+#include <cstdlib>
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
@@ -33,13 +38,18 @@ EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Co
     titlebar_timer = SDL_AddTimer(2000, [](void *userdata, SDL_TimerID, Uint32) -> Uint32 {
         auto* this_ = (EmuWindow_SDL3*)userdata;
         auto const results = this_->system.GetAndResetPerfStats();
-        auto const title = fmt::format("{} | {}-{} | FPS: {:.0f} ({:.0f}%)", Common::g_build_fullname, Common::g_scm_branch, Common::g_scm_desc, results.average_game_fps, results.emulation_speed * 100.0f);
+        // EDEN_WINDOW_TITLE names the running game (set from the launch path when not given).
+        const char* const game = std::getenv("EDEN_WINDOW_TITLE");
+        auto const title = fmt::format("{}{}{}-{}-{} | FPS: {:.0f} ({:.0f}%)", game ? game : "", game ? " | " : "", Common::g_build_fullname, Common::g_scm_branch, Common::g_scm_desc, results.average_game_fps, results.emulation_speed * 100.0f);
         SDL_SetWindowTitle(this_->render_window, title.c_str());
         return 2000;
     }, this);
     mouse_timer = SDL_AddTimer(100, [](void *userdata, SDL_TimerID, Uint32) -> Uint32 {
         auto* this_ = (EmuWindow_SDL3*)userdata;
-        this_->input_subsystem->GetMouse()->NotifyChanged();
+        // The timer can fire before the input subsystem has created its mouse driver.
+        if (auto* const mouse = this_->input_subsystem->GetMouse()) {
+            mouse->NotifyChanged();
+        }
         return 100;
     }, this);
 }
@@ -115,7 +125,26 @@ void EmuWindow_SDL3::OnFingerUp() {
     input_subsystem->GetTouchScreen()->ReleaseAllTouch();
 }
 
+// Seconds since the first frame; shared by the key script (yuzu.cpp) and key recording.
+double Nx2KeyClockSeconds() {
+    static const auto begin = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+}
+
 void EmuWindow_SDL3::OnKeyEvent(int key, u8 state) {
+    // EDEN_NX2_KEY_RECORD=<file>: append each press/release ("seconds:code", "seconds:-code").
+    static std::FILE* const record = [] {
+        const char* path = std::getenv("EDEN_NX2_KEY_RECORD");
+        return path ? std::fopen(path, "w") : nullptr;
+    }();
+    static std::array<bool, 512> held{};
+    if (record && key >= 0 && key < static_cast<int>(held.size()) && held[key] != (state != 0)) {
+        held[key] = state != 0;
+        std::fprintf(record, "f%llu:%s%d,",
+                     static_cast<unsigned long long>(Core::g_nx2_present_count.load()),
+                     state != 0 ? "" : "-", key);
+        std::fflush(record);
+    }
     if (state != 0) {
         input_subsystem->GetKeyboard()->PressKey(static_cast<std::size_t>(key));
     } else {
@@ -201,6 +230,7 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
         is_shown = true;
         return OnResize();
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        LOG_INFO(Frontend, "Window close requested");
         is_open = false;
         return;
     case SDL_EVENT_KEY_DOWN:
@@ -224,6 +254,7 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
     case SDL_EVENT_FINGER_UP:
         return OnFingerUp();
     case SDL_EVENT_QUIT:
+        LOG_INFO(Frontend, "Quit requested");
         is_open = false;
         return;
     default:

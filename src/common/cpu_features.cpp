@@ -225,6 +225,13 @@ const CPUCaps g_cpu_caps = [] {
         }
     }
 
+    // AMD CPUs have no leaf 0x15 (Zen 4 stops at 0x10): measure their invariant TSC too, or every
+    // guest clock read (CNTPCT, which games read thousands of times a frame) goes through the
+    // host's much slower QueryPerformanceCounter.
+    if (caps.invariant_tsc && caps.tsc_frequency == 0) {
+        caps.tsc_frequency = X64::EstimateRDTSCFrequency();
+    }
+
     if (max_std_fn >= 0x16) {
         __cpuid(cpu_id, 0x16);
         caps.base_frequency = cpu_id[0];

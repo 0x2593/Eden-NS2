@@ -16,6 +16,7 @@
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
+#include "core/hle/service/nvdrv/devices/native_gpu_characteristics.h"
 
 namespace Service::Nvidia {
 
@@ -134,7 +135,17 @@ void NVDRV::Ioctl3(HLERequestContext& ctx) {
 
     const auto nv_result =
         nvdrv->Ioctl3(fd, command, input_buffer, output_buffer, inline_output_buffer);
-    if (command.raw == 0xc0e04705) {
+    if (nv_result == NvResult::Success && native_gpu_profile != 0 &&
+        (command.raw == 0xc0e04705 || command.raw == 0xc0e84705) && output_buffer.size() >= 0x88) {
+        // GPU profile negotiation is independent of the characteristics reply size.
+        Devices::ApplyNativeGpuProfile(
+            std::span<u8>{output_buffer.data() + 0x10, output_buffer.size() - 0x10},
+            native_gpu_profile);
+        Devices::ApplyNativeGpuProfile(
+            std::span<u8>{inline_output_buffer.data(), inline_output_buffer.size()},
+            native_gpu_profile);
+    }
+    if (command.raw == 0xc0e04705 || command.raw == 0xc0e84705) {
         LOG_DEBUG(Service_NVDRV, "native characteristics input={}, output={}, inline={}, result={}",
                   input_buffer.size(), output_buffer.size(), inline_output_buffer.size(),
                   static_cast<u32>(nv_result));
@@ -283,8 +294,9 @@ NVDRV::NVDRV(Core::System& system_, std::shared_ptr<Module> nvdrv_, const char* 
 }
 
 NVDRV::NVDRV(Core::System& system, std::shared_ptr<Module> module, const char* name,
-             Kernel::KProcess* process, u64 aruid)
+             Kernel::KProcess* process, u64 aruid, u32 gpu_profile)
     : NVDRV{system, std::move(module), name} {
+    native_gpu_profile = gpu_profile;
     session_id = nvdrv->GetContainer().OpenSession(process);
     pid = aruid;
     is_initialized = true;

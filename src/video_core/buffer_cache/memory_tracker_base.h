@@ -22,7 +22,7 @@ namespace VideoCommon {
 
 template <typename DeviceTracker>
 class MemoryTrackerBase {
-    static constexpr size_t MAX_CPU_PAGE_BITS = 34;
+    static constexpr size_t MAX_CPU_PAGE_BITS = 36; // device addresses (MaxwellDeviceTraits)
     static constexpr size_t HIGHER_PAGE_BITS = 22;
     static constexpr size_t HIGHER_PAGE_SIZE = 1ULL << HIGHER_PAGE_BITS;
     static constexpr size_t HIGHER_PAGE_MASK = HIGHER_PAGE_SIZE - 1ULL;

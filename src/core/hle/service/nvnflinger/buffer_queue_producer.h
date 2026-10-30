@@ -59,6 +59,7 @@ public:
 
 public:
     std::optional<Fence> GetReleasedBufferFence(s32 slot);
+    Status DetachReleasedBuffer(s32 slot);
     Status RequestBuffer(s32 slot, std::shared_ptr<GraphicBuffer>* buf);
     Status SetBufferCount(s32 buffer_count);
     Status DequeueBuffer(s32* out_slot, android::Fence* out_fence, bool async, u32 width,

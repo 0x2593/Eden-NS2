@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <deque>
 #include <span>
 
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -66,7 +67,14 @@ public:
 
     u64 GetDeviceMemoryUsage() const;
 
+    u64 GetDeviceMemoryBudget() const;
+
     bool CanReportMemoryUsage() const;
+
+    void LogMemoryStatistics() const;
+
+    /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
+    bool UseOpaqueAstcFormat() const;
 
     bool CanDownloadMsaa(const VideoCommon::ImageInfo& info) const;
 
@@ -157,6 +165,20 @@ public:
     BlitImageHelper& blit_image_helper;
     RenderPassCache& render_pass_cache;
     std::optional<ASTCDecoderPass> astc_decoder_pass;
+    std::optional<BcEncoderPass> bc_encoder_pass;
+
+    /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
+    /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
+    void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
+                            std::span<const VideoCommon::SwizzleParameters> swizzles);
+
+    /// Temporary decode images, freed once the GPU is past `tick`.
+    struct PendingTranscode {
+        u64 tick;
+        vk::Image image;
+        std::vector<vk::ImageView> views;
+    };
+    std::deque<PendingTranscode> pending_transcodes;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;

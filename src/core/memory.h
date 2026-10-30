@@ -38,6 +38,9 @@ class MemoryManager;
 
 namespace Core::Memory {
 
+/// Counts unmapped reads on this host thread since the CPU callbacks last checked (debug aid).
+u32& UnmappedReadFlag();
+
 /**
  * Page size used by the ARM architecture. This is the smallest granularity with which memory can
  * be mapped.

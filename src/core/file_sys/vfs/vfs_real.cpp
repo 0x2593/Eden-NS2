@@ -20,6 +20,10 @@
 // For FileTimeStampRaw
 #include <sys/stat.h>
 
+#ifdef _WIN32
+#include <cstdio> // _getmaxstdio
+#endif
+
 #ifdef _MSC_VER
 #define stat _stat64
 #endif
@@ -34,20 +38,13 @@ namespace FS = Common::FS;
 
 namespace {
 
-constexpr size_t MaxOpenFiles = 8192;
-
-// The frontend raises the C runtime's stream limit, but MSVCRT (MinGW) caps it at 2048. Keep the
-// cache below whatever limit is in effect, leaving room for logs, configs and save data.
-size_t OpenFileLimit() {
+size_t GetMaxOpenFiles() {
 #ifdef _WIN32
-    static const size_t limit = [] {
-        const int streams = _getmaxstdio();
-        return streams > 512 ? std::min<size_t>(MaxOpenFiles, static_cast<size_t>(streams) - 256)
-                             : size_t{256};
-    }();
-    return limit;
+    // Leave stdio slots for logs, module files, and callers outside the VFS cache.
+    const size_t limit = static_cast<size_t>(_getmaxstdio());
+    return std::min(size_t{8192}, limit > 64 ? limit - 64 : size_t{1});
 #else
-    return MaxOpenFiles;
+    return 8192;
 #endif
 }
 
@@ -267,7 +264,7 @@ void RealVfsFilesystem::DropReference(std::unique_ptr<FileReference>&& reference
 }
 
 void RealVfsFilesystem::EvictSingleReferenceLocked() {
-    if (num_open_files < OpenFileLimit() || open_references.empty()) {
+    if (num_open_files < GetMaxOpenFiles() || open_references.empty()) {
         return;
     }
 

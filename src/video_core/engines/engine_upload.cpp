@@ -9,6 +9,7 @@
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "video_core/engines/engine_upload.h"
+#include "video_core/gpu_write_watch.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -29,6 +30,7 @@ void State::ProcessExec(const bool is_linear_) {
     write_offset = 0;
     flushed_offset = 0;
     copy_size = regs.line_length_in * regs.line_count;
+    GPU_WRITE_WATCH("inline upload", regs.dest.Address(), copy_size, "");
     inner_buffer.resize_destructive(copy_size);
     is_linear = is_linear_;
 }

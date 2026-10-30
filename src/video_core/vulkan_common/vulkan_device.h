@@ -963,6 +963,9 @@ FN_MAX_LIMIT_LIST
 
     u64 GetDeviceMemoryUsage() const;
 
+    /// The driver's current memory budget for this process (VK_EXT_memory_budget), 0 without it.
+    u64 GetDeviceMemoryBudget() const;
+
     u32 GetSetsPerPool() const {
         return sets_per_pool;
     }
@@ -1145,7 +1148,7 @@ private:
 
 private:
     VkInstance instance;         ///< Vulkan instance.
-    VmaAllocator allocator;      ///< VMA allocator.
+    VmaAllocator allocator{};    ///< VMA allocator.
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.

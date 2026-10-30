@@ -17,6 +17,8 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/dlss_trace.h"
+#include "core/hle/guest_hooks.h"
 #include "core/loader/deconstructed_rom_directory.h"
 #include "core/loader/nso.h"
 
@@ -269,6 +271,13 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         next_load_addr = *tentative_next_load_addr;
         modules.insert_or_assign(load_addr, module);
         LOG_DEBUG(Loader, "loaded module {} @ {:#x}", module, load_addr);
+        Core::HLE::DlssTrace::InstallModule(process, module, load_addr, next_load_addr - load_addr);
+        NSOHeader nso_header{};
+        if (module_file->ReadObject(&nso_header) == sizeof(nso_header)) {
+            Core::HLE::GuestHooks::InstallModule(process, module, load_addr,
+                                                 next_load_addr - load_addr,
+                                                 nso_header.segments[0].size);
+        }
     }
 
     is_loaded = true;

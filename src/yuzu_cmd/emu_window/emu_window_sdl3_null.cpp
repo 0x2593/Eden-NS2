@@ -31,7 +31,7 @@ EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(InputCommon::InputSubsystem* input_subs
     render_window =
         SDL_CreateWindow(window_title.c_str(), Layout::ScreenUndocked::Width,
                          Layout::ScreenUndocked::Height,
-                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | Nx2HiddenWindowFlags());
 
     SetWindowIcon();
 

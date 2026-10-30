@@ -3,9 +3,11 @@
 
 #pragma once
 
-#include <mutex>
+#include <atomic>
+#include <mutex> // Kernel headers that use std::mutex get it through this one
 
 #include "common/common_funcs.h"
+#include "common/common_types.h"
 #include "core/hle/kernel/k_scoped_lock.h"
 
 namespace Kernel {
@@ -22,7 +24,11 @@ public:
     bool TryLock();
 
 private:
-    std::mutex m_lock;
+    // 0 free, 1 held, 2 held with (possible) sleepers. The scheduler lock is taken by every
+    // core thousands of times a frame and held for microseconds: a contended Lock spins briefly
+    // before sleeping, instead of putting the host thread to sleep at once and paying its
+    // wake-up latency (std::mutex did).
+    std::atomic<u32> m_state{0};
 };
 
 // TODO(bunnei): Alias for now, in case we want to implement these accurately in the future.

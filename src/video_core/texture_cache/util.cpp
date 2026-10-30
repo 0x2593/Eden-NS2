@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -603,6 +604,10 @@ u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept {
     return NumBlocksPerLayer(info, tile_size) * info.resources.layers * BytesPerBlock(info.format);
 }
 
+bool AstcDataLooksOpaque(std::span<const u8> data) noexcept {
+    return Tegra::Texture::ASTC::IsOpaque(data);
+}
+
 u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept {
     if (info.type == ImageType::Buffer) {
         return info.size.width * BytesPerBlock(info.format);
@@ -611,8 +616,10 @@ u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept {
     if (IsPixelFormatASTC(info.format) && Settings::values.astc_recompression.GetValue() !=
                                               Settings::AstcRecompression::Uncompressed) {
         const u32 bpp_div =
-            Settings::values.astc_recompression.GetValue() == Settings::AstcRecompression::Bc1 ? 2
-                                                                                               : 1;
+            Settings::values.astc_recompression.GetValue() == Settings::AstcRecompression::Bc1 ||
+                    info.astc_opaque
+                ? 2
+                : 1;
         // NumBlocksPerLayer doesn't account for this correctly, so we have to do it manually.
         u32 output_size = 0;
         for (s32 i = 0; i < info.resources.levels; i++) {
@@ -922,6 +929,35 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
     return copies;
 }
 
+void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
+    // Same offsets and sizes as ConvertImage below.
+    const auto recompression = Settings::values.astc_recompression.GetValue();
+    const bool astc = IsPixelFormatASTC(info.format);
+    u64 output_offset = 0;
+    for (BufferImageCopy& copy : copies) {
+        const Extent3D mip_size = AdjustMipSize(info.size, copy.image_subresource.base_level);
+        const u64 layers = static_cast<u64>(copy.image_subresource.num_layers) * copy.image_extent.depth;
+        u64 size;
+        if (astc && recompression == Settings::AstcRecompression::Uncompressed) {
+            size = u64{copy.image_extent.width} * copy.image_extent.height * layers *
+                   BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
+        } else if (astc) {
+            const u64 bpp_div =
+                recompression == Settings::AstcRecompression::Bc1 || info.astc_opaque ? 2 : 1;
+            size = u64{Common::AlignUp(copy.image_extent.width, 4U)} *
+                   Common::AlignUp(copy.image_extent.height, 4U) * layers / bpp_div;
+        } else {
+            size = u64{copy.image_extent.width} * copy.image_extent.height * layers *
+                   ConvertedBytesPerBlock(info.format);
+        }
+        copy.buffer_offset = output_offset;
+        copy.buffer_size = size;
+        copy.buffer_row_length = mip_size.width;
+        copy.buffer_image_height = mip_size.height;
+        output_offset += size;
+    }
+}
+
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies) {
     u32 output_offset = 0;
@@ -955,10 +991,11 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
         } else if (astc) {
             // BC1 uses 0.5 bytes per texel
             // BC3 uses 1 byte per texel
-            const auto compress = recompression_setting == Settings::AstcRecompression::Bc1
-                                      ? Tegra::Texture::BCN::CompressBC1
-                                      : Tegra::Texture::BCN::CompressBC3;
-            const auto bpp_div = recompression_setting == Settings::AstcRecompression::Bc1 ? 2 : 1;
+            const bool bc1 =
+                recompression_setting == Settings::AstcRecompression::Bc1 || info.astc_opaque;
+            const auto compress =
+                bc1 ? Tegra::Texture::BCN::CompressBC1 : Tegra::Texture::BCN::CompressBC3;
+            const auto bpp_div = bc1 ? 2 : 1;
 
             const u32 plane_dim = copy.image_extent.width * copy.image_extent.height;
             const u32 level_size = plane_dim * copy.image_extent.depth *
@@ -1298,6 +1335,13 @@ void DeduceBlitImages(ImageInfo& dst_info, ImageInfo& src_info, const ImageBase*
 }
 
 u32 MapSizeBytes(const ImageBase& image) {
+    if (True(image.flags & ImageFlagBits::AcceleratedUpload) && image.host_level_offset != 0) {
+        // Each layer's mip chain from host_level_offset on (see UploadImageContents).
+        const auto uploads = FullUploadSwizzles(image.info);
+        const u32 tail = image.info.layer_stride -
+                         static_cast<u32>(uploads[image.host_level_offset].buffer_offset);
+        return tail * image.info.resources.layers;
+    }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
         return image.guest_size_bytes;
     } else if (True(image.flags & ImageFlagBits::Converted)) {

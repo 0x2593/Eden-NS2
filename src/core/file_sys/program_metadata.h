@@ -72,6 +72,10 @@ public:
                     KernelCapabilityDescriptors capabilities);
 
     bool Is64BitProgram() const;
+    /// True when the NPDM uses the Switch 2 ACID layout.
+    bool IsSwitch2() const {
+        return is_switch2;
+    }
     ProgramAddressSpaceType GetAddressSpaceType() const;
     u8 GetMainThreadPriority() const;
     u8 GetMainThreadCore() const;
@@ -181,6 +185,7 @@ private:
     bool uses_extended_acid{};
     AciHeader aci_header{};
     AcidHeader acid_header{};
+    bool is_switch2{};
 
     FileAccessControl acid_file_access{};
     FileAccessHeader aci_file_access{};

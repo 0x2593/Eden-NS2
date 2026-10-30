@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <chrono>
 #include <filesystem>
@@ -752,9 +753,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             .flags = flags,
             .physicalDevice = physical,
             .device = *logical,
-            .preferredLargeHeapBlockSize = is_integrated
-                                           ? (64u * 1024u * 1024u)
-                                           : (256u * 1024u * 1024u),
+            // 64 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
+            // texture sizes left ~38% of the image blocks empty (2 GB of an 8 GB card in title
+            // 1), which the texture cache counted as used and kept evicting textures for.
+            .preferredLargeHeapBlockSize = 64u * 1024u * 1024u,
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = nullptr,
@@ -1608,6 +1610,33 @@ u64 Device::GetDeviceMemoryUsage() const {
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
         result += budget.heapUsage[heap];
+    }
+    // Space in VMA's blocks that no allocation uses counts as used, but freeing an image gives
+    // its share back only once its whole block is empty: the caches, collecting until this drops,
+    // evicted thousands of textures in a row without lowering it (title 1). Count only what
+    // allocations use.
+    if (allocator != nullptr) {
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+        for (const size_t heap : valid_heap_memory) {
+            const VmaStatistics& statistics = heap_budgets[heap].statistics;
+            const u64 unused = statistics.blockBytes - statistics.allocationBytes;
+            result -= (std::min)(result, unused);
+        }
+    }
+    return result;
+}
+
+u64 Device::GetDeviceMemoryBudget() const {
+    if (!extensions.memory_budget) {
+        return 0;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    physical.GetMemoryProperties(&budget);
+    u64 result{};
+    for (const size_t heap : valid_heap_memory) {
+        result += budget.heapBudget[heap];
     }
     return result;
 }

@@ -103,7 +103,9 @@ namespace Vulkan {
 
         MemoryAllocator(const MemoryAllocator &) = delete;
 
-        vk::Image CreateImage(const VkImageCreateInfo &ci) const;
+        /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
+        /// images would otherwise leave holes in the shared blocks).
+        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
@@ -141,5 +143,8 @@ namespace Vulkan {
         VkDeviceSize buffer_image_granularity;            ///< Adjacent buffer/image granularity
         u32 valid_memory_types{~0u};
     };
+
+    /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
+    void LogMemoryStatistics(const Device& device);
 
 } // namespace Vulkan

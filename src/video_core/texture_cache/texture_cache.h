@@ -6,7 +6,13 @@
 
 #pragma once
 
+#include "video_core/native_diagnostics.h"
+#include "video_core/native_texture_capture.h"
+#include <algorithm>
+#include <cstdlib>
 #include <limits>
+#include <map>
+#include <vector>
 #include <optional>
 #include <bit>
 #include "common/container/unordered_map.h"
@@ -24,6 +30,7 @@
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
@@ -76,6 +83,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
         critical_memory = DEFAULT_CRITICAL_MEMORY + 1_GiB;
         minimum_memory = 0;
     }
+    ApplyThresholdOverrides();
 
     const bool gpu_unswizzle_enabled = Settings::values.gpu_unswizzle_enabled.GetValue();
 
@@ -123,6 +131,12 @@ void TextureCache<P>::RunGarbageCollector() {
         high_priority_mode = total_used_memory >= expected_memory;
         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
+        // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
+        static const u64 min_age = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        }();
+        ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode](ImageId image_id) {
@@ -144,10 +158,12 @@ void TextureCache<P>::RunGarbageCollector() {
             image.DownloadMemory(map, copies);
             runtime.Finish();
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            ++gc_download_deletes;
         }
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
         }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (aggressive_mode && total_used_memory < critical_memory) {
@@ -168,10 +184,118 @@ void TextureCache<P>::RunGarbageCollector() {
 }
 
 template <class P>
+void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+    // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
+    for (const auto& [name, target] : {std::pair{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory},
+                                       std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
+        if (const char* value = std::getenv(name)) {
+            *target = std::strtoull(value, nullptr, 10) << 20;
+        }
+    }
+    if (log) {
+        LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
+                 expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
+    }
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
+        // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
+        // sat in aggressive mode evicting decoded ASTC (and decoding it again). Total use is
+        // measured from the driver, so collect only near the device budget instead.
+        if (!native_thresholds_applied && gpu_memory != nullptr && gpu_memory->UsesNativeTiling()) {
+            native_thresholds_applied = true;
+            const u64 device_local = runtime.GetDeviceLocalMemory();
+            critical_memory = (std::max)(critical_memory, device_local - 256_MiB);
+            expected_memory = (std::max)(expected_memory, device_local - 1280_MiB);
+            ApplyThresholdOverrides();
+            native_critical_memory = critical_memory;
+            native_expected_memory = expected_memory;
+        }
+        // Follow the driver's budget (re-read now and then): it shrinks when other programs use
+        // VRAM (another game: 7.0 -> 6.4 GB), and collecting only past it means the driver pages
+        // textures out. It is also the room to use: Eden's device memory figure is capped near
+        // 7 GB, which on a 12 GB card (11.2 GB budget) kept title 1 evicting textures with 3 GB
+        // unused. EDEN_NX2_TC_*_MIB overrides still win.
+        if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+            if (native_thresholds_applied && budget_check_frames++ % 60 == 0) {
+                const u64 budget = runtime.GetDeviceMemoryBudget();
+                if (budget > 2_GiB) {
+                    const u64 old_critical = critical_memory;
+                    critical_memory = budget - 768_MiB;
+                    expected_memory = budget - 1536_MiB;
+                    // Log only real changes (the budget moves by a few MiB all the time).
+                    const u64 change = critical_memory > old_critical
+                                           ? critical_memory - old_critical
+                                           : old_critical - critical_memory;
+                    ApplyThresholdOverrides(change >= 256_MiB);
+                }
+            }
+        }
+    }
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
+    }
+    // Every 600 frames: device memory in use against the collector's thresholds, and what the
+    // images themselves account for (VRAM pressure makes the collector thrash).
+    if (static u64 frames{}; ++frames % 600 == 0) {
+        u64 image_bytes{};
+        size_t images{};
+        std::vector<std::pair<u64, const Image*>> largest;
+        std::map<u32, std::pair<u64, u32>> by_format;
+        for (const auto [image_id, image] : slot_images) {
+            const u64 bytes = GetScaledImageSizeBytes(*image);
+            image_bytes += bytes;
+            ++images;
+            largest.emplace_back(bytes, image);
+            auto& format = by_format[static_cast<u32>(image->info.format)];
+            format.first += bytes;
+            ++format.second;
+        }
+        LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
+                 total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
+                 image_bytes >> 20);
+        std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
+                          largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
+            const Image& image = *largest[i].second;
+            LOG_INFO(HW_GPU, "  {} MiB: {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
+                     largest[i].first >> 20, image.gpu_addr, image.info.size.width, image.info.size.height,
+                     image.info.size.depth, image.info.resources.layers, image.info.resources.levels,
+                     static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
+                     static_cast<u32>(image.flags));
+        }
+        std::vector<std::pair<u64, u32>> formats;
+        for (const auto& [format, total] : by_format) formats.emplace_back(total.first, format);
+        std::sort(formats.rbegin(), formats.rend());
+        for (size_t i = 0; i < std::min<size_t>(8, formats.size()); ++i) {
+            LOG_INFO(HW_GPU, "  format {}: {} MiB in {} images", formats[i].second, formats[i].first >> 20,
+                     by_format[formats[i].second].second);
+        }
+        if constexpr (requires { runtime.LogMemoryStatistics(); }) {
+            runtime.LogMemoryStatistics();
+        }
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+                 images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
+                 gc_download_deletes,
+                 async_decodes_queued, astc_opaque_images, astc_alpha_images);
+        astc_opaque_images = astc_alpha_images = 0;
+        std::vector<std::pair<u32, u64>> shapes;
+        for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
+        std::sort(shapes.rbegin(), shapes.rend());
+        for (size_t i = 0; i < std::min<size_t>(10, shapes.size()); ++i) {
+            const u64 key = shapes[i].second;
+            LOG_INFO(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
+                     shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
+                     (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
+                     created_shapes[key].second);
+        }
+        created_shapes.clear();
+        gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+        images_created = images_deleted = 0;
     }
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
@@ -217,6 +341,7 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
 
 template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
+    const bool capture = !compute && gpu_memory->UsesNativeTiling() && BeginNativeTextureCapture();
     bool has_blacklisted = false;
     do {
         has_deleted_images = false;
@@ -225,6 +350,13 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         }
         for (ImageViewInOut& view : views) {
             view.id = VisitImageView(view.index, compute);
+            if (capture && view.id != NULL_IMAGE_VIEW_ID) {
+                const ImageViewBase& image_view = slot_image_views[view.id];
+                if (!image_view.IsBuffer() && image_view.image_id) {
+                    const auto [descriptor, unused] = channel_state->graphics_image_table.Read(*gpu_memory, view.index);
+                    CaptureNativeTexture(*gpu_memory, view.index, descriptor, image_view, slot_images[image_view.image_id]);
+                }
+            }
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -315,6 +447,7 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
     }
     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
     auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    if (!compute && gpu_memory->UsesNativeTiling()) CaptureNativeSampler(index, descriptor);
     if (is_new) {
         auto const id = FindSampler(descriptor, compute);
         channel_state->sampler_ids.insert_or_assign(map_index, id);
@@ -597,7 +730,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
 
 template <class P>
 bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
-    if (!image.IsSafeGpuCopy()) {
+    if (!image.IsSafeGpuCopy() || True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
         return false;
     }
     if (image.info.num_samples == 1) {
@@ -608,6 +741,74 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
     } else {
         return false;
     }
+}
+
+// Diagnostic readback only: preserve guest memory and image modification flags.
+template <class P>
+bool TextureCache<P>::CaptureNativeGpuTexture(std::span<const ImageViewInOut> views) {
+    if (!NativeDrawDiagnosticsEnabled() || !gpu_memory->UsesNativeTiling()) return false;
+    static thread_local u32 wanted{};
+    static thread_local GPUVAddr wanted_gpu{};
+    static thread_local u32 remaining{};
+    std::ifstream request("native-gpu-texture.request");
+    if (request) {
+        wanted_gpu = 0;
+        bool valid{};
+        if (request.peek() == 'g') {
+            std::string kind;
+            valid = static_cast<bool>(request >> kind >> std::hex >> wanted_gpu) && kind == "gpu" && wanted_gpu != 0;
+        } else {
+            valid = static_cast<bool>(request >> wanted);
+        }
+        request.close();
+        std::error_code error;
+        std::filesystem::remove("native-gpu-texture.request", error);
+        remaining = valid ? 512 : 0;
+    }
+    if (!remaining) return false;
+    --remaining;
+    for (const auto& binding : views) {
+        if ((!wanted_gpu && binding.index != wanted) || binding.id == NULL_IMAGE_VIEW_ID) continue;
+        const auto& view = slot_image_views[binding.id];
+        if (view.IsBuffer() || !view.image_id) continue;
+        Image& image = slot_images[view.image_id];
+        if (wanted_gpu && image.gpu_addr != wanted_gpu) continue;
+        wanted = binding.index;
+        const auto& info = image.info;
+        // Restrict this first probe to the unchanged native image format and size.
+        if (info.num_samples != 1 || info.resources.levels != 1 || info.resources.layers != 1 ||
+            info.type != ImageType::e2D || True(image.flags & (ImageFlagBits::Converted |
+                ImageFlagBits::Rescaled | ImageFlagBits::IsDecoding)) ||
+            !image.unswizzled_size_bytes || image.unswizzled_size_bytes > 64 * 1024 * 1024) continue;
+        remaining = 0;
+        const std::string prefix = "native-gpu-texture-" + std::to_string(wanted);
+        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+        const auto copies = FullDownloadCopies(info);
+        image.DownloadMemory(map, copies);
+        runtime.Finish();
+        NativeTextureCapture::Write(prefix + ".linear.bin", map.mapped_span.data(), image.unswizzled_size_bytes);
+        std::ofstream metadata(prefix + ".txt");
+        metadata << "index " << wanted << "\ngpu " << std::hex << image.gpu_addr << std::dec
+                 << "\npixel_format " << static_cast<u32>(info.format)
+                 << "\nview_format " << static_cast<u32>(view.format)
+                 << "\nflags " << static_cast<u32>(image.flags)
+                 << "\nsize " << info.size.width << ' ' << info.size.height << ' ' << info.size.depth
+                 << "\nview_range " << view.range.base.level << ' ' << view.range.base.layer << ' '
+                 << view.range.extent.levels << ' ' << view.range.extent.layers << '\n';
+        if constexpr (requires { view.Swizzle(); image.Handle(); }) {
+            const auto& mapping = view.Swizzle();
+            metadata << "image_handle " << image.Handle() << "\nview_image_handle " << view.ImageHandle()
+                     << "\ncomponent_mapping " << mapping.r << ' ' << mapping.g << ' ' << mapping.b << ' ' << mapping.a << '\n';
+        }
+        for (const auto& copy : copies)
+            metadata << "copy " << copy.buffer_offset << ' ' << copy.buffer_size << ' '
+                     << copy.buffer_row_length << ' ' << copy.buffer_image_height << ' '
+                     << copy.image_subresource.base_level << ' ' << copy.image_subresource.base_layer << ' '
+                     << copy.image_subresource.num_layers << ' ' << copy.image_extent.width << ' '
+                     << copy.image_extent.height << ' ' << copy.image_extent.depth << '\n';
+        return true;
+    }
+    return false;
 }
 
 template <class P>
@@ -714,6 +915,14 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
 
     Image& dst_image = slot_images[dst_id];
     Image& src_image = slot_images[src_id];
+    if (True(dst_image.flags & ImageFlagBits::Unbacked)) {
+        static u32 logged{};
+        if (logged++ < 64) {
+            LOG_INFO(HW_GPU, "2D blit into unbacked image {:#x}: dst {:#x} {}x{} from {:#x} {}x{}",
+                     dst_image.gpu_addr, dst.Address(), dst.width, dst.height, src.Address(),
+                     src.width, src.height);
+        }
+    }
     bool is_src_rescaled = True(src_image.flags & ImageFlagBits::Rescaled);
     bool is_dst_rescaled = True(dst_image.flags & ImageFlagBits::Rescaled);
 
@@ -803,9 +1012,7 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
     if (it == page_table.end()) {
         return {};
     }
-    // Debug: EDEN_NATIVE_DISPLAY_OVERRIDE shows an arbitrary render target, in its own format.
-    static const bool any_format = std::getenv("EDEN_NATIVE_DISPLAY_OVERRIDE") != nullptr;
-    auto view_format = [&]() {
+    const auto view_format = [&]() {
         switch (config.pixel_format) {
         case Service::android::PixelFormat::Rgb565:
             return PixelFormat::R5G6B5_UNORM;
@@ -827,12 +1034,9 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         if (image.image_view_ids.empty()) {
             continue;
         }
-        if (any_format && valid_image_ids.empty()) {
-            view_format = image.info.format;
-        }
         if (!VideoCore::Surface::IsViewCompatible(image.info.format, view_format, false, true)) {
             static u32 rejected_alias_count{};
-            if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") && rejected_alias_count++ < 8) {
+            if (VideoCommon::NativeDrawDiagnosticsEnabled() && rejected_alias_count++ < 8) {
                 LOG_WARNING(HW_GPU, "Ignoring incompatible framebuffer alias: address={:#x}, image={}, view={}",
                             cpu_addr, image.info.format, view_format);
             }
@@ -873,6 +1077,11 @@ bool TextureCache<P>::HasUncommittedFlushes() const noexcept {
 }
 
 template <class P>
+bool TextureCache<P>::HasAsyncFlushWork() const noexcept {
+    return !uncommitted_downloads.empty() || !uncommitted_async_buffers.empty();
+}
+
+template <class P>
 bool TextureCache<P>::ShouldWaitAsyncFlushes() const noexcept {
     return !committed_downloads.empty() && !committed_downloads.front().empty();
 }
@@ -903,7 +1112,7 @@ void TextureCache<P>::CommitAsyncFlushes() {
         }
 
         if (any_none_dma) {
-            if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") && total_size_bytes >= 64_MiB) {
+            if (VideoCommon::NativeDrawDiagnosticsEnabled() && total_size_bytes >= 64_MiB) {
                 LOG_WARNING(HW_GPU, "Large image readback batch: bytes={}, entries={}, duplicates_removed={}, submitted_batches={}, retained_buffers={}",
                             total_size_bytes, download_ids.size(), redundant_images,
                             committed_downloads.size(), async_buffers_death_ring.size());
@@ -1146,10 +1355,17 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         // Only upload modified images
         return;
     }
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
     TrackImage(image, image_id);
+
+    if (True(image.flags & ImageFlagBits::Unbacked)) {
+        // Nothing to upload into (and staging it could take tens of GB).
+        runtime.TransitionImageLayout(image);
+        return;
+    }
 
     if (image.info.num_samples > 1 && !runtime.CanUploadMSAA()) {
         LOG_WARNING(HW_GPU, "MSAA image uploads are not implemented");
@@ -1185,6 +1401,24 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
     const std::span<u8> mapped_span = staging.mapped_span;
     const GPUVAddr gpu_addr = image.gpu_addr;
 
+    if (True(image.flags & ImageFlagBits::AcceleratedUpload) && image.host_level_offset != 0) {
+        // Only levels >= host_level_offset exist on the host: read each layer's tail of the mip
+        // chain into a compact buffer (layer stride = that tail's size) and decode those levels.
+        auto uploads = FullUploadSwizzles(image.info);
+        const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
+        const size_t tail = image.info.layer_stride - level_offset;
+        for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
+            gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
+                                  mapped_span.data() + layer * tail, tail,
+                                  VideoCommon::CacheType::NoTextureCache);
+        }
+        uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
+        for (auto& upload : uploads) {
+            upload.buffer_offset -= level_offset;
+        }
+        runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
+        return;
+    }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
         gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
                               VideoCommon::CacheType::NoTextureCache);
@@ -1209,7 +1443,7 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
 template <class P>
 ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const bool native = gpu_memory->UsesNativeTiling();
-    if (native && raw_config.BaseLayer() && std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
+    if (native && raw_config.BaseLayer() && VideoCommon::NativeDrawDiagnosticsEnabled()) {
         static u32 texture_view_traces{};
         if (texture_view_traces++ < 8) {
             LOG_WARNING(HW_GPU, "Native texture view header: address={:#x}, dimensions={}x{}x{}, type={}, legacy_layer={}, raw={:016x}/{:016x}/{:016x}/{:016x}",
@@ -1220,17 +1454,6 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const TICEntry config = TextureViewHeader(raw_config, native);
     const ImageInfo info(config);
-    static const bool tic_trace = std::getenv("EDEN_NATIVE_TIC_TRACE") != nullptr;
-    static u32 tic_traces{};
-    if (native && tic_trace && tic_traces++ < 20000) {
-        LOG_INFO(HW_GPU, "Native TIC: address={:#x}, {}x{}x{}, type={}, format={}, swizzle={}{}{}{}, header={}, levels={}, raw={:016x}/{:016x}/{:016x}/{:016x}",
-                 config.Address(), config.Width(), config.Height(), config.Depth(),
-                 static_cast<u32>(config.texture_type.Value()), info.format,
-                 static_cast<u32>(config.x_source.Value()), static_cast<u32>(config.y_source.Value()),
-                 static_cast<u32>(config.z_source.Value()), static_cast<u32>(config.w_source.Value()),
-                 static_cast<u32>(config.header_version.Value()), config.max_mip_level.Value(),
-                 config.raw[0], config.raw[1], config.raw[2], config.raw[3]);
-    }
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
@@ -1239,11 +1462,6 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
     const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
     if (!image_id) {
-        if (native && tic_trace) {
-            LOG_WARNING(HW_GPU, "Native TIC has no image: address={:#x}, mapped={}, format={}, type={}",
-                        image_gpu_addr, gpu_memory->GpuToCpuAddress(image_gpu_addr).has_value(),
-                        info.format, static_cast<u32>(info.type));
-        }
         return NULL_IMAGE_VIEW_ID;
     }
     ImageBase& image = slot_images[image_id];
@@ -1269,12 +1487,9 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
 template <class P>
 ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                    RelaxedOptions options) {
-    std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    const std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
-        cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
-        if (!cpu_addr) {
-            return ImageId{};
-        }
+        return ImageId{};
     }
     const bool broken_views =
         runtime.HasBrokenTextureViewFormats() || True(options & RelaxedOptions::ForceBrokenViews);
@@ -1400,9 +1615,10 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
 template <class P>
 void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
-    LOG_INFO(HW_GPU, "Queuing async texture decode");
+    LOG_DEBUG(HW_GPU, "Queuing async texture decode {:#x}", image.gpu_addr);
 
     image.flags |= ImageFlagBits::IsDecoding;
+    ++async_decodes_queued;
     auto decode = std::make_unique<AsyncDecodeContext>();
     auto* decode_ptr = decode.get();
     decode->image_id = image_id;
@@ -1412,6 +1628,18 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
     const size_t out_size = MapSizeBytes(image);
+    if (False(image.flags & ImageFlagBits::ZeroFilled)) {
+        // Until the decode lands (a second or more while title 1 streams ~40 textures a second)
+        // a new image showed whatever its memory last held, often other textures. Zero blocks
+        // read as opaque black (BC1) or transparent (BC3) instead.
+        image.flags |= ImageFlagBits::ZeroFilled;
+        auto zero_copies = copies;
+        ConvertedLayout(image.info, zero_copies);
+        auto staging = runtime.UploadStagingBuffer(out_size);
+        std::memset(staging.mapped_span.data(), 0, out_size);
+        image.UploadMemory(staging, zero_copies);
+        runtime.InsertUploadMemoryBarrier();
+    }
 
     auto func = [out_size, copies, info = image.info,
                  input = std::move(local_unswizzle_data_buffer),
@@ -1448,12 +1676,26 @@ void TextureCache<P>::TickAsyncDecode() {
     auto i = async_decodes.begin();
     while (i != async_decodes.end()) {
         auto* async_decode = i->get();
-        std::unique_lock lock{async_decode->mutex};
-        if (!async_decode->complete) {
-            ++i;
+        {
+            // Release the lock before the context is erased below: unlocking it afterwards wrote
+            // into freed memory (heap corruption, crashes minutes into title 1).
+            std::unique_lock lock{async_decode->mutex};
+            if (!async_decode->complete) {
+                ++i;
+                continue;
+            }
+        }
+        if (async_decode->cancelled) {
+            i = async_decodes.erase(i);
             continue;
         }
         Image& image = slot_images[async_decode->image_id];
+        if (async_decode->decoded_data.size() > MapSizeBytes(image)) {
+            LOG_ERROR(HW_GPU, "Async decode of {} bytes for a {}-byte image at {:#x}, dropped",
+                      async_decode->decoded_data.size(), MapSizeBytes(image), image.gpu_addr);
+            i = async_decodes.erase(i);
+            continue;
+        }
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
                     async_decode->decoded_data.size());
@@ -1569,17 +1811,31 @@ bool TextureCache<P>::ScaleDown(Image& image) {
 }
 
 template <class P>
+std::optional<DAddr> TextureCache<P>::ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const {
+    if (const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+        return cpu_addr;
+    }
+    if (const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr, size)) {
+        return cpu_addr;
+    }
+    // No CPU backing (title 1 renders a bloom chain at GPU 0xf0000-0x15b600): a stand-in address
+    // fixed by the GPU address, at or above ~(1 << 40) so TrackImage skips it. A fresh address per
+    // lookup made every use create another image (thousands a minute, never found again).
+    constexpr GPUVAddr StandInRange = 1ULL << 40;
+    if (gpu_addr >= StandInRange || size > StandInRange - gpu_addr - 1) {
+        return std::nullopt;
+    }
+    return ~(1ULL << 40ULL) + gpu_addr;
+}
+
+template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
-    std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
-        const auto size = CalculateGuestSizeInBytes(info);
-        cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr, size);
-        if (!cpu_addr) {
-            const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
-            virtual_invalid_space += Common::AlignUp(size, 32);
-            cpu_addr = std::optional<DAddr>(fake_addr);
-        }
+        const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
+        virtual_invalid_space += Common::AlignUp(CalculateGuestSizeInBytes(info), 32);
+        cpu_addr = std::optional<DAddr>(fake_addr);
     }
     ASSERT_MSG(cpu_addr, "Tried to insert an image to an invalid gpu_addr={:#x}", gpu_addr);
     ImageInfo storage_info = info;
@@ -1692,10 +1948,36 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
 
+    if constexpr (requires { runtime.UseOpaqueAstcFormat(); }) {
+        // Opaque ASTC goes to BC1 rather than BC3 when it is re-compressed (the Vulkan runtime
+        // decides). The guest data is already there when an image is first used.
+        constexpr size_t MaxScanBytes = 64_MiB;
+        if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
+            const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
+            if (scan_bytes <= MaxScanBytes) {
+                astc_scan_buffer.resize(scan_bytes);
+                gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
+                new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
+                ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+            }
+        }
+    }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
 
     new_image.allocation_tick = frame_tick;
+    {
+        // Which shapes are being created (periodic log): format, type, levels, layers, size.
+        const u64 key = (u64{static_cast<u32>(new_info.format)} << 56) |
+                        (u64{static_cast<u32>(new_info.type)} << 52) |
+                        (u64{static_cast<u32>(new_info.resources.levels) & 0xF} << 48) |
+                        (u64{static_cast<u32>(new_info.resources.layers) & 0xFFF} << 36) |
+                        (u64{new_info.size.width & 0x3FFFF} << 18) | (new_info.size.height & 0x3FFFF);
+        auto& shape = created_shapes[key];
+        ++shape.first;
+        shape.second = gpu_addr;
+        ++images_created;
+    }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
         new_info.is_sparse) {
@@ -1705,7 +1987,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const ImageId overlap_id : join_ignore_textures) {
         Image& overlap = slot_images[overlap_id];
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
-            UNIMPLEMENTED();
+            // An ignored overlap whose contents only exist on the GPU cannot be merged into the new image;
+            // MKW's native sparse remaps hit this (texture_cache.h assert after NativeRemap, which aborted
+            // the process). Drop the stale contents instead of aborting.
+            LOG_WARNING(HW_GPU, "Dropping GPU-modified overlapping image at {:#x} while joining images",
+                        overlap.gpu_addr);
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, overlap_id);
@@ -1891,12 +2177,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
 
 template <class P>
 ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) {
-    std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    const std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
-        cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
-        if (!cpu_addr) {
-            return ImageId{};
-        }
+        return ImageId{};
     }
     ImageId image_id{};
     boost::container::small_vector<ImageId, 8> image_ids;
@@ -1917,6 +2200,13 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) 
                 return true;
             }
         } else if (IsSubCopy(info, existing_image, gpu_addr)) {
+            if (True(existing_image.flags & ImageFlagBits::Unbacked)) {
+                static u32 logged{};
+                if (logged++ < 64) {
+                    LOG_INFO(HW_GPU, "DMA copy at {:#x} ({}x{}) into unbacked image {:#x}", gpu_addr,
+                             info.size.width, info.size.height, existing_image.gpu_addr);
+                }
+            }
             image_id = existing_image_id;
             image_ids.push_back(existing_image_id);
             return true;
@@ -2012,6 +2302,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
         base = image.TryFindBase(gpu_addr).value();
     }
     const s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
+    if (True(image.flags & ImageFlagBits::Unbacked)) {
+        static u32 logged{};
+        if (logged++ < 64) {
+            LOG_INFO(HW_GPU, "Render target in unbacked image {:#x} at {:#x}: {}x{} level {} layer {}",
+                     image.gpu_addr, gpu_addr, info.size.width, info.size.height, base.level, base.layer);
+        }
+    }
     const SubresourceRange range{
         .base = base,
         .extent = {.levels = 1, .layers = layers},
@@ -2194,6 +2491,13 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
     if (const ImageViewId image_view_id = image.FindView(info); image_view_id) {
         return image_view_id;
     }
+    if (True(image.flags & ImageFlagBits::Unbacked)) {
+        // How the game uses an image too large to back (e.g. a sparse virtual texture).
+        LOG_INFO(HW_GPU, "View of unbacked image {:#x}: type {} format {} levels {}+{} layers {}+{}",
+                 image.gpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
+                 info.range.base.level, info.range.extent.levels, info.range.base.layer,
+                 info.range.extent.layers);
+    }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
     image.InsertView(info, image_view_id);
     return image_view_id;
@@ -2374,6 +2678,16 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
+    ++images_deleted;
+    // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
+    // a decode was in flight has two, and the first to finish clears the flag. A decode left
+    // behind was uploaded into the next image to take this slot (another texture's data: garbage
+    // textures, and a staging overrun when that image was smaller).
+    for (auto& async_decode : async_decodes) {
+        if (async_decode->image_id == image_id) {
+            async_decode->cancelled = true;
+        }
+    }
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }
@@ -2571,12 +2885,6 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             TrackImage(image, image_id);
         }
     } else {
-        // Debug: re-upload pitch-linear images from guest memory on every use.
-        static const bool force_linear = std::getenv("EDEN_NATIVE_FORCE_LINEAR_UPLOAD") != nullptr;
-        if (force_linear && image.info.type == ImageType::Linear &&
-            False(image.flags & ImageFlagBits::GpuModified)) {
-            image.flags |= ImageFlagBits::CpuModified;
-        }
         RefreshContents(image, image_id);
         if (!image.aliased_images.empty()) {
             SynchronizeAliases(image_id);
@@ -2605,6 +2913,11 @@ template <class P>
 void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
+    if (dst.info.astc_opaque != src.info.astc_opaque) {
+        // BC1 and BC3 blocks differ in size, so the host can't copy between them; both hold the
+        // same guest data, which is uploaded from guest memory instead.
+        return;
+    }
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
@@ -2696,7 +3009,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id) 
     }
     if (new_id) {
         const ImageViewBase& old_view = slot_image_views[new_id];
-        if (True(old_view.flags & ImageViewFlagBits::PreemtiveDownload)) {
+        if (True(old_view.flags & ImageViewFlagBits::PreemtiveDownload) &&
+            False(slot_images[old_view.image_id].flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
             const PendingDownload new_download{true, 0, old_view.image_id};
             uncommitted_downloads.emplace_back(new_download);
         }

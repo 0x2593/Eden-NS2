@@ -10,7 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
-#include <unordered_set>
+#include <string>
 #include "common/container/unordered_map.h"
 #include <utility>
 #include <vector>
@@ -37,6 +37,7 @@ class GenericEnvironment;
 struct ShaderInfo {
     u64 unique_hash{};
     size_t size_bytes{};
+    std::vector<Shader::Ampere::Instruction> native_trap_prefix;
 };
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
@@ -99,7 +100,6 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
-    std::unordered_set<VAddr> failed_native_shaders;
 
 private:
     /// @brief Tries to obtain a cached shader starting in a given address
@@ -107,6 +107,17 @@ private:
     /// @param addr Start address of the shader, this doesn't cache for region
     /// @return Pointer to a valid shader, nullptr when nothing is found
     ShaderInfo* TryGet(VAddr addr) const;
+
+    /// @brief Rethrows the remembered rejection of the shader at a given address, if any
+    /// @note The remembered entry is dropped when the first bytes of the shader changed
+    void ThrowIfRejected(VAddr cpu_addr, GPUVAddr gpu_addr);
+
+    /// @brief Remembers that the shader at a given address was rejected by the compiler
+    void RememberRejection(VAddr cpu_addr, GPUVAddr gpu_addr, const char* error);
+
+    /// @brief Forgets remembered rejections overlapping a written region
+    /// @pre invalidation_mutex is locked
+    void DropRejections(VAddr addr, size_t size);
 
     /// @brief Register in the cache a given entry
     /// @param data Shader to store in the cache
@@ -154,6 +165,15 @@ private:
     ::Common::unordered_map<u64, std::vector<Entry*>> invalidation_cache;
     std::vector<std::unique_ptr<ShaderInfo>> storage;
     std::vector<Entry*> marked_for_removal;
+
+    /// Shaders whose environment could not be built (native dry run and lowering both failed). Without
+    /// this every draw or dispatch analysed and lowered the same rejected shader again.
+    struct RejectedShader {
+        u64 prefix_hash;
+        size_t prefix_size;
+        std::string error;
+    };
+    ::Common::unordered_map<u64, RejectedShader> rejected_shaders;
 };
 
 } // namespace VideoCommon

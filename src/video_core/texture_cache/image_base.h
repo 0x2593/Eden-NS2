@@ -45,6 +45,11 @@ enum class ImageFlagBits : u32 {
 
     AsynchronousDecode = 1 << 16,
     IsDecoding = 1 << 17, ///< Is currently being decoded asynchronously.
+    Unbacked = 1 << 18,   ///< Host image has no memory (too big to back); never upload/download.
+    /// The host image keeps only mip levels >= host_level_offset (its decoded copy would not fit
+    /// in VRAM); uploads skip the rest, downloads are never done.
+    TrimmedLevels = 1 << 19,
+    ZeroFilled = 1 << 20, ///< Cleared to zero blocks before its first asynchronous decode.
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -93,6 +98,7 @@ struct ImageBase {
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;
+    u32 host_level_offset = 0; ///< Guest mip level held by host mip 0 (see TrimmedLevels).
     u64 scale_tick = 0;
     bool has_scaled = false;
 

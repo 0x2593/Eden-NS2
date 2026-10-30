@@ -689,6 +689,11 @@ public:
           allocation{allocation_}, dld{&dld_} {}
     Image() = default;
 
+    /// True for an image created without memory (an unbacked sparse image).
+    bool IsUnbacked() const noexcept {
+        return handle != VK_NULL_HANDLE && allocation == VK_NULL_HANDLE;
+    }
+
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
 

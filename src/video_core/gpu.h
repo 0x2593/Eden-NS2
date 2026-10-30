@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "common/bit_field.h"
@@ -163,6 +164,9 @@ public:
     /// Request a host GPU memory flush from the CPU.
     [[nodiscard]] u64 RequestFlush(DAddr addr, std::size_t size);
 
+    /// Runs an action on the GPU thread between command lists (returns its sync fence).
+    u64 RunOnGpuThread(std::function<void()>&& action);
+
     /// Obtains current flush request fence id.
     [[nodiscard]] u64 CurrentSyncRequestFence() const;
 
@@ -246,6 +250,7 @@ public:
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size);
+
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes = false);

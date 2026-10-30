@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
@@ -46,6 +47,10 @@ public:
     // Copy floating point status registers to the target thread.
     void CloneFpuStatus(KThread* dst) const;
 
+    // Diagnostic only (thread dump): the registers of the thread running right now, read without
+    // stopping the core, so they can be slightly inconsistent. False when nothing is loaded.
+    bool GetLiveContextForDebugging(Svc::ThreadContext& ctx) const;
+
     // Log backtrace of current processor state.
     void LogBacktrace(KernelCore& kernel);
 
@@ -71,7 +76,7 @@ private:
     std::condition_variable m_on_interrupt;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
-    bool m_is_interrupted{};
+    std::atomic<bool> m_is_interrupted{};
     bool m_is_single_core{};
 };
 

@@ -13,7 +13,9 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
+#include "video_core/macro.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 
 namespace Tegra::Control {
 namespace {
@@ -21,15 +23,30 @@ namespace {
 // Match NVK/Nouveau's initial pushbuffer subchannel layout.
 constexpr u32 Nvk3DSubchannel = 0;
 constexpr u32 NvkComputeSubchannel = 1;
+constexpr u32 NvkM2mfSubchannel = 2;
 constexpr u32 Nvk2DSubchannel = 3;
 constexpr u32 NvkCopySubchannel = 4;
+
+// Switch 2 channels of a process share one TSG, whose graphics context holds the macro RAM.
+std::shared_ptr<NativeMacroContext> Nx2MacroContext() {
+    static const auto context = [] {
+        auto created = std::make_shared<NativeMacroContext>();
+        created->engine.native_turing = true;
+        created->compute_engine.native_turing = true;
+        return created;
+    }();
+    return context;
+}
 
 void BindNvkDefaultSubchannels(ChannelState::Payload& payload) {
     auto& dma_pusher = payload.dma_pusher;
     dma_pusher.BindSubchannel(&payload.maxwell_3d, Nvk3DSubchannel, Engines::EngineTypes::Maxwell3D);
     dma_pusher.BindSubchannel(&payload.kepler_compute, NvkComputeSubchannel,
                               Engines::EngineTypes::KeplerCompute);
-    // Subchannel 2 is M2MF there; Eden does not expose a 0x9039 engine yet.
+    // Subchannel 2 is M2MF/inline-to-memory there (NVN uses it without binding a class);
+    // KeplerMemory has the same LINE_LENGTH_IN/OFFSET_OUT/LAUNCH_DMA/LOAD_INLINE_DATA layout.
+    dma_pusher.BindSubchannel(&payload.kepler_memory, NvkM2mfSubchannel,
+                              Engines::EngineTypes::KeplerMemory);
     dma_pusher.BindSubchannel(&payload.fermi_2d, Nvk2DSubchannel, Engines::EngineTypes::Fermi2D);
     dma_pusher.BindSubchannel(&payload.maxwell_dma, NvkCopySubchannel,
                               Engines::EngineTypes::MaxwellDMA);
@@ -57,6 +74,17 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
     payload.emplace(system, *memory_manager, *this);
     payload->maxwell_3d.SetNativeMacroContext(native_macro_context);
     BindNvkDefaultSubchannels(*payload);
+    if (g_nx2_ampere) {
+        // Switch 2 command streams use Ampere classes with Turing+ (MME64) macros, and its
+        // block-linear surfaces the console's GOB swizzle.
+        memory_manager->EnableNativeTiling();
+        const auto macros = Nx2MacroContext();
+        payload->maxwell_3d.SetNativeMacroContext(macros);
+        payload->maxwell_3d.SetNativeTuringMacroMode(true);
+        payload->kepler_compute.SetNativeMacroMode(&macros->engine, macros->positions,
+                                                   macros.get());
+        payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
+    }
     initialized = true;
 }
 

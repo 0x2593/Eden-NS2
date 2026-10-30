@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <tuple>
 #include <utility>
 
@@ -23,6 +24,14 @@ namespace InputCommon {
 class InputSubsystem;
 enum class MouseButton;
 } // namespace InputCommon
+
+// EDEN_NX2_HIDE_WINDOW=1 (anything but 0) creates the render window hidden and without focus, for unattended
+// test runs that must not cover or interrupt the desktop.
+inline SDL_WindowFlags Nx2HiddenWindowFlags() {
+    const char* hide = std::getenv("EDEN_NX2_HIDE_WINDOW");
+    return hide != nullptr && hide[0] != '0' ? SDL_WINDOW_HIDDEN | SDL_WINDOW_NOT_FOCUSABLE
+                                                         : SDL_WindowFlags{0};
+}
 
 class EmuWindow_SDL3 : public Core::Frontend::EmuWindow {
 public:

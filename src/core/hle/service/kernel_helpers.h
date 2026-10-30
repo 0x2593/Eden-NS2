@@ -29,6 +29,9 @@ public:
 
     void CloseEvent(Kernel::KEvent* event);
 
+    /// Name an event was created with (debugger handle listing); empty when unknown.
+    static std::string GetEventName(const Kernel::KEvent* event);
+
     Kernel::KernelCore& kernel;
     Kernel::KProcess* process{};
     bool process_created{false};

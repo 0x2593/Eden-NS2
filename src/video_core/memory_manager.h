@@ -38,17 +38,24 @@ public:
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
                            GPUVAddr split_address = 1ULL << 34, u64 big_page_bits_ = 16,
                            u64 page_bits_ = 12);
+    [[nodiscard]] MaxwellDeviceMemoryManager& GetDeviceMemory() noexcept { return memory; }
+
     explicit MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& memory_,
                            u64 address_space_bits_ = 40, GPUVAddr split_address = 1ULL << 34,
                            u64 big_page_bits_ = 16, u64 page_bits_ = 12);
     ~MemoryManager();
 
+    // Switch 2: GPU address of the read-only syncpoint shim (u32 per syncpoint); 0 = none.
     void SetNativeSyncpointShim(GPUVAddr address);
-    void EnableNativeTiling() { native_tiling = true; }
-    bool UsesNativeTiling() const { return native_tiling; }
-    /// Bytes from gpu_addr to the end of the native mapping containing it. Native memory pools
-    /// are identity mapped back to back, so the kind map alone merges neighbouring pools.
-    [[nodiscard]] std::optional<size_t> GetNativeMappingSizeFrom(GPUVAddr gpu_addr) const;
+    static constexpr u32 NumShimSyncpoints = 192; // Tegra::Host1x::SyncpointManager
+
+    /// Switch 2 lays out block-linear surfaces with the console's GOB swizzle.
+    void EnableNativeTiling() {
+        native_tiling = true;
+    }
+    bool UsesNativeTiling() const {
+        return native_tiling;
+    }
     bool IsShuttingDown() const;
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
@@ -160,6 +167,12 @@ public:
 
     void FlushCaching();
 
+    /// Leaves the caches' invalidation of a range already written for the next FlushCaching
+    /// (before every draw, dispatch, clear and copy), merged with neighbouring ranges.
+    void AccumulateInvalidation(GPUVAddr gpu_addr, std::size_t size) {
+        accumulator.Add(gpu_addr, size);
+    }
+
     const u8* GetSpan(const GPUVAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 
@@ -231,9 +244,6 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
-    std::map<GPUVAddr, GPUVAddr> native_mappings; ///< Start -> end of each native mapping.
-    mutable std::mutex native_mapping_guard;
-    void TrackNativeMapping(GPUVAddr gpu_addr, std::size_t size, bool mapped);
 
     static constexpr size_t continuous_bits = 64;
 

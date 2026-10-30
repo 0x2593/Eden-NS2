@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "common/logging.h"
@@ -12,6 +14,7 @@
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_write_watch.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
@@ -43,7 +46,11 @@ void MaxwellDMA::ConsumeSinkImpl(Core::System& system) {
 }
 
 void MaxwellDMA::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
-    ASSERT_MSG(method < NUM_REGS, "Invalid MaxwellDMA register");
+    if (method >= NUM_REGS) {
+        // Ampere copy (Switch 2) can use methods past this register file; don't write past it.
+        LOG_DEBUG(HW_GPU, "Ignoring MaxwellDMA method {:#x} past the register file", method);
+        return;
+    }
 
     regs.reg_array[method] = method_argument;
 
@@ -66,6 +73,47 @@ void MaxwellDMA::Launch() {
             regs.line_count, static_cast<GPUVAddr>(regs.offset_in), regs.line_length_in);
     }
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
+    if (regs.launch_dma.src_type == LaunchDMA::Type::PHYSICAL ||
+        regs.launch_dma.dst_type == LaunchDMA::Type::PHYSICAL) {
+        // Physical addressing is not implemented: the addresses are used as GPU virtual addresses.
+        static std::atomic<u64> physical_copies{};
+        const u64 count = ++physical_copies;
+        if (count <= 16 || count % 256 == 0)
+            LOG_WARNING(HW_GPU, "DMA copy with physical addressing (src={}, dst={}): {:#x} -> {:#x}, length={:#x}, lines={}, total={}",
+                        static_cast<u32>(regs.launch_dma.src_type.Value()),
+                        static_cast<u32>(regs.launch_dma.dst_type.Value()), static_cast<GPUVAddr>(regs.offset_in),
+                        static_cast<GPUVAddr>(regs.offset_out), regs.line_length_in, regs.line_count, count);
+    }
+    GPU_WRITE_WATCH("DMA copy", GPUVAddr(regs.offset_out),
+                    u64{regs.line_length_in} * std::max<u32>(regs.line_count, 1),
+                    ", source={:#x}, lines={}, pitch_in={:#x}, pitch_out={:#x}", static_cast<GPUVAddr>(regs.offset_in),
+                    regs.line_count, regs.pitch_in, regs.pitch_out);
+    // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
+    static const u64 trace_destination = [] {
+        const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    if (trace_destination != 0 && GPUVAddr(regs.offset_out) >= trace_destination &&
+        GPUVAddr(regs.offset_out) < trace_destination + (32ULL << 20)) {
+        static u32 traced_destination{};
+        if (traced_destination++ < 40) {
+            LOG_INFO(HW_GPU,
+                     "nx2 DMA to traced dst: {:#x} -> {:#x} lines={} length={} pitch in={:#x} "
+                     "out={:#x} launch={:#x} src_layout={} dst_layout={}",
+                     static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out),
+                     regs.line_count, regs.line_length_in, regs.pitch_in, regs.pitch_out,
+                     regs.reg_array[0xc0], regs.launch_dma.src_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? "pitch" : "block",
+                     regs.launch_dma.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? "pitch" : "block");
+        }
+    }
+    if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
+        static u32 traced{};
+        if (traced++ < 64) {
+            LOG_INFO(HW_GPU, "nx2 DMA {:#x} -> {:#x} lines={} length={} launch={:#x}",
+                     static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out),
+                     regs.line_count, regs.line_length_in, regs.reg_array[0xc0]);
+        }
+    }
 
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;
@@ -356,7 +404,6 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
-    TRACE_NATIVE_SEMAPHORE_RELEASE("DMA", this, address, payload);
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;

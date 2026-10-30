@@ -23,6 +23,7 @@
 #include "core/device_memory.h"
 #include "core/hle/kernel/board/nintendo/nx/k_system_control.h"
 #include "core/device_memory_manager.h"
+#include "core/hle/dlss_trace.h"
 #include "core/memory.h"
 
 namespace Core {
@@ -217,6 +218,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
         auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
         if (ptr == nullptr) [[unlikely]] {
             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
+            InsertCPUBacking(start_page_d + i, new_vaddress, asid);
             continue;
         }
         auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
@@ -235,10 +237,22 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
         }
         impl->multi_dev_address.Register(new_dev, start_id);
     }
-    t_slot = {};
+    translation_generation.fetch_add(1, std::memory_order_release);
     if (track) {
         TrackContinuityImpl(address, virtual_address, size, asid);
     }
+}
+
+template <typename Traits>
+u32 DeviceMemoryManager<Traits>::ProbeBacking(DAddr address) {
+    const size_t page_index = address >> Memory::YUZU_PAGEBITS;
+    const auto [asid, vaddress] = ExtractCPUBacking(page_index);
+    if (asid.id >= registered_processes.size() || !registered_processes[asid.id]) return 1;
+    auto* ptr = registered_processes[asid.id]->GetPointerSilent(Common::ProcessAddress(vaddress));
+    const u32 stored = tracked_entries[page_index].compressed_physical_ptr;
+    const u32 current = ptr ? static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U : 0U;
+    if (stored == current) return stored ? 0 : 1;
+    return stored == 0 ? 2 : 3;
 }
 
 template <typename Traits>
@@ -269,7 +283,7 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
             base_dev = new_start | MULTI_FLAG;
         }
     }
-    t_slot = {};
+    translation_generation.fetch_add(1, std::memory_order_release);
 }
 template <typename Traits>
 void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtual_address,
@@ -358,6 +372,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
     if (!ptr) [[unlikely]] {
         return;
     }
+    Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::Write<T>", ptr, sizeof(T));
     std::memcpy(ptr, &value, sizeof(T));
 }
 
@@ -405,9 +420,10 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
         const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
-        for (size_t i = 0; i < 4; ++i) {
-            if (t_slot[i].guest_page == guest_page && t_slot[i].host_ptr != nullptr) {
-                std::memcpy(dest_pointer, t_slot[i].host_ptr + page_offset, size);
+        TranslationCache& cache = Translations();
+        for (const TranslationEntry& entry : cache.slots) {
+            if (entry.guest_page == guest_page && entry.host_ptr != nullptr) {
+                std::memcpy(dest_pointer, entry.host_ptr + page_offset, size);
                 return;
             }
         }
@@ -416,8 +432,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
         const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
         if (phys_addr != 0) {
             auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
-            t_slot[cache_cursor % t_slot.size()] = TranslationEntry{.guest_page = guest_page, .host_ptr = mem_ptr};
-            cache_cursor = (cache_cursor + 1) & 3U;
+            cache.slots[cache.cursor] = TranslationEntry{.guest_page = guest_page, .host_ptr = mem_ptr};
+            cache.cursor = (cache.cursor + 1) & 3U;
             std::memcpy(dest_pointer, mem_ptr + page_offset, size);
             return;
         }
@@ -450,6 +466,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
                 current_vaddr, address, size);
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
+            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -463,9 +480,10 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
         const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
-        for (size_t i = 0; i < 4; ++i) {
-            if (t_slot[i].guest_page == guest_page && t_slot[i].host_ptr != nullptr) {
-                std::memcpy(dest_pointer, t_slot[i].host_ptr + page_offset, size);
+        TranslationCache& cache = Translations();
+        for (const TranslationEntry& entry : cache.slots) {
+            if (entry.guest_page == guest_page && entry.host_ptr != nullptr) {
+                std::memcpy(dest_pointer, entry.host_ptr + page_offset, size);
                 return;
             }
         }
@@ -474,8 +492,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
         const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
         if (phys_addr != 0) {
             auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
-            t_slot[cache_cursor % t_slot.size()] = TranslationEntry{.guest_page = guest_page, .host_ptr = mem_ptr};
-            cache_cursor = (cache_cursor + 1) & 3U;
+            cache.slots[cache.cursor] = TranslationEntry{.guest_page = guest_page, .host_ptr = mem_ptr};
+            cache.cursor = (cache.cursor + 1) & 3U;
             std::memcpy(dest_pointer, mem_ptr + page_offset, size);
             return;
         }
@@ -509,6 +527,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
                 current_vaddr, address, size);
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
+            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {

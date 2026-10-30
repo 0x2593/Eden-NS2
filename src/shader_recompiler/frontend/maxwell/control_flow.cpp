@@ -14,6 +14,7 @@
 
 #include <ranges>
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/cfg_builder.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/decode.h"
 #include "shader_recompiler/frontend/maxwell/indirect_branch_table_track.h"
@@ -191,6 +192,10 @@ CFG::CFG(Environment& env_, ObjectPool<Block>& block_pool_, Location start_addre
          bool exits_to_dispatcher_)
     : env{env_}, block_pool{block_pool_}, program_start{start_address}, exits_to_dispatcher{
                                                                             exits_to_dispatcher_} {
+    if (env.IsNativeAmpere()) {
+        Ampere::CfgBuilder::Build(*this);
+        return;
+    }
     if (exits_to_dispatcher) {
         dispatch_block = block_pool.Create(Block{});
         dispatch_block->begin = {};

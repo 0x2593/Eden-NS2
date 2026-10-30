@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <cstring>
 #include <vector>
 
 #include "common/logging.h"
@@ -58,6 +59,7 @@ Loader::ResultStatus ProgramMetadata::Load(VirtualFile file) {
             return Loader::ResultStatus::ErrorBadACIDHeader;
         }
         uses_extended_acid = true;
+        is_switch2 = true;
     }
 
     if (aci_offset < sizeof(Header) || !contains(aci_offset, aci_size, total_size) ||

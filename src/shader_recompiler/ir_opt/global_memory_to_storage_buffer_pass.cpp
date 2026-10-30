@@ -4,12 +4,16 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <optional>
+#include <string>
 
 #include <boost/container/flat_set.hpp>
+#include <fmt/format.h>
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -332,9 +336,35 @@ std::optional<LowAddrInfo> TrackLowAddress(IR::Inst* inst) {
     };
 }
 
+/// True when the value is computed from a value loaded from global or storage memory.
+bool DependsOnLoadedValue(const IR::Value& value) {
+    if (value.IsImmediate()) return false;
+    small_vector<const IR::Inst*, 32> pending{value.InstRecursive()};
+    for (size_t next = 0; next < pending.size() && next < 512; ++next) {
+        const IR::Inst* inst = pending[next];
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::LoadGlobal32: case IR::Opcode::LoadGlobal64: case IR::Opcode::LoadGlobal128:
+        case IR::Opcode::LoadStorage32: case IR::Opcode::LoadStorage64: case IR::Opcode::LoadStorage128:
+            return true;
+        default:
+            break;
+        }
+        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+            const IR::Value operand{inst->Arg(arg)};
+            if (operand.IsImmediate()) continue;
+            const IR::Inst* operand_inst = operand.InstRecursive();
+            if (std::ranges::find(pending, operand_inst) == pending.end()) pending.push_back(operand_inst);
+        }
+    }
+    return false;
+}
+
 /// Tries to track the storage buffer address used by a global memory instruction
-std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias) {
-    const auto pred{[bias](const IR::Inst* inst) -> std::optional<StorageBufferAddr> {
+// With allow_unset, a constant buffer slot that is still zero when the shader is built also
+// counts as a pointer: native drivers often fill pointer arguments per dispatch.
+std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias, Environment* native_env = nullptr,
+                                       bool allow_unset = false) {
+    const auto pred{[bias, native_env, allow_unset](const IR::Inst* inst) -> std::optional<StorageBufferAddr> {
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 &&
             inst->GetOpcode() != IR::Opcode::GetCbufU32x2) {
             return std::nullopt;
@@ -364,13 +394,78 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
             // point to them
             return std::nullopt;
         }
+        if (native_env && !native_env->IsCbufStorageBufferPointer(storage_buffer.index,
+                                                                 storage_buffer.offset)) {
+            bool unset = false;
+            if (allow_unset) {
+                try {
+                    unset = native_env->ReadCbufValue(storage_buffer.index, storage_buffer.offset) == 0 &&
+                            native_env->ReadCbufValue(storage_buffer.index, storage_buffer.offset + 4) == 0;
+                } catch (const Exception&) {
+                    // A cached environment without the value: the original compile never read it.
+                }
+            }
+            if (!unset) return std::nullopt;
+        }
         return storage_buffer;
     }};
+    if (!native_env) {
+        return BreadthFirstSearch(value, pred);
+    }
+    // A base pointer survives addition and selection, but not multiplication or a
+    // predicate calculation. Searching those expressions can find strides first.
+    small_vector<const IR::Inst*, 16> pending;
+    const auto enqueue = [&](const IR::Value& candidate) {
+        if (candidate.IsImmediate()) return;
+        const auto* candidate_inst = candidate.InstRecursive();
+        if (std::ranges::find(pending, candidate_inst) == pending.end()) {
+            pending.push_back(candidate_inst);
+        }
+    };
+    const auto pointer_search = [&](bool relaxed) -> std::optional<StorageBufferAddr> {
+        pending.clear();
+        enqueue(value);
+        for (size_t next = 0; next < pending.size(); ++next) {
+            const auto* inst = pending[next];
+            if (const auto result = pred(inst)) return result;
+            // A 64-bit constant buffer read added straight into the address is the base pointer,
+            // even when its slot does not hold a mapped pointer yet when the shader is built.
+            if (relaxed && inst->GetOpcode() == IR::Opcode::GetCbufU32x2 && inst->Arg(0).IsImmediate() &&
+                inst->Arg(1).IsImmediate() && Common::IsAligned(inst->Arg(1).U32(), 8U)) {
+                return StorageBufferAddr{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
+            }
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::Phi:
+                for (size_t arg = inst->NumArgs(); arg--;) enqueue(inst->Arg(arg));
+                break;
+            case IR::Opcode::SelectU32:
+                enqueue(inst->Arg(1));
+                enqueue(inst->Arg(2));
+                break;
+            case IR::Opcode::CompositeExtractU32x2:
+                if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
+                    enqueue(inst->Arg(0));
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        return std::nullopt;
+    };
+    if (const auto result = pointer_search(false)) return result;
+    if (const auto result = pointer_search(true)) return result;
+    // Pointers that reach the address through other operations (shifts, 64-bit adds, ...) are
+    // found by the generic search. It is not used when the address depends on a value loaded
+    // from memory: there it attaches the access to an unrelated pointer (a counter or a
+    // pointer table), and the writes land in the wrong buffer.
+    if (DependsOnLoadedValue(value)) return std::nullopt;
     return BreadthFirstSearch(value, pred);
 }
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
-void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) {
+void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, Environment& env) {
     // NVN puts storage buffers in a specific range, we have to bias towards these addresses to
     // avoid getting false positives
     static constexpr Bias nvn_bias{
@@ -385,12 +480,78 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
         // Failed to track the low address, use NVN fallbacks
         return;
     }
+    const bool native = env.HasNativeRegisterCopies();
     // First try to find storage buffers in the NVN address
     const IR::U32 low_addr{low_addr_info->value};
-    std::optional<StorageBufferAddr> storage_buffer{Track(low_addr, &nvn_bias)};
+    if (native && IsGlobalMemoryWrite(inst) && std::getenv("EDEN_POINTER_CHASE_LOG")) {
+        // Diagnostic: does the written address depend on a value loaded from memory?
+        small_vector<const IR::Inst*, 32> pending;
+        bool loaded = false;
+        if (!low_addr.IsImmediate()) pending.push_back(low_addr.InstRecursive());
+        for (size_t next = 0; next < pending.size() && next < 256 && !loaded; ++next) {
+            const IR::Inst* def = pending[next];
+            switch (def->GetOpcode()) {
+            case IR::Opcode::LoadGlobal32: case IR::Opcode::LoadGlobal64: case IR::Opcode::LoadGlobal128:
+            case IR::Opcode::LoadStorage32: case IR::Opcode::LoadStorage64: case IR::Opcode::LoadStorage128:
+                loaded = true;
+                break;
+            default:
+                for (size_t arg = 0; arg < def->NumArgs(); ++arg) {
+                    const IR::Value value{def->Arg(arg)};
+                    if (!value.IsImmediate()) pending.push_back(value.InstRecursive());
+                }
+            }
+        }
+        if (loaded) {
+            // Compact expression of the low address word, depth-limited.
+            const auto describe = [](const auto& self, const IR::Value& value, int depth) -> std::string {
+                if (value.IsImmediate()) {
+                    return value.Type() == IR::Type::U32 ? fmt::format("{:#x}", value.U32()) : "imm";
+                }
+                const IR::Inst* def = value.InstRecursive();
+                std::string text{IR::NameOf(def->GetOpcode())};
+                if (depth == 0 || def->GetOpcode() == IR::Opcode::Phi) return text;
+                text += '(';
+                for (size_t arg = 0; arg < def->NumArgs(); ++arg) {
+                    if (arg) text += ',';
+                    text += self(self, def->Arg(arg), depth - 1);
+                }
+                return text + ')';
+            };
+            const auto tracked = Track(low_addr, nullptr, &env);
+            if (!tracked) {
+                // Pointer table: report the constant buffer slots feeding the loaded pointer's
+                // address, with their values when the shader is built.
+                small_vector<const IR::Inst*, 32> walk{low_addr.InstRecursive()};
+                for (size_t next = 0; next < walk.size() && next < 256; ++next) {
+                    const IR::Inst* def = walk[next];
+                    if ((def->GetOpcode() == IR::Opcode::GetCbufU32 || def->GetOpcode() == IR::Opcode::GetCbufU32x2) &&
+                        def->Arg(0).IsImmediate() && def->Arg(1).IsImmediate()) {
+                        u32 low{}, high{};
+                        try {
+                            low = env.ReadCbufValue(def->Arg(0).U32(), def->Arg(1).U32());
+                            high = env.ReadCbufValue(def->Arg(0).U32(), def->Arg(1).U32() + 4);
+                        } catch (const Exception&) {}
+                        LOG_WARNING(Shader, "Pointer table slot c{}[{:#x}] = {:#x}", def->Arg(0).U32(),
+                                    def->Arg(1).U32(), (u64{high} << 32) | low);
+                    }
+                    for (size_t arg = 0; arg < def->NumArgs(); ++arg) {
+                        const IR::Value operand{def->Arg(arg)};
+                        if (!operand.IsImmediate()) walk.push_back(operand.InstRecursive());
+                    }
+                }
+            }
+            LOG_WARNING(Shader, "Global write via loaded value ({}): tracked={} low={}", IR::NameOf(inst.GetOpcode()),
+                        tracked ? fmt::format("c{}[{:#x}]", tracked->index, tracked->offset) : std::string{"none"},
+                        describe(describe, low_addr, 6));
+        }
+    }
+    // Native kernels use eight-byte pointer arguments, without NVN descriptor spacing.
+    // Applying the NVN bias can skip the pointer and select a dimension or stride instead.
+    std::optional<StorageBufferAddr> storage_buffer{Track(low_addr, native ? nullptr : &nvn_bias, native ? &env : nullptr)};
     if (!storage_buffer) {
         // If it fails, track without a bias
-        storage_buffer = Track(low_addr, nullptr);
+        storage_buffer = Track(low_addr, nullptr, native ? &env : nullptr, native);
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks
             LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");
@@ -523,14 +684,14 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
 }
 } // Anonymous namespace
 
-void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateInfo& host_info) {
+void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program, const HostTranslateInfo& host_info) {
     StorageInfo info;
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsGlobalMemory(inst)) {
                 continue;
             }
-            CollectStorageBuffers(*block, inst, info);
+            CollectStorageBuffers(*block, inst, info, env);
         }
     }
     for (const StorageBufferAddr& storage_buffer : info.set) {

@@ -58,6 +58,53 @@ bool TranslatorVisitor::XPAC_1([[maybe_unused]] bool D, Reg Rd) {
     return true;
 }
 
+bool TranslatorVisitor::PACIA_1(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::PACIB_1(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::PACDA(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::PACDB(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::AUTIA_1(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::AUTIB_1(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::AUTDA(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::AUTDB(bool Z, Reg Rn, [[maybe_unused]] Reg Rd) {
+    if (Z && Rn != Reg::ZR) return UnallocatedEncoding();
+    return options.enable_pauth_returns ? true : UnallocatedEncoding();
+}
+
+bool TranslatorVisitor::PACGA(Reg Rm, Reg Rn, Reg Rd) {
+    if (!options.enable_pauth_returns) return UnallocatedEncoding();
+    const IR::U64 modifier = Rm == Reg::ZR ? IR::U64{SP(64)} : IR::U64{X(64, Rm)};
+    X(64, Rd, ir.ComputePACGA(X(64, Rn), modifier));
+    return true;
+}
+
 bool TranslatorVisitor::NOP() {
     return true;
 }

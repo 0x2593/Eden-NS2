@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/native_diagnostics.h"
+#include <array>
 #include <cstdlib>
 #include <unordered_set>
 #include <cstring>
@@ -16,6 +18,7 @@
 
 #ifdef ARCHITECTURE_x86_64
 #include "common/x64/xbyak.h"
+#include "video_core/macro_turing_jit.h"
 #endif
 
 #include "common/assert.h"
@@ -27,14 +30,15 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
-#include "video_core/memory_manager.h"
 
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_profile.h"
 
 namespace Tegra {
 
@@ -1342,44 +1346,207 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
 
 void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
                           std::span<const u32> parameters) {
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     if (native_turing) {
         maxwell3d.RefreshParameters();
         const auto context = reinterpret_cast<std::uintptr_t>(this);
         static std::unordered_set<std::uintptr_t> captured_contexts;
-        if (std::getenv("EDEN_NATIVE_FRAME_CAPTURE") && captured_contexts.insert(context).second) {
+        static const bool capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
+        if (capture && captured_contexts.insert(context).second) {
             std::ofstream dump("native-graphics-mme-" + std::to_string(context) + ".bin", std::ios::binary);
             dump.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
         }
-        LOG_DEBUG(HW_GPU, "Native MME context={:#x}", context);
-        LOG_DEBUG(HW_GPU, "Native MME start={:#x}, parameters={}, data={:08x}", method, parameters.size(), fmt::join(parameters, ","));
-        std::vector<u32> fifo(parameters.begin(), parameters.end());
-        u64 dma_address{};
+        // EDEN_NX2_MME_LOG: log every macro call (runs ~750,000 times a second in title 1).
+        if (static const bool log_calls = std::getenv("EDEN_NX2_MME_LOG") != nullptr; log_calls) {
+            LOG_DEBUG(HW_GPU, "Native MME context={:#x}", context);
+            LOG_DEBUG(HW_GPU, "Native MME start={:#x}, parameters={}, data={:08x}", method, parameters.size(), fmt::join(parameters, ","));
+        }
+        // Reused between calls (a macro never calls another: methods >= 0xe00 are refused below);
+        // filled only for calls that are interpreted.
+        auto& fifo = native_fifo;
+        native_interpreter.active_dram = &maxwell3d.GetNativeDataRam();
+        // EDEN_NX2_MME_RECORD=<file>: write the first 200000 calls (u32 start, u32 count, the
+        // parameters) and then the macro code to <file>.code, to check interpreter changes
+        // offline against the previous interpreter. EDEN_NX2_MME_RECORD_SKIP=<n>: skip the first
+        // n calls (title 1 makes ~1,000,000 a second in 3D scenes).
+        if (static const char* const record_path = std::getenv("EDEN_NX2_MME_RECORD"); record_path != nullptr) {
+            static std::ofstream record{record_path, std::ios::binary};
+            static u32 recorded{};
+            static u64 to_skip = [] {
+                const char* value = std::getenv("EDEN_NX2_MME_RECORD_SKIP");
+                return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+            }();
+            if (to_skip > 0) {
+                --to_skip;
+            } else if (recorded < 200000) {
+                const u32 count = static_cast<u32>(parameters.size());
+                record.write(reinterpret_cast<const char*>(&method), sizeof(method));
+                record.write(reinterpret_cast<const char*>(&count), sizeof(count));
+                record.write(reinterpret_cast<const char*>(parameters.data()), parameters.size_bytes());
+                if (++recorded == 200000) {
+                    record.flush();
+                    std::ofstream code{std::string{record_path} + ".code", std::ios::binary};
+                    code.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
+                    LOG_INFO(HW_GPU, "Recorded 200000 macro calls to {}", record_path);
+                }
+            }
+        }
+        // A method write of the macro (also what a remembered call replays).
+        bool read_memory = false;
+        const auto emit = [&](u32 address, u32 value) {
+                if (address >= 0xe00) return false;
+                if (address == 0x556) {
+                    // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
+                    // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
+                    static std::array<u64, 4> modes{};
+                    static u64 enable_writes{};
+                    ++modes[value & 3];
+                    if (++enable_writes % 20000 == 0) {
+                        LOG_INFO(HW_GPU, "Native MME render enable modes: use {} always {} never {} other {}",
+                                 modes[0], modes[1], modes[2], modes[3]);
+                    }
+                }
+                {
+                    VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
+                    maxwell3d.CallMethod(system, address, value, true);
+                }
+                // Turing MME memory reads (methods 0x550 SET_MME_MEM_ADDRESS_A/B, 0x558 data RAM
+                // address, 0x55c MME_DMA_READ into data RAM, 0x560 MME_DMA_READ_FIFOED into
+                // the load FIFO, which the macro then reads after a load barrier).
+                constexpr u32 MemAddressA = 0x154, MemAddressB = 0x155, DataRamAddress = 0x156;
+                constexpr u32 DmaRead = 0x157, DmaReadFifoed = 0x158;
+                if (address == DmaRead || address == DmaReadFifoed) {
+                    read_memory = true;
+                    const GPUVAddr source = (GPUVAddr{maxwell3d.GetRegisterValue(MemAddressA) & 0x1ffffff} << 32) |
+                                            maxwell3d.GetRegisterValue(MemAddressB);
+                    auto& memory = maxwell3d.GetMemoryManager();
+                    const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
+                    // The words may have just been written by the GPU (e.g. indirect draw arguments
+                    // from a culling dispatch) and still be only in host buffers: flush them first,
+                    // or the macro draws with an older frame's arguments (objects pop in and out).
+                    const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
+                    if (VideoCommon::Nx2Profile::Enabled()) {
+                        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+                        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
+                            if (const auto device = memory.GpuToCpuAddress(page)) {
+                                VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
+                            }
+                        }
+                    }
+                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                        static u64 flushes{};
+                        if (++flushes % 2000 == 1) {
+                            LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
+                        }
+                    }
+                    static u32 dma_logs{};
+                    if (dma_logs < 400) {
+                        ++dma_logs;
+                        std::array<u32, 8> words{};
+                        for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = memory.Read<u32>(source + u64{i} * 4);
+                        LOG_INFO(HW_GPU, "Native MME DMA read{} start={:#x} source={:#x} count={} words={:08x}",
+                                 address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
+                    }
+                    for (u32 i = 0; i < std::min<u32>(value, 0x1000); ++i) {
+                        const u32 word = memory.Read<u32>(source + u64{i} * 4);
+                        if (address == DmaReadFifoed) {
+                            fifo.push_back(word);
+                        } else if (ram + i < native_interpreter.active_dram->size()) {
+                            if (static const bool mme_dump = std::getenv("EDEN_NX2_MME_DUMP") != nullptr;
+                                mme_dump && ram + i == 0x27 && (*native_interpreter.active_dram)[0x27] != word) {
+                                LOG_INFO(HW_GPU, "MME data RAM[0x27] {:#x} -> {:#x} by 3D engine {} (DMA from {:#x})",
+                                         (*native_interpreter.active_dram)[0x27], word, fmt::ptr(&maxwell3d), source);
+                            }
+                            (*native_interpreter.active_dram)[ram + i] = word;
+                        }
+                    }
+                }
+                return true;
+            };
+#ifdef ARCHITECTURE_x86_64
+        // Macro code runs compiled to x86-64 (macro_turing_jit.h) instead of through the memo
+        // and the interpreter; EDEN_NX2_MME_JIT=0 goes back to those.
+        static const bool use_jit = [] {
+            const char* value = std::getenv("EDEN_NX2_MME_JIT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (use_jit) {
+            if (!native_jit) {
+                native_jit = std::make_shared<TuringMacroJit>();
+            }
+            native_jit->Prepare(native_code, native_code_generation);
+            fifo.assign(parameters.begin(), parameters.end());
+            const auto result = native_jit->Execute(
+                method, fifo, std::span<u32>{*native_interpreter.active_dram},
+                [&](u32 address) {
+                    return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
+                },
+                emit);
+            if (!result.success) {
+                native_execution_failed = true;
+                LOG_ERROR(HW_GPU, "Native MME (JIT) failed: start={:#x}, consumed={}/{}, error={}",
+                          method, result.consumed, parameters.size(), result.error);
+            }
+            return;
+        }
+#endif
+        // EDEN_NX2_MME_MEMO=0: interpret every call (see macro_memo.h).
+        static const bool use_memo = [] {
+            const char* value = std::getenv("EDEN_NX2_MME_MEMO");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (use_memo) {
+            // EDEN_NX2_MME_MEMO_STATS: log the memo's counters every 2^24 calls.
+            if (static const bool memo_stats = std::getenv("EDEN_NX2_MME_MEMO_STATS") != nullptr;
+                memo_stats && (++native_calls & 0xffffff) == 0) {
+                const auto& stats = native_memo.GetStatistics();
+                LOG_INFO(HW_GPU,
+                         "Macro memo: {} hits ({} on the last call's slot), {} misses, {} guard "
+                         "failures, {} stores ({} in place), {} compactions, {} clears; {} entries, "
+                         "{} KiB",
+                         stats.hits, stats.slot_hits, stats.misses, stats.guard_failures, stats.stores,
+                         stats.overwrites, stats.compactions, stats.clears, native_memo.Size(),
+                         native_memo.ArenaWords() * 4 / 1024);
+            }
+            native_memo.Synchronize(native_code_generation);
+            if (decltype(native_memo)::Effects effects;
+                native_memo.Find(method, parameters, *native_interpreter.active_dram, effects)) {
+                auto& data_ram = *native_interpreter.active_dram;
+                for (size_t i = 0; i < effects.data_ram_writes.size(); i += 2) {
+                    data_ram[effects.data_ram_writes[i]] = effects.data_ram_writes[i + 1];
+                }
+                for (size_t i = 0; i < effects.writes.size(); i += 2) {
+                    emit(effects.writes[i], effects.writes[i + 1]);
+                }
+                return;
+            }
+            native_writes.clear();
+        }
+        fifo.assign(parameters.begin(), parameters.end());
+        const u64 code_generation = native_code_generation;
         const auto result = native_interpreter.Execute(native_code, method, fifo,
             [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
             [&](u32 address, u32 value) {
-                if (address >= 0xe00) return false;
-                // SET_MME_MEM_ADDRESS_A/B and MME_DMA_READ_FIFOED feed memory into the
-                // parameter FIFO; the following load barrier waits for that data.
-                if (address == 0x154) {
-                    dma_address = (dma_address & 0xffffffffULL) | (u64{value & 0xff} << 32);
-                } else if (address == 0x155) {
-                    dma_address = (dma_address & ~0xffffffffULL) | value;
-                } else if (address == 0x158) {
-                    if (value > 0x10000 || !maxwell3d.GetMemoryManager().IsFullyMappedRange(dma_address, value * sizeof(u32))) {
-                        return false;
-                    }
-                    const size_t offset = fifo.size();
-                    fifo.resize(offset + value);
-                    maxwell3d.GetMemoryManager().ReadBlock(dma_address, fifo.data() + offset, value * sizeof(u32));
-                    return true;
+                if (use_memo) {
+                    native_writes.emplace_back(address, value);
                 }
-                maxwell3d.CallMethod(system, address, value, true);
-                return true;
+                return emit(address, value);
             });
+        // Remember the call if its effects depend only on its parameters and the data RAM words
+        // it read (and the macro code did not change under it).
+        if (use_memo && result.success && !read_memory && !native_interpreter.read_registers &&
+            !native_interpreter.reread_data_ram && code_generation == native_code_generation) {
+            native_memo.Store(method, parameters, native_interpreter.data_ram_reads,
+                              native_interpreter.data_ram_writes, native_writes);
+        }
         if (!result.success) {
             native_execution_failed = true;
-            std::ofstream dump("native-mme-" + std::to_string(method) + ".bin", std::ios::binary);
-            dump.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
+            if (static const bool diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+                diagnostics) {
+                std::ofstream dump("native-mme-" + std::to_string(method) + ".bin", std::ios::binary);
+                dump.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
+            }
             LOG_ERROR(HW_GPU, "Native MME failed: start={:#x}, pc={:#x}, consumed={}/{}, error={}",
                       method, result.pc, result.consumed, parameters.size(), result.error);
         }

@@ -4,11 +4,18 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/core_timing.h"
+#include "core/guest_clock.h"
+#include "core/hle/dlss_trace.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
 
@@ -24,13 +31,24 @@ DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess
 
 u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read);
+    u64 value{};
     switch (size) {
-    case sizeof(u64): return m_memory.Read64(vaddr);
-    case sizeof(u32): return m_memory.Read32(vaddr);
-    case sizeof(u16): return m_memory.Read16(vaddr);
-    case sizeof(u8): return m_memory.Read8(vaddr);
+    case sizeof(u64): value = m_memory.Read64(vaddr); break;
+    case sizeof(u32): value = m_memory.Read32(vaddr); break;
+    case sizeof(u16): value = m_memory.Read16(vaddr); break;
+    case sizeof(u8): value = m_memory.Read8(vaddr); break;
     default: UNREACHABLE();
     }
+    // With memory aborts ignored the guest keeps running on zeros: say where it read from.
+    if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
+        unmapped = 0;
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 32) {
+            LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
+                      m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
+        }
+    }
+    return value;
 }
 Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
     CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
@@ -48,7 +66,23 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     return cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
 }
 
+namespace {
+// Diagnostic only (EDEN_DLSS_TRACE=1, which also disables fastmem and the page table so that every guest
+// store reaches the callbacks below).
+template <typename Jit, typename Mem>
+void TraceGuestStore(Jit& jit, Mem& memory, const char* tag, u64 vaddr, size_t size, u64 value) {
+    const u64 watch = Core::HLE::DlssTrace::g_watch_address.load(std::memory_order_relaxed);
+    if (watch == 0 || vaddr >= watch + 0x40 || vaddr + size <= watch) {
+        return;
+    }
+    Core::HLE::DlssTrace::GuestWriteWatch(memory, tag, vaddr, size, value, jit->GetPC(), jit->GetRegister(30),
+                                          jit->GetRegister(29), jit->GetRegister(0), jit->GetRegister(1),
+                                          jit->GetRegister(2));
+}
+} // namespace
+
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
+    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWrite", vaddr, size, value);
     if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
         switch (size) {
         case sizeof(u64): return m_memory.Write64(vaddr, u64(value));
@@ -60,6 +94,7 @@ void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std
     }
 }
 void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) {
+    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWrite128", vaddr, 16, value[0]);
     if (CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
         m_memory.Write64(vaddr, value[0]);
         m_memory.Write64(vaddr + 8, value[1]);
@@ -67,22 +102,27 @@ void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value)
 }
 
 bool DynarmicCallbacks64::MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) {
+    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive8", vaddr, 1, value);
     return CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive8(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive16(u64 vaddr, std::uint16_t value, std::uint16_t expected) {
+    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive16", vaddr, 2, value);
     return CheckMemoryAccess(vaddr, 2, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive16(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive32(u64 vaddr, std::uint32_t value, std::uint32_t expected) {
+    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive32", vaddr, 4, value);
     return CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive32(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive64(u64 vaddr, std::uint64_t value, std::uint64_t expected) {
+    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive64", vaddr, 8, value);
     return CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive64(vaddr, value, expected);
 }
 bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vector value, Dynarmic::A64::Vector expected) {
+    TraceGuestStore(m_parent.m_jit, m_memory, "MemoryWriteExclusive128", vaddr, 16, value[0]);
     return CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive128(vaddr, value, expected);
 }
@@ -142,7 +182,8 @@ void DynarmicCallbacks64::AddTicks(u64 ticks) {
     // if not all cores are doing a similar amount of work. Instead of doing this, we should
     // device a way so that timing is consistent across all cores without increasing the ticks 4
     // times.
-    u64 amortized_ticks = ticks / Core::Hardware::NUM_CPU_CORES;
+    // Stays at the Switch 1 core count so guest time does not change with the extra emulated cores.
+    u64 amortized_ticks = ticks / Core::Hardware::NUM_LEGACY_CPU_CORES;
     // Always execute at least one tick.
     amortized_ticks = std::max<u64>(amortized_ticks, 1);
     m_parent.m_system.CoreTiming().AddTicks(amortized_ticks);
@@ -154,7 +195,27 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
 }
 
 u64 DynarmicCallbacks64::GetCNTPCT() {
-    return m_parent.m_system.CoreTiming().GetClockTicks();
+    const u64 ticks = Timing::GetGuestCounterTicks(m_parent.m_system.CoreTiming().GetClockTicks(),
+                                                   m_process && m_process->UsesPAuthReturns());
+    // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
+    // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
+    // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
+    // other are such a loop: pause, which hands the core's resources to the sibling thread for a
+    // moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
+    static const bool pause_spins = [] {
+        const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (pause_spins && ticks - m_last_cntpct < 32) {
+#if defined(_M_X64) || defined(__x86_64__)
+        _mm_pause();
+        _mm_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield");
+#endif
+    }
+    m_last_cntpct = ticks;
+    return ticks;
 }
 
 bool DynarmicCallbacks64::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
@@ -235,7 +296,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.tpidr_el0 = &m_cb->m_tpidr_el0;
     config.dczid_el0 = 4;
     config.ctr_el0 = 0x8444c004;
-    config.cntfrq_el0 = Hardware::CNTFREQ;
+    config.cntfrq_el0 = Timing::GetGuestCounterFrequency(config.enable_pauth_returns);
 
     // Unpredictable instructions
     config.define_unpredictable_behaviour = true;
@@ -343,6 +404,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         break;
     }
     if (!Settings::IsFastmemEnabled()) {
+        config.fastmem_pointer = std::nullopt;
+        config.fastmem_exclusive_access = false;
+    }
+    if (Core::HLE::DlssTrace::TraceActive()) {
+        config.page_table = nullptr;
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }

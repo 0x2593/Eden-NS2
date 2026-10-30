@@ -25,6 +25,7 @@ class Module;
 
 namespace Service::AM {
 struct NativeImageRegistry;
+class NativeVideoService;
 
 class IGpuSession;
 
@@ -39,12 +40,27 @@ private:
     void Initialize(HLERequestContext& ctx);
     void BindProcess(HLERequestContext& ctx);
     void CompleteBootstrap(HLERequestContext& ctx);
+    void SetGraphicsClass1111(HLERequestContext& ctx);
+    void GetNativeEvent1121(HLERequestContext& ctx);
+    void SequenceCommand(HLERequestContext& ctx);
+    void QueryMemoryMode(HLERequestContext& ctx);
+    void InitializeVideoService(HLERequestContext& ctx);
+    void FinalizeVideoService(HLERequestContext& ctx);
+    void OpenVideoEncoderContext(HLERequestContext& ctx);
+    void CalculateVideoImageRequirements(HLERequestContext& ctx);
+    void CreateVideoImagePool(HLERequestContext& ctx);
+    void MapVideoGpuImage(HLERequestContext& ctx);
+    void UnmapVideoGpuImage(HLERequestContext& ctx);
+    void QueryVideoGpuImage(HLERequestContext& ctx);
+    void QueryVideoImage(HLERequestContext& ctx);
+    void DestroyVideoImagePool(HLERequestContext& ctx);
+    void OpenVideoDecoderContext(HLERequestContext& ctx);
     void InitializeImageContext(HLERequestContext& ctx);
     void GetNvidiaDriver(HLERequestContext& ctx);
-    void UnknownQuery(HLERequestContext& ctx);
-    void CalculateDecoderImageRequirements(HLERequestContext& ctx);
-    void OpenVideoCodecRoot(HLERequestContext& ctx);
     void CalculateImageRequirements(HLERequestContext& ctx);
+    void CalculateRequiredBufferMemory(HLERequestContext& ctx);
+    void CreateCameraContext(HLERequestContext& ctx);
+    void CreateChatImagePool(HLERequestContext& ctx);
     void CreateNativeMemory(HLERequestContext& ctx);
     void CreateNativeImage(HLERequestContext& ctx);
     void DestroyNativeImage(HLERequestContext& ctx);
@@ -60,6 +76,7 @@ private:
     void OpenGpuSession(HLERequestContext& ctx);
     void OpenDisplaySession(HLERequestContext& ctx);
     void InitializeDisplayContext(HLERequestContext& ctx);
+    void FinalizeDisplayContext(HLERequestContext& ctx);
     void InitializeGpuContext(HLERequestContext& ctx);
     void InitializeSyncpointContext(HLERequestContext& ctx);
     void GetSyncpointSession(HLERequestContext& ctx);
@@ -72,6 +89,7 @@ private:
     std::vector<u32> m_native_memories;
     std::shared_ptr<NativeImageRegistry> m_image_registry;
     u32 m_next_native_image_id{1};
+    u32 m_next_chat_image_pool{1};
     std::shared_ptr<Core::Timing::EventType> m_cache_poll;
     std::array<GraphicsSyncpointCache::CounterValue, GraphicsSyncpointCache::CounterCount>
         m_counter_values{};
@@ -80,10 +98,18 @@ private:
     Kernel::KEvent* m_syncpoint_request_event{};
     KernelHelpers::ServiceContext m_context;
     Event m_syncpoint_cache_event;
+    Event m_native_event_1121;
     bool m_syncpoint_context_initialized{};
     Kernel::KProcess* const m_process;
     const u64 m_aruid;
+    bool m_sequence_started{};
+    bool m_sequence_session_returned{};
+    bool m_sequence_finished{};
+    std::shared_ptr<NativeVideoService> m_video_service;
+    bool m_video_decoder_initialized{};
+    bool m_video_encoder_initialized{};
     Phase m_phase{Phase::Created};
+    u32 m_native_gpu_profile{};
     bool m_display_context_initialized{};
     bool m_gpu_context_initialized{};
     bool m_gpu_context_ready{};
