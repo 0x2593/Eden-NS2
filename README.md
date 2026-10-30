@@ -24,7 +24,8 @@ Nintendo Switch 2 games.
 - **Performance:** still a work in progress; expect slowdowns and stutter.
 - **Donkey Kong Bananza:** destructible terrain is drawn black on NVIDIA and appears to be completely
   invisible on AMD.
-- **Mario Kart World:** recommended per-game settings: GPU accuracy Low, asynchronous shaders on, and ASTC
+- **Mario Kart World:** loading screens can take a long time, especially the first time a course is
+  loaded. Recommended per-game settings: GPU accuracy Low, asynchronous shaders on, and ASTC
   recompression BC3 (needed on GPUs with less than 8 GB of video memory). Some geometry
   (task/mesh shaders) is missing.
 - **Splatoon Raiders:** runs well in-game, but crashes on loading screens.
