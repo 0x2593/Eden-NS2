@@ -13,12 +13,13 @@ Nintendo Switch 2 games.
 | --- | --- |
 | Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Playable; destructible terrain renders black |
 | Mario Kart World (`0400C3F00006E000`, v1.8.0) | Playable in Free Roam; Grand Prix hangs on a black screen |
-| Pokémon Pokopia (`0400A3A01EE4C000`) | Gameplay, 3D world renders |
+| Pokémon Pokopia (`0400A3A01EE4C000`) | Playable; stable 60 FPS, glitched textures |
 | Splatoon Raiders | Playable; crashes on loading screens |
 | Nintendo Switch 2 Welcome Tour | Boots to a black screen |
 
 ### Known issues
 
+- **Performance:** still a work in progress; expect slowdowns and stutter.
 - **Donkey Kong Bananza:** destructible terrain is drawn black on NVIDIA and appears to be completely
   invisible on AMD.
 - **Mario Kart World:** loading into a Grand Prix hangs on a black screen.
