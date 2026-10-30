@@ -13,10 +13,15 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Install Choco Dependencies
+      run: |
+        choco install cmake ninja --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
     - name: Configure Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
 
     - name: Build with MSVC Script
+      shell: cmd
       run: |
         call build-eden-msvc.bat
 
