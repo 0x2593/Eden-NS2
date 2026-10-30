@@ -6403,10 +6403,10 @@ index 0000000..698b5ee
 +} // namespace Service::AM
 diff --git a/src/core/hle/service/am/service/graphics_supervisor.cpp b/src/core/hle/service/am/service/graphics_supervisor.cpp
 new file mode 100644
-index 0000000..fe0023a
+index 0000000..a99dc1b
 --- /dev/null
 +++ b/src/core/hle/service/am/service/graphics_supervisor.cpp
-@@ -0,0 +1,2711 @@
+@@ -0,0 +1,2714 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -8035,8 +8035,11 @@ index 0000000..fe0023a
 +    if (request) {
 +        result = Kernel::ResultInvalidState;
 +        if (m_video_decoder_initialized) {
++            // Video library 3.2 (Mario Kart World 1.8.0) and 3.3 open the decoder the same way;
++            // refusing 3.2 aborted the game when its Grand Prix cup-opening movie started.
 +            result = Kernel::ResultNotImplemented;
-+            if (!request->remote_memory && request->library_version == 0x300030000ULL) {
++            if (!request->remote_memory && (request->library_version == 0x300020000ULL ||
++                                            request->library_version == 0x300030000ULL)) {
 +                result = CreateGraphicsSession(system, ctx, m_video_service->CreateContext(NativeVideoKind::Decoder), &client);
 +            }
 +        }
@@ -9656,10 +9659,10 @@ index 0000000..38cd022
 +} // namespace Service::AM
 diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
 new file mode 100644
-index 0000000..4956440
+index 0000000..fcb8b74
 --- /dev/null
 +++ b/src/core/hle/service/am/service/native_video_decoder.cpp
-@@ -0,0 +1,947 @@
+@@ -0,0 +1,983 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
 +#include "core/core.h"
@@ -9787,6 +9790,7 @@ index 0000000..4956440
 +            operation_syncpoint.reset();
 +        }
 +        started = false;
++        stream_ended = false;
 +        if (submission_event) submission_event->Clear(kernel);
 +    }
 +
@@ -9831,6 +9835,7 @@ index 0000000..4956440
 +                        consumed_size = input.size();
 +                        pending_input_bytes += input.size();
 +                        pending_inputs.push_back({std::vector<u8>{input.begin(), input.end()}, submission_id, timestamp, bool(packet[7] & 0xff)});
++                        stream_ended = false;
 +                        result = PumpOutput();
 +                    } else if (submission_event) {
 +                        submission_event->Clear(kernel);
@@ -10057,6 +10062,7 @@ index 0000000..4956440
 +            properties[7] = static_cast<u32>(timestamp_ns >> 32);
 +            properties[8] = frame.eos ? 1 : 0;
 +            output_properties.push_back(properties);
++            if (frame.eos) stream_ended = true;
 +            image->available = false;
 +            system.Host1x().GetSyncpointManager().IncrementGuest(*operation_syncpoint);
 +            system.Host1x().GetSyncpointManager().IncrementHost(*operation_syncpoint);
@@ -10105,7 +10111,19 @@ index 0000000..4956440
 +                    result = Kernel::ResultNotImplemented;
 +                    if (!(packet[4] || packet[5] || packet[6] || packet[7])) {
 +                        result = Kernel::ResultInvalidState;
-+                        if (!image->available) {
++                        if (stream_ended && pending_inputs.empty() && decoded_frames.empty()) {
++                            // After the end of the stream nothing fills an image again, so a release
++                            // completes at once: its fence is the syncpoint's current value. Mario Kart
++                            // World releases its images after a movie ends and repeats that until their
++                            // fences are reached (a fence for a frame that never comes hung the game
++                            // on a black screen after its title movie).
++                            const u32 reached = system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(*operation_syncpoint);
++                            next_completion_value = reached;
++                            completion_value = reached;
++                            image->completion_value = reached;
++                            image->available = true;
++                            result = ResultSuccess;
++                        } else if (!image->available) {
 +                            completion_value = ++next_completion_value;
 +                            image->completion_value = completion_value;
 +                            image->available = true;
@@ -10261,7 +10279,9 @@ index 0000000..4956440
 +        Result result = Kernel::ResultInvalidCombination;
 +        if (packet[0] == 0x16 && packet[1] == 0) {
 +            result = Kernel::ResultInvalidState;
-+            if (Initialized() && configuration && !registered_images.empty() && !started) {
++            // A started decoder can be started again after a Flush: Mario Kart World loops its
++            // title movie with Flush and Start once the stream ends.
++            if (Initialized() && configuration && !registered_images.empty()) {
 +                started = true;
 +                submission_event->Signal(kernel);
 +                result = ResultSuccess;
@@ -10290,6 +10310,20 @@ index 0000000..4956440
 +                // AV1 passes its mime string in the buffer. The H.264 initializer's trailing
 +                // (pointer, size) pair is codec-specific data (parameter sets) instead; when present
 +                // it is given to FFmpeg as extradata by reopening the decoder.
++                if (decoder && mime_is("video/vp9")) {
++                    // A decoder initialized without a codec (see InitializeByTransferMemory) named
++                    // VP9: decode with FFmpeg instead of the AV1 backend.
++                    auto ffmpeg_decoder = std::make_unique<FFmpeg::Decoder>(Tegra::Host1x::NvdecCommon::VideoCodec::VP9);
++                    if (ffmpeg_decoder->GetCodec()) {
++                        auto ffmpeg_context = std::make_unique<FFmpeg::DecoderContext>(*ffmpeg_decoder);
++                        if (ffmpeg_context->OpenContext(*ffmpeg_decoder)) {
++                            decoder.reset();
++                            h264_decoder = std::move(ffmpeg_decoder);
++                            h264_context = std::move(ffmpeg_context);
++                            ffmpeg_vp9 = true;
++                        }
++                    }
++                }
 +                result = Kernel::ResultNotImplemented;
 +                if (h264_context || mime_is("video/av1")) {
 +                    result = Kernel::ResultInvalidSize;
@@ -10353,19 +10387,22 @@ index 0000000..4956440
 +            // Output format 3 pairs with NV12 pools (image kind 1) and 2 with RGBA pools (kind 5).
 +            // Codec 3 is the AV1 decoder, codec 0 the H.264 decoder: nn::codec::InitializeH264Decoder
 +            // sends codec 0 (hard-coded in the SDK helper) and the AV1 initializer sends 3.
-+            // The command 200 helper (Kirby Air Riders) sends codec 1, input format 3 and output format 3
-+            // (NV12 pools): treated as the AV1 decoder, the only decoder whose input format is 3. This
-+            // pairing is inferred, the codec numbering of the real server was not decoded.
++            // Codec 1 with input format 3 and output format 3 (NV12 pools) names its codec later, in
++            // Configure's mime string: Kirby Air Riders sends it through the command 200 helper (AV1),
++            // Mario Kart World 1.8.0 through 201 ("video/vp9", its cup-opening movies). It starts as
++            // the AV1 decoder and Configure switches it to VP9. This pairing is inferred, the codec
++            // numbering of the real server was not decoded.
 +            const bool is_av1 = kind == NativeVideoKind::Decoder &&
 +                                ((!is_200 && request->codec == 3 && request->output_format == 2) ||
-+                                 (is_200 && request->codec == 1 && request->output_format == 3)) &&
++                                 (request->codec == 1 && request->output_format == 3)) &&
 +                                request->input_format == 3 && request->output_mode == 1;
 +            const bool is_h264 = kind == NativeVideoKind::Decoder && request->codec == 0 &&
 +                                 request->input_format == 1 && (request->output_format == 2 || request->output_format == 3) &&
 +                                 request->output_mode == 1;
-+            // The command 200 helper with codec 1 and input format 1 is the VP9 decoder
-+            // (Donkey Kong Bananza; its configuration data comes from Vp9DecoderHolder).
-+            const bool is_vp9 = kind == NativeVideoKind::Decoder && is_200 && request->codec == 1 &&
++            // Codec 1 with input format 1 is the VP9 decoder: Donkey Kong Bananza sends it through the
++            // command 200 helper (its configuration data comes from Vp9DecoderHolder), Mario Kart
++            // World 1.8.0 through 201.
++            const bool is_vp9 = kind == NativeVideoKind::Decoder && request->codec == 1 &&
 +                                request->input_format == 1 && (request->output_format == 2 || request->output_format == 3) &&
 +                                request->output_mode == 1;
 +            if (is_av1 || is_h264 || is_vp9) {
@@ -10430,6 +10467,8 @@ index 0000000..4956440
 +    u64 pending_input_bytes{};
 +    u64 next_submission_id{1};
 +    bool started{};
++    /// The end-of-stream frame was handed out and nothing was submitted since.
++    bool stream_ended{};
 +    Kernel::KProcess* process;
 +    NativeVideoKind kind;
 +    Kernel::KTransferMemory* transfer_memory{};
@@ -16883,10 +16922,10 @@ index 15a77e4..1b7b22f 100644
      A64/fp_min_max.cpp
      A64/misaligned_page_table.cpp
 diff --git a/src/hid_core/frontend/emulated_controller.cpp b/src/hid_core/frontend/emulated_controller.cpp
-index 7b4af13..744c579 100644
+index 7b4af13..bcc5047 100644
 --- a/src/hid_core/frontend/emulated_controller.cpp
 +++ b/src/hid_core/frontend/emulated_controller.cpp
-@@ -5,6 +5,13 @@
+@@ -5,6 +5,14 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include <algorithm>
@@ -16895,12 +16934,13 @@ index 7b4af13..744c579 100644
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <string_view>
 +#include <vector>
 +#include <optional>
  #include <chrono>
  #include <common/scope_exit.h>
  
-@@ -1804,10 +1811,59 @@ CaptureButtonState EmulatedController::GetCaptureButtons() const {
+@@ -1804,10 +1812,108 @@ CaptureButtonState EmulatedController::GetCaptureButtons() const {
      return controller.capture_button_state;
  }
  
@@ -16950,6 +16990,52 @@ index 7b4af13..744c579 100644
 +                       [now](const auto& window) { return now >= window[0] && now <= window[1]; });
 +}
 +
++// EDEN_AUTO_BUTTONS=<start>,<end>,<button>[+<button>...][;...]: holds those buttons (a b x y l r zl
++// zr plus minus up down left right) between the two times (seconds after launch), for unattended
++// runs that have to get through menus.
++static u64 AutoButtons() {
++    struct Window {
++        double start;
++        double end;
++        u64 mask;
++    };
++    static const auto windows = [] {
++        static constexpr std::array<std::pair<std::string_view, u64>, 14> names{{
++            {"a", 1ULL << 0}, {"b", 1ULL << 1}, {"x", 1ULL << 2}, {"y", 1ULL << 3},
++            {"l", 1ULL << 6}, {"r", 1ULL << 7}, {"zl", 1ULL << 8}, {"zr", 1ULL << 9},
++            {"plus", 1ULL << 10}, {"minus", 1ULL << 11}, {"left", 1ULL << 12},
++            {"up", 1ULL << 13}, {"right", 1ULL << 14}, {"down", 1ULL << 15},
++        }};
++        std::vector<Window> parsed;
++        for (const char* cursor = std::getenv("EDEN_AUTO_BUTTONS"); cursor && *cursor;) {
++            Window window{};
++            char buttons[64]{};
++            if (std::sscanf(cursor, "%lf,%lf,%63[a-z+]", &window.start, &window.end, buttons) == 3) {
++                for (std::string_view rest{buttons}; !rest.empty();) {
++                    const size_t plus = rest.find('+');
++                    const std::string_view name = rest.substr(0, plus);
++                    for (const auto& [button, bit] : names) {
++                        if (button == name) window.mask |= bit;
++                    }
++                    rest = plus == std::string_view::npos ? std::string_view{} : rest.substr(plus + 1);
++                }
++                parsed.push_back(window);
++            }
++            cursor = std::strchr(cursor, ';');
++            if (cursor) ++cursor;
++        }
++        return parsed;
++    }();
++    if (windows.empty()) return 0;
++    const double now =
++        std::chrono::duration<double>(std::chrono::steady_clock::now() - auto_press_epoch).count();
++    u64 mask = 0;
++    for (const auto& window : windows) {
++        if (now >= window.start && now <= window.end) mask |= window.mask;
++    }
++    return mask;
++}
++
  NpadButtonState EmulatedController::GetNpadButtons() const {
      if (is_configuring)
          return {};
@@ -16957,11 +17043,14 @@ index 7b4af13..744c579 100644
 +    NpadButtonState state{controller.npad_button_state.raw & GetTurboButtonMask()};
 +    if (AutoPressA()) state.a.Assign(1);
 +    if (AutoHoldPlus()) state.plus.Assign(1);
++    if (const u64 scripted = AutoButtons()) {
++        state.raw = static_cast<NpadButton>(static_cast<u64>(state.raw) | scripted);
++    }
 +    return state;
  }
  
  DebugPadButton EmulatedController::GetDebugPadButtons() const {
-@@ -1816,9 +1872,44 @@ DebugPadButton EmulatedController::GetDebugPadButtons() const {
+@@ -1816,9 +1922,44 @@ DebugPadButton EmulatedController::GetDebugPadButtons() const {
      return controller.debug_pad_button_state;
  }
  

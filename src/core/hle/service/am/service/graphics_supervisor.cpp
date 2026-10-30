@@ -1626,8 +1626,11 @@ void IGraphicsSupervisor::OpenVideoDecoderContext(HLERequestContext& ctx) {
     if (request) {
         result = Kernel::ResultInvalidState;
         if (m_video_decoder_initialized) {
+            // Video library 3.2 (Mario Kart World 1.8.0) and 3.3 open the decoder the same way;
+            // refusing 3.2 aborted the game when its Grand Prix cup-opening movie started.
             result = Kernel::ResultNotImplemented;
-            if (!request->remote_memory && request->library_version == 0x300030000ULL) {
+            if (!request->remote_memory && (request->library_version == 0x300020000ULL ||
+                                            request->library_version == 0x300030000ULL)) {
                 result = CreateGraphicsSession(system, ctx, m_video_service->CreateContext(NativeVideoKind::Decoder), &client);
             }
         }
