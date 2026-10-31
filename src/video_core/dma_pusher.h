@@ -153,6 +153,9 @@ private:
     [[nodiscard]] bool WantsSegment() const;
     bool Step();
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
+    /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
+    /// Returns whether anything was flushed.
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
     size_t command_resume_offset{};
 
     void SetState(const CommandHeader& command_header);

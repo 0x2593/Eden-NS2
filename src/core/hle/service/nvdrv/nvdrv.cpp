@@ -132,6 +132,7 @@ Module::Module(Core::System& system)
     // another in the same window inherited them.
     Tegra::g_nx2_ampere = false;
     Tegra::g_native_channels = false;
+    Tegra::Nx2ClearGpuWrittenPages();
     builders["/dev/nvhost-as-gpu"] = [this, &system](DeviceFD fd) {
         auto device = std::make_shared<Devices::nvhost_as_gpu>(system, *this, container);
         return open_files.emplace(fd, std::move(device)).first;

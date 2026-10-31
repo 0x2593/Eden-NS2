@@ -1582,11 +1582,125 @@ index 8ccb684..52fd003 100644
      if (max_std_fn >= 0x16) {
          __cpuid(cpu_id, 0x16);
          caps.base_frequency = cpu_id[0];
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 75a9da8..868e9c6 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -56,6 +56,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
++#include "common/div_ceil.h"
+ #include "common/free_region_manager.h"
+ #include "common/host_memory.h"
+ #include "common/logging.h"
+@@ -707,7 +708,9 @@ private:
+ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+     : backing_size(backing_size_)
+     , virtual_size(virtual_size_)
++    , num_granules(Common::DivCeil(backing_size_, size_t{1} << GranuleShift))
+ {
++    granules = std::make_unique<std::atomic<u8>[]>(num_granules);
+ #if defined(__OPENORBIS__) || defined(__managarm__)
+     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
+     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+@@ -791,7 +794,62 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission
+ }
+ 
+ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+-    std::memset(backing_base + physical_offset, fill_value, length);
++    if (length == 0) {
++        return;
++    }
++    MarkUsed(physical_offset, length);
++    if (fill_value != 0) {
++        std::memset(backing_base + physical_offset, fill_value, length);
++        MarkDirty(physical_offset, length);
++        return;
++    }
++    // Fresh backing memory is zero and the host gives it no RAM until it's touched: clear only
++    // the granules that may hold data (title 1's heap made the host commit every page of it).
++    // A granule cleared in full is zero again.
++    const size_t end = physical_offset + length;
++    for (size_t offset = physical_offset; offset < end;) {
++        const size_t index = offset >> GranuleShift;
++        const size_t granule_begin = index << GranuleShift;
++        const size_t granule_end = granule_begin + (size_t{1} << GranuleShift);
++        const size_t clear_end = (std::min)(granule_end, end);
++        if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) != 0) {
++            std::memset(backing_base + offset, 0, clear_end - offset);
++            if (offset == granule_begin && clear_end == granule_end) {
++                granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
++            }
++        }
++        offset = clear_end;
++    }
++}
++
++void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
++    if (length == 0) {
++        return;
++    }
++    const size_t last = (physical_offset + length - 1) >> GranuleShift;
++    for (size_t index = physical_offset >> GranuleShift; index <= last; ++index) {
++        if ((granules[index].load(std::memory_order_relaxed) & GranuleUsed) == 0) {
++            granules[index].fetch_or(GranuleUsed, std::memory_order_release);
++        }
++    }
++}
++
++void HostMemory::MarkDirty(size_t physical_offset, size_t length) {
++    if (length == 0) {
++        return;
++    }
++    const size_t last = (physical_offset + length - 1) >> GranuleShift;
++    for (size_t index = physical_offset >> GranuleShift; index <= last; ++index) {
++        granules[index].fetch_or(GranuleDirty, std::memory_order_release);
++    }
++}
++
++void HostMemory::ForgetContents() {
++    for (size_t index = 0; index < num_granules; ++index) {
++        if ((granules[index].load(std::memory_order_relaxed) & GranuleUsed) != 0) {
++            granules[index].fetch_or(GranuleDirty, std::memory_order_release);
++        }
++    }
+ }
+ 
+ void HostMemory::EnableDirectMappedAddress() {
 diff --git a/src/common/host_memory.h b/src/common/host_memory.h
-index a7fd053..8747a18 100644
+index a7fd053..3e0142e 100644
 --- a/src/common/host_memory.h
 +++ b/src/common/host_memory.h
-@@ -68,6 +68,10 @@ public:
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ #include <optional>
+ #include "common/common_funcs.h"
+@@ -52,8 +53,19 @@ public:
+ 
+     void EnableDirectMappedAddress();
+ 
++    /// Clears guest memory being handed out. Memory still zero since it was created (or since its
++    /// last full clear) is skipped: clearing it only made the host give every page real memory.
+     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
+ 
++    /// Pages the kernel hands out (cleared or not).
++    void MarkUsed(size_t physical_offset, size_t length);
++
++    /// Pages given back to the kernel: their contents are no longer known to be zero.
++    void MarkDirty(size_t physical_offset, size_t length);
++
++    /// A new kernel on this memory: everything a previous one used may hold data.
++    void ForgetContents();
++
+     [[nodiscard]] u8* BackingBasePointer() noexcept {
+         return backing_base;
+     }
+@@ -68,6 +80,10 @@ public:
          return virtual_base;
      }
  
@@ -1597,6 +1711,19 @@ index a7fd053..8747a18 100644
      bool IsInVirtualRange(void* address) const noexcept {
          return address >= virtual_base && address < virtual_base + virtual_size;
      }
+@@ -84,6 +100,12 @@ private:
+     u8* backing_base{};
+     u8* virtual_base{};
+     size_t virtual_base_offset{};
++
++    static constexpr size_t GranuleShift = 16; ///< 64 KiB of backing per state byte
++    static constexpr u8 GranuleUsed = 1 << 0;   ///< Handed out at least once
++    static constexpr u8 GranuleDirty = 1 << 1;  ///< May hold non-zero data
++    std::unique_ptr<std::atomic<u8>[]> granules;
++    size_t num_granules{};
+     // Windows requires it for kernels whom lack proper support for some functions!
+     bool fallback_buffer{false};
+ };
 diff --git a/src/common/range_sets.h b/src/common/range_sets.h
 index f8fcee4..e5cb53b 100644
 --- a/src/common/range_sets.h
@@ -3796,6 +3923,90 @@ index f6543bd..2abca31 100644
  };
  DECLARE_ENUM_FLAG_OPERATORS(KMemoryAttribute);
  
+diff --git a/src/core/hle/kernel/k_memory_manager.cpp b/src/core/hle/kernel/k_memory_manager.cpp
+index 743e290..bed3dd8 100644
+--- a/src/core/hle/kernel/k_memory_manager.cpp
++++ b/src/core/hle/kernel/k_memory_manager.cpp
+@@ -48,6 +48,8 @@ KMemoryManager::KMemoryManager(Core::System& system)
+       } {}
+ 
+ void KMemoryManager::Initialize(KVirtualAddress management_region, size_t management_region_size) {
++    // Memory a previous kernel handed out may still hold its data.
++    m_system.DeviceMemory().buffer.ForgetContents();
+ 
+     // Clear the management region to zero.
+     const KVirtualAddress management_region_end = management_region + management_region_size;
+@@ -242,10 +244,21 @@ KPhysicalAddress KMemoryManager::AllocateAndOpenContinuous(size_t num_pages, siz
+ 
+     // Open the first reference to the pages.
+     chosen_manager->OpenFirst(allocated_block, num_pages);
++    this->MarkUsed(allocated_block, num_pages);
+ 
+     return allocated_block;
+ }
+ 
++void KMemoryManager::MarkUsed(KPhysicalAddress address, size_t num_pages) {
++    m_system.DeviceMemory().buffer.MarkUsed(GetInteger(address) - Core::DramMemoryMap::Base,
++                                            num_pages * PageSize);
++}
++
++void KMemoryManager::MarkDirty(KPhysicalAddress address, size_t num_pages) {
++    m_system.DeviceMemory().buffer.MarkDirty(GetInteger(address) - Core::DramMemoryMap::Base,
++                                             num_pages * PageSize);
++}
++
+ Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages, Pool pool,
+                                              Direction dir, bool unoptimized, bool random) {
+     // Choose a heap based on our page size request.
+@@ -297,6 +310,10 @@ Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages,
+     // Only succeed if we allocated as many pages as we wanted.
+     R_UNLESS(num_pages == 0, ResultOutOfMemory);
+ 
++    for (const auto& block : *out) {
++        this->MarkUsed(block.GetAddress(), block.GetNumPages());
++    }
++
+     // We succeeded!
+     R_SUCCEED();
+ }
+@@ -525,9 +542,10 @@ bool KMemoryManager::Impl::ProcessOptimizedAllocation(KernelCore& kernel, KPhysi
+             // If not, it's new.
+             any_new = true;
+ 
+-            // Fill the page.
+-            auto* ptr = device_memory.GetPointer<u8>(m_heap.GetAddress());
+-            std::memset(ptr + offset * PageSize, fill_pattern, PageSize);
++            // Fill the page (a zero fill skips pages that are still zero).
++            device_memory.buffer.ClearBackingRegion(
++                GetInteger(m_heap.GetAddress()) + offset * PageSize - Core::DramMemoryMap::Base,
++                PageSize, fill_pattern);
+         }
+ 
+         offset++;
+diff --git a/src/core/hle/kernel/k_memory_manager.h b/src/core/hle/kernel/k_memory_manager.h
+index 2f4ae7f..66b97fe 100644
+--- a/src/core/hle/kernel/k_memory_manager.h
++++ b/src/core/hle/kernel/k_memory_manager.h
+@@ -100,6 +100,9 @@ public:
+     }
+ 
+     void Close(KPhysicalAddress address, size_t num_pages) {
++        // Pages that may be freed here may hold data: the next allocation clears them.
++        this->MarkDirty(address, num_pages);
++
+         // Repeatedly close references until we've done so for all pages.
+         while (num_pages) {
+             auto& manager = this->GetManager(address);
+@@ -333,6 +336,9 @@ private:
+     };
+ 
+ private:
++    void MarkUsed(KPhysicalAddress address, size_t num_pages);
++    void MarkDirty(KPhysicalAddress address, size_t num_pages);
++
+     Impl& GetManager(KPhysicalAddress address) {
+         return m_managers[m_memory_layout.GetPhysicalLinearRegion(address).GetAttributes()];
+     }
 diff --git a/src/core/hle/kernel/k_page_table_base.cpp b/src/core/hle/kernel/k_page_table_base.cpp
 index 2a0a7d4..23130cb 100644
 --- a/src/core/hle/kernel/k_page_table_base.cpp
@@ -3886,6 +4097,23 @@ index caa1404..e727b7d 100644
      bool IsLockedByCurrentThread() const {
          return m_owner_thread == GetCurrentThreadPointer(m_kernel);
      }
+diff --git a/src/core/hle/kernel/k_shared_memory.cpp b/src/core/hle/kernel/k_shared_memory.cpp
+index 61f2872..cb8877b 100644
+--- a/src/core/hle/kernel/k_shared_memory.cpp
++++ b/src/core/hle/kernel/k_shared_memory.cpp
+@@ -59,9 +59,10 @@ Result KSharedMemory::Initialize(KernelCore& kernel, Core::DeviceMemory& device_
+     // Mark initialized.
+     m_is_initialized = true;
+ 
+-    // Clear all pages in the memory.
++    // Clear all pages in the memory (pages still zero are skipped).
+     for (const auto& block : *m_page_group) {
+-        std::memset(m_device_memory->GetPointer<void>(block.GetAddress()), 0, block.GetSize());
++        m_device_memory->buffer.ClearBackingRegion(
++            GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base, block.GetSize(), 0);
+     }
+ 
+     R_SUCCEED();
 diff --git a/src/core/hle/kernel/k_spin_lock.cpp b/src/core/hle/kernel/k_spin_lock.cpp
 index 8525320..107d6f1 100644
 --- a/src/core/hle/kernel/k_spin_lock.cpp
@@ -13421,19 +13649,21 @@ index 14cdd8f..a3c1c4c 100644
              break;
          }
 diff --git a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
-index 1e571be..0329634 100644
+index 1e571be..d3f9bdd 100644
 --- a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
 +++ b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
-@@ -4,6 +4,8 @@
+@@ -4,7 +4,10 @@
  // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
  // SPDX-License-Identifier: GPL-2.0-or-later
  
 +#include <cstdlib>
 +#include <fstream>
  #include <cstring>
++#include <vector>
  #include "common/assert.h"
  #include "common/logging.h"
-@@ -14,11 +16,13 @@
+ #include "core/core.h"
+@@ -14,11 +17,13 @@
  #include "core/hle/service/nvdrv/core/syncpoint_manager.h"
  #include "core/hle/service/nvdrv/devices/ioctl_serialization.h"
  #include "core/hle/service/nvdrv/devices/nvhost_gpu.h"
@@ -13447,7 +13677,7 @@ index 1e571be..0329634 100644
  #include "video_core/host1x/host1x.h"
  
  namespace Service::Nvidia::Devices {
-@@ -33,7 +37,7 @@ Tegra::CommandHeader BuildFenceAction(Tegra::Engines::Puller::FenceOperation op,
+@@ -33,7 +38,7 @@ Tegra::CommandHeader BuildFenceAction(Tegra::Engines::Puller::FenceOperation op,
  
  nvhost_gpu::nvhost_gpu(Core::System& system_, EventInterface& events_interface_,
                         NvCore::Container& core_)
@@ -13456,7 +13686,7 @@ index 1e571be..0329634 100644
        syncpoint_manager{core_.GetSyncpointManager()}, nvmap{core.GetNvMapFile()},
        channel_state{system.GPU().AllocateChannel()} {
      channel_syncpoint = syncpoint_manager.AllocateSyncpoint(false);
-@@ -86,6 +90,11 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
+@@ -86,6 +91,11 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
              return WrapFixedVariable(this, &nvhost_gpu::SubmitGPFIFOBase1, input, output, fd, true);
          case 0x1d:
              return WrapFixed(this, &nvhost_gpu::ChannelSetTimeslice, input, output);
@@ -13468,7 +13698,7 @@ index 1e571be..0329634 100644
          default:
              break;
          }
-@@ -128,6 +137,7 @@ NvResult nvhost_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> inpu
+@@ -128,6 +138,7 @@ NvResult nvhost_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> inpu
  
  void nvhost_gpu::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {
      sessions[fd] = session_id;
@@ -13476,7 +13706,22 @@ index 1e571be..0329634 100644
  }
  
  void nvhost_gpu::OnClose(DeviceFD fd) {
-@@ -280,6 +290,9 @@ NvResult nvhost_gpu::AllocateObjectContext(IoctlAllocObjCtx& params) {
+@@ -163,6 +174,14 @@ NvResult nvhost_gpu::ZCullBind(IoctlZCullBind& params) {
+ NvResult nvhost_gpu::SetErrorNotifier(IoctlSetErrorNotifier& params) {
+     LOG_WARNING(Service_NVDRV, "(STUBBED) called, offset={:X}, size={:X}, mem={:X}", params.offset,
+                 params.size, params.mem);
++    // Like the host driver, clear the notifier when it is installed: NVN polls its status word and
++    // treats a non-zero value (whatever the buffer held before) as a channel error.
++    if (const auto handle = nvmap.GetHandle(params.mem);
++        handle && handle->address && params.size && params.size <= 0x10000 &&
++        params.offset <= handle->size && params.size <= handle->size - params.offset) {
++        const std::vector<u8> zeros(params.size);
++        system.ApplicationMemory().WriteBlock(handle->address + params.offset, zeros.data(), zeros.size());
++    }
+     return NvResult::Success;
+ }
+ 
+@@ -280,6 +299,9 @@ NvResult nvhost_gpu::AllocateObjectContext(IoctlAllocObjCtx& params) {
  
      s32_le ctx_class_number_index =
          GetObjectContextClassNumberIndex(static_cast<CtxClasses>(params.class_num));
@@ -13486,7 +13731,7 @@ index 1e571be..0329634 100644
      if (ctx_class_number_index < 0) {
          LOG_ERROR(Service_NVDRV, "Invalid class number for object context: {:#x}",
                    params.class_num);
-@@ -311,13 +324,13 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildWaitComman
+@@ -311,13 +333,13 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildWaitComman
  }
  
  static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementCommandList(
@@ -13502,7 +13747,7 @@ index 1e571be..0329634 100644
          result.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
                                                     Tegra::SubmissionMode::Increasing));
          result.push_back(
-@@ -328,12 +341,12 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementC
+@@ -328,12 +350,12 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementC
  }
  
  static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementWithWfiCommandList(
@@ -13517,7 +13762,7 @@ index 1e571be..0329634 100644
      result.insert(result.end(), increment_list.begin(), increment_list.end());
      return result;
  }
-@@ -351,6 +364,41 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
+@@ -351,6 +373,41 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
          system.GPU().InitChannel(*channel_state, channel_state->program_id);
      }
  
@@ -13559,7 +13804,7 @@ index 1e571be..0329634 100644
      const auto bind_id = channel_state->bind_id;
  
      auto& flags = params.flags;
-@@ -365,6 +413,8 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
+@@ -365,6 +422,8 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
          }
      }
  
@@ -13568,7 +13813,7 @@ index 1e571be..0329634 100644
      params.fence.id = channel_syncpoint;
  
      u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
-@@ -382,6 +432,14 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
+@@ -382,6 +441,14 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
          }
      }
  
@@ -13583,7 +13828,7 @@ index 1e571be..0329634 100644
      flags.raw = 0;
  
      return NvResult::Success;
-@@ -437,6 +495,26 @@ NvResult nvhost_gpu::GetWaitbase(IoctlGetWaitbase& params) {
+@@ -437,6 +504,26 @@ NvResult nvhost_gpu::GetWaitbase(IoctlGetWaitbase& params) {
      return NvResult::Success;
  }
  
@@ -13610,7 +13855,7 @@ index 1e571be..0329634 100644
  NvResult nvhost_gpu::ChannelSetTimeout(IoctlChannelSetTimeout& params) {
      LOG_INFO(Service_NVDRV, "called, timeout={:#x}", params.timeout);
  
-@@ -463,10 +541,47 @@ Kernel::KEvent* nvhost_gpu::QueryEvent(u32 event_id) {
+@@ -463,10 +550,47 @@ Kernel::KEvent* nvhost_gpu::QueryEvent(u32 event_id) {
          return sm_exception_breakpoint_pause_report_event;
      case 3:
          return error_notifier_event;
@@ -13877,7 +14122,7 @@ index 0000000..12adc24
 +
 +} // namespace Service::Nvidia::Devices
 diff --git a/src/core/hle/service/nvdrv/nvdrv.cpp b/src/core/hle/service/nvdrv/nvdrv.cpp
-index b252a2e..fa6952b 100644
+index b252a2e..7b5d700 100644
 --- a/src/core/hle/service/nvdrv/nvdrv.cpp
 +++ b/src/core/hle/service/nvdrv/nvdrv.cpp
 @@ -18,6 +18,8 @@
@@ -13897,7 +14142,7 @@ index b252a2e..fa6952b 100644
  
  namespace Service::Nvidia {
  
-@@ -125,6 +128,10 @@ void LoopProcess(Core::System& system) {
+@@ -125,6 +128,11 @@ void LoopProcess(Core::System& system) {
  
  Module::Module(Core::System& system)
      : container{system.Host1x()}, service_context{system, "nvdrv"}, events_interface{*this} {
@@ -13905,10 +14150,11 @@ index b252a2e..fa6952b 100644
 +    // another in the same window inherited them.
 +    Tegra::g_nx2_ampere = false;
 +    Tegra::g_native_channels = false;
++    Tegra::Nx2ClearGpuWrittenPages();
      builders["/dev/nvhost-as-gpu"] = [this, &system](DeviceFD fd) {
          auto device = std::make_shared<Devices::nvhost_as_gpu>(system, *this, container);
          return open_files.emplace(fd, std::move(device)).first;
-@@ -133,6 +140,10 @@ Module::Module(Core::System& system)
+@@ -133,6 +141,10 @@ Module::Module(Core::System& system)
          auto device = std::make_shared<Devices::nvhost_gpu>(system, events_interface, container);
          return open_files.emplace(fd, std::move(device)).first;
      };
@@ -13919,7 +14165,7 @@ index b252a2e..fa6952b 100644
      builders["/dev/nvhost-ctrl-gpu"] = [this, &system](DeviceFD fd) {
          auto device = std::make_shared<Devices::nvhost_ctrl_gpu>(system, events_interface);
          return open_files.emplace(fd, std::move(device)).first;
-@@ -163,7 +174,12 @@ Module::Module(Core::System& system)
+@@ -163,7 +175,12 @@ Module::Module(Core::System& system)
      };
  }
  
@@ -13933,7 +14179,7 @@ index b252a2e..fa6952b 100644
  
  NvResult Module::VerifyFD(DeviceFD fd) const {
      if (fd < 0) {
-@@ -180,6 +196,12 @@ NvResult Module::VerifyFD(DeviceFD fd) const {
+@@ -180,6 +197,12 @@ NvResult Module::VerifyFD(DeviceFD fd) const {
  }
  
  DeviceFD Module::Open(const std::string& device_name, NvCore::SessionId session_id) {
@@ -15228,6 +15474,229 @@ index 0330a98..f215c4c 100644
  template<>
  void EmitIR<IR::Opcode::CallHostFunction>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
      auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+diff --git a/src/dynarmic/src/dynarmic/backend/block_range_information.cpp b/src/dynarmic/src/dynarmic/backend/block_range_information.cpp
+index 1a56b7a..068e86c 100644
+--- a/src/dynarmic/src/dynarmic/backend/block_range_information.cpp
++++ b/src/dynarmic/src/dynarmic/backend/block_range_information.cpp
+@@ -8,7 +8,8 @@
+ 
+ #include "dynarmic/backend/block_range_information.h"
+ 
+-#include <boost/icl/interval_map.hpp>
++#include <algorithm>
++
+ #include <boost/icl/interval_set.hpp>
+ #include "common/common_types.h"
+ #include "common/container/unordered_set.h"
+@@ -17,24 +18,28 @@ namespace Dynarmic::Backend {
+ 
+ template<typename P>
+ void BlockRangeInformation<P>::AddRange(boost::icl::discrete_interval<P> range, IR::LocationDescriptor location) {
+-    block_ranges.add(std::make_pair(range, ::Common::unordered_set<IR::LocationDescriptor>{location}));
++    if (!boost::icl::is_empty(range)) {
++        ranges.push_back({boost::icl::first(range), boost::icl::last(range), location});
++    }
+ }
+ 
+ template<typename P>
+ void BlockRangeInformation<P>::ClearCache() {
+-    block_ranges.clear();
++    ranges.clear();
+ }
+ 
+ template<typename P>
+-::Common::unordered_set<IR::LocationDescriptor> BlockRangeInformation<P>::InvalidateRanges(const boost::icl::interval_set<P>& ranges) {
++::Common::unordered_set<IR::LocationDescriptor> BlockRangeInformation<P>::InvalidateRanges(const boost::icl::interval_set<P>& invalidated) {
+     ::Common::unordered_set<IR::LocationDescriptor> erase_locations;
+-    for (auto invalidate_interval : ranges) {
+-        auto pair = block_ranges.equal_range(invalidate_interval);
+-        for (auto it = pair.first; it != pair.second; ++it)
+-            for (const auto& descriptor : it->second)
+-                erase_locations.insert(descriptor);
+-    }
+-    // TODO: EFFICIENCY: Remove ranges that are to be erased.
++    std::erase_if(ranges, [&](const Range& range) {
++        for (const auto& interval : invalidated) {
++            if (range.first <= boost::icl::last(interval) && boost::icl::first(interval) <= range.last) {
++                erase_locations.insert(range.location);
++                return true;
++            }
++        }
++        return false;
++    });
+     return erase_locations;
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/block_range_information.h b/src/dynarmic/src/dynarmic/backend/block_range_information.h
+index 8f7daa9..f894240 100644
+--- a/src/dynarmic/src/dynarmic/backend/block_range_information.h
++++ b/src/dynarmic/src/dynarmic/backend/block_range_information.h
+@@ -8,11 +8,9 @@
+ 
+ #pragma once
+ 
+-#include <set>
++#include <vector>
+ 
+-#include <boost/icl/interval_map.hpp>
+ #include <boost/icl/interval_set.hpp>
+-#include "common/container/unordered_map.h"
+ #include "common/container/unordered_set.h"
+ 
+ #include "dynarmic/ir/location_descriptor.h"
+@@ -24,8 +22,18 @@ class BlockRangeInformation {
+ public:
+     void AddRange(boost::icl::discrete_interval<P> range, IR::LocationDescriptor location);
+     void ClearCache();
+-    ::Common::unordered_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<P>& ranges);
+-    boost::icl::interval_map<P, ::Common::unordered_set<IR::LocationDescriptor>> block_ranges;
++    ::Common::unordered_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<P>& invalidated);
++
++private:
++    /// The guest code [first, last] a block was translated from. Code is invalidated rarely (when
++    /// it is unmapped or reprotected), so a list scanned then costs least: an interval map of
++    /// block sets held ~300 bytes per block.
++    struct Range {
++        P first;
++        P last;
++        IR::LocationDescriptor location;
++    };
++    std::vector<Range> ranges;
+ };
+ 
+ }  // namespace Dynarmic::Backend
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 5c6a90e..e0e3c46 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -1168,7 +1168,7 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+     } else {
+         if (e.conf.enable_cycle_counting) {
+             e.code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+-            e.patch_information[terminal.next].jg.push_back(e.code.getCurr());
++            e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jg);
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJg(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -1176,7 +1176,7 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+             }
+         } else {
+             e.code.cmp(dword[e.code.ABI_JIT_PTR + offsetof(A32JitState, halt_reason)], 0);
+-            e.patch_information[terminal.next].jz.push_back(e.code.getCurr());
++            e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jz);
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJz(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -1196,7 +1196,7 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
+         e.code.mov(MJitStateReg(A32::Reg::PC), A32::LocationDescriptor{terminal.next}.PC());
+         e.code.ReturnFromRunCode();
+     } else {
+-        e.patch_information[terminal.next].jmp.push_back(e.code.getCurr());
++        e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jmp);
+         if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+             e.EmitPatchJmp(terminal.next, next_bb->entrypoint);
+         } else {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index a106bb6..eb36bff 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -87,13 +87,17 @@ public:
+ 
+     // Fastmem information
+     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
++    /// Where a fastmem access that faults goes: code addresses are offsets in the code space.
+     struct FastmemPatchInfo {
+-        u64 resume_rip;
+-        u64 callback;
+-        DoNotFastmemMarker marker;
+-        bool recompile;
++        u32 rip;
++        u32 resume_rip;
++        u32 callback;
++        u32 inst_name : 31;
++        u32 recompile : 1;
++        IR::LocationDescriptor location;
+     };
+     std::optional<DoNotFastmemMarker> ShouldFastmem(A32EmitContext& ctx, IR::Inst* inst) const;
++    void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile);
+     FakeCall FastmemCallback(u64 rip);
+ 
+     // Memory access helpers
+@@ -127,7 +131,7 @@ public:
+     RegAlloc reg_alloc; //reusable reg alloc
+     BlockRangeInformation<u32> block_ranges;
+     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+-    ::Common::unordered_map<u64, FastmemPatchInfo> fastmem_patch_info;
++    std::vector<FastmemPatchInfo> fastmem_patch_info;  // sorted by rip
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 71e5e62..2307226 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -628,7 +628,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+     if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+         if (e.conf.enable_cycle_counting) {
+             e.code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+-            e.patch_information[terminal.next].jg.push_back(e.code.getCurr());
++            e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jg);
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJg(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -636,7 +636,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+             }
+         } else {
+             e.code.cmp(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+-            e.patch_information[terminal.next].jz.push_back(e.code.getCurr());
++            e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jz);
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJz(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -656,7 +656,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+ 
+ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
+     if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+-        e.patch_information[terminal.next].jmp.push_back(e.code.getCurr());
++        e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jmp);
+         if (auto next_bb = e.GetBasicBlock(terminal.next)) {
+             e.EmitPatchJmp(terminal.next, next_bb->entrypoint);
+         } else {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 1310b4a..a9f2d9b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -83,13 +83,17 @@ public:
+ 
+     // Fastmem information
+     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
++    /// Where a fastmem access that faults goes: code addresses are offsets in the code space.
+     struct FastmemPatchInfo {
+-        u64 resume_rip;
+-        u64 callback;
+-        DoNotFastmemMarker marker;
+-        bool recompile;
++        u32 rip;
++        u32 resume_rip;
++        u32 callback;
++        u32 inst_name : 31;
++        u32 recompile : 1;
++        IR::LocationDescriptor location;
+     };
+     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
++    void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile);
+     FakeCall FastmemCallback(u64 rip);
+ 
+     // Memory access helpers
+@@ -123,7 +127,7 @@ public:
+     RegAlloc reg_alloc; //reusable reg alloc
+     BlockRangeInformation<u64> block_ranges;
+     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+-    ::Common::unordered_map<u64, FastmemPatchInfo> fastmem_patch_info;
++    std::vector<FastmemPatchInfo> fastmem_patch_info;  // sorted by rip
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
 diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
 index bb07212..0d5a7d3 100644
 --- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
@@ -15246,7 +15715,7 @@ index bb07212..0d5a7d3 100644
          return emitter.Emit(ir_block).entrypoint;
      }
 diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
-index b9df398..f6b50d1 100644
+index b9df398..bbef5f0 100644
 --- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
 +++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
 @@ -9,6 +9,7 @@
@@ -15270,6 +15739,310 @@ index b9df398..f6b50d1 100644
  void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
      auto args = ctx.reg_alloc.GetArgumentInfo(inst);
      ctx.reg_alloc.HostCall(code, nullptr, args[1], args[2], args[3]);
+@@ -102,7 +109,7 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
+ 
+     code.mov(index_reg.cvt32(), dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr]);
+     code.mov(loc_desc_reg, target.Value());
+-    patch_information[target].mov_rcx.push_back(code.getCurr());
++    AddPatchLocation(target, PatchKind::MovRcx);
+     EmitPatchMovRcx(target_code_ptr);
+     code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_location_descriptors], loc_desc_reg);
+     code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_codeptrs], rcx);
+@@ -357,37 +364,61 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
+     return block_desc;
+ }
+ 
+-void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+-    const CodePtr save_code_ptr = code.getCurr();
+-    const PatchInformation& patch_info = patch_information[target_desc];
+-
+-    for (CodePtr location : patch_info.jg) {
+-        code.SetCodePtr(location);
+-        EmitPatchJg(target_desc, target_code_ptr);
++void EmitX64::AddPatchLocation(const IR::LocationDescriptor& target_desc, PatchKind kind) {
++    const size_t offset = code.getCurr<const u8*>() - static_cast<const u8*>(code.getCode());
++    ASSERT(offset > 0 && offset < (size_t(1) << 30));
++    const u32 entry = u32(offset << 2) | u32(kind);
++    PatchInformation& patch_info = patch_information[target_desc];
++    for (u32& slot : patch_info.first) {
++        if (slot == 0) {
++            slot = entry;
++            return;
++        }
+     }
+-
+-    for (CodePtr location : patch_info.jz) {
+-        code.SetCodePtr(location);
+-        EmitPatchJz(target_desc, target_code_ptr);
++    if (!patch_info.rest) {
++        patch_info.rest = std::make_unique<std::vector<u32>>();
+     }
++    patch_info.rest->push_back(entry);
++}
+ 
+-    for (CodePtr location : patch_info.jmp) {
+-        code.SetCodePtr(location);
+-        EmitPatchJmp(target_desc, target_code_ptr);
++void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
++    const auto it = patch_information.find(target_desc);
++    if (it == patch_information.end()) {
++        return;
+     }
+-
+-    for (CodePtr location : patch_info.mov_rcx) {
+-        code.SetCodePtr(location);
+-        EmitPatchMovRcx(target_code_ptr);
++    const CodePtr save_code_ptr = code.getCurr();
++    const auto patch = [&](u32 entry) {
++        code.SetCodePtr(static_cast<const u8*>(code.getCode()) + (entry >> 2));
++        switch (PatchKind(entry & 3)) {
++        case PatchKind::Jg:
++            EmitPatchJg(target_desc, target_code_ptr);
++            break;
++        case PatchKind::Jz:
++            EmitPatchJz(target_desc, target_code_ptr);
++            break;
++        case PatchKind::Jmp:
++            EmitPatchJmp(target_desc, target_code_ptr);
++            break;
++        case PatchKind::MovRcx:
++            EmitPatchMovRcx(target_code_ptr);
++            break;
++        }
++    };
++    for (const u32 entry : it->second.first) {
++        if (entry != 0) {
++            patch(entry);
++        }
++    }
++    if (it->second.rest) {
++        for (const u32 entry : *it->second.rest) {
++            patch(entry);
++        }
+     }
+-
+     code.SetCodePtr(save_code_ptr);
+ }
+ 
+ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
+-    if (patch_information.count(target_desc)) {
+-        Patch(target_desc, nullptr);
+-    }
++    Patch(target_desc, nullptr);
+ }
+ 
+ void EmitX64::ClearCache() {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 5e540e5..327cac7 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -116,12 +116,16 @@ public:
+     virtual bool EmitTerminal(IR::Term::Terminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept = 0;
+ 
+     // Patching
++    enum class PatchKind : u32 { Jg, Jz, Jmp, MovRcx };
++    /// Places in emitted code that jump to a block (or load its entrypoint), patched when it is
++    /// compiled or invalidated: each the place's offset in the code space times four plus its
++    /// PatchKind, 0 when unused. Most blocks are linked from one or two places.
+     struct PatchInformation {
+-        boost::container::small_vector<CodePtr, 4> jg; //4*8=32
+-        boost::container::small_vector<CodePtr, 4> jz; //4*8=32
+-        boost::container::small_vector<CodePtr, 4> jmp; //4*8=32
+-        boost::container::small_vector<CodePtr, 4> mov_rcx; //4*8=32
++        std::array<u32, 2> first{};
++        std::unique_ptr<std::vector<u32>> rest;
+     };
++    /// Records that the code about to be emitted at the current position is a patch of `kind`.
++    void AddPatchLocation(const IR::LocationDescriptor& target_desc, PatchKind kind);
+     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
+     virtual void Unpatch(const IR::LocationDescriptor& target_desc);
+     virtual void EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) = 0;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 8bb8be3..689e507 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -30,15 +30,48 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
+     return marker;
+ }
+ 
++void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile) {
++    const u64 base = std::bit_cast<u64>(code.getCode());
++    const auto offset = [base](u64 address) {
++        ASSERT(address >= base && address - base <= UINT32_MAX);
++        return u32(address - base);
++    };
++    FastmemPatchInfo info{
++        .rip = offset(std::bit_cast<u64>(location)),
++        .resume_rip = offset(std::bit_cast<u64>(resume_location)),
++        .callback = offset(std::bit_cast<u64>(callback)),
++        .inst_name = 0,
++        .recompile = 0,
++        .location = std::get<0>(marker),
++    };
++    info.inst_name = std::get<1>(marker);
++    info.recompile = recompile ? 1 : 0;
++    // Code is emitted in address order; only a block's deferred fallbacks can come after a later
++    // access of the same block.
++    auto it = fastmem_patch_info.end();
++    if (!fastmem_patch_info.empty() && fastmem_patch_info.back().rip >= info.rip) {
++        it = std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), info.rip,
++                              [](const FastmemPatchInfo& entry, u32 value) { return entry.rip < value; });
++        if (it != fastmem_patch_info.end() && it->rip == info.rip) {
++            return;
++        }
++    }
++    fastmem_patch_info.insert(it, info);
++}
++
+ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+-    const auto iter = fastmem_patch_info.find(rip_);
+-    if (iter != fastmem_patch_info.end()) {
++    const u64 base = std::bit_cast<u64>(code.getCode());
++    const auto iter = rip_ >= base && rip_ - base <= UINT32_MAX
++                        ? std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), u32(rip_ - base),
++                                           [](const FastmemPatchInfo& entry, u32 value) { return entry.rip < value; })
++                        : fastmem_patch_info.end();
++    if (iter != fastmem_patch_info.end() && iter->rip == u32(rip_ - base)) {
+         FakeCall result{
+-            .call_rip = iter->second.callback,
+-            .ret_rip = iter->second.resume_rip,
++            .call_rip = base + iter->callback,
++            .ret_rip = base + iter->resume_rip,
+         };
+-        if (iter->second.recompile) {
+-            const auto marker = iter->second.marker;
++        if (iter->recompile) {
++            const DoNotFastmemMarker marker{iter->location, static_cast<unsigned>(iter->inst_name)};
+             do_not_fastmem.insert(marker);
+             InvalidateBasicBlocks({std::get<0>(marker)});
+         }
+@@ -99,14 +132,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+             code.L(*abort);
+             code.call(wrapped_fn);
+ 
+-            fastmem_patch_info.emplace(
+-                std::bit_cast<u64>(location),
+-                FastmemPatchInfo{
+-                    std::bit_cast<u64>(code.getCurr()),
+-                    std::bit_cast<u64>(wrapped_fn),
+-                    *fastmem_marker,
+-                    conf.recompile_on_fastmem_failure,
+-                });
++            AddFastmemPatch(location, code.getCurr(), wrapped_fn, *fastmem_marker, conf.recompile_on_fastmem_failure);
+ 
+             EmitCheckMemoryAbort(ctx, inst, end);
+             code.jmp(*end, code.T_NEAR);
+@@ -186,14 +212,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+             code.L(*abort);
+             code.call(wrapped_fn);
+ 
+-            fastmem_patch_info.emplace(
+-                std::bit_cast<u64>(location),
+-                FastmemPatchInfo{
+-                    std::bit_cast<u64>(code.getCurr()),
+-                    std::bit_cast<u64>(wrapped_fn),
+-                    *fastmem_marker,
+-                    conf.recompile_on_fastmem_failure,
+-                });
++            AddFastmemPatch(location, code.getCurr(), wrapped_fn, *fastmem_marker, conf.recompile_on_fastmem_failure);
+ 
+             EmitCheckMemoryAbort(ctx, inst, end);
+             code.jmp(*end, code.T_NEAR);
+@@ -357,14 +376,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
+ 
+         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+ 
+-        fastmem_patch_info.emplace(
+-            std::bit_cast<u64>(location),
+-            FastmemPatchInfo{
+-                std::bit_cast<u64>(code.getCurr()),
+-                std::bit_cast<u64>(wrapped_fn),
+-                *fastmem_marker,
+-                conf.recompile_on_exclusive_fastmem_failure,
+-            });
++        AddFastmemPatch(location, code.getCurr(), wrapped_fn, *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+ 
+         code.L(*end);
+ 
+@@ -495,14 +507,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+             code.L(*abort);
+             code.call(wrapped_fn);
+ 
+-            fastmem_patch_info.emplace(
+-                std::bit_cast<u64>(location),
+-                FastmemPatchInfo{
+-                    std::bit_cast<u64>(code.getCurr()),
+-                    std::bit_cast<u64>(wrapped_fn),
+-                    *fastmem_marker,
+-                    conf.recompile_on_exclusive_fastmem_failure,
+-                });
++            AddFastmemPatch(location, code.getCurr(), wrapped_fn, *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+ 
+             code.xor_(status.cvt32(), status.cvt32()); //dep-break
+             code.test(code.al, code.al);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+index 5a82883..4f3d253 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+@@ -465,22 +465,24 @@ std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const noex
+     return std::nullopt;
+ }
+ 
++// The checks that scan every location for def_inst are debug-only: per IR instruction they cost as
++// much as the rest of register allocation.
+ void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, HostLoc host_loc) noexcept {
+-    ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
++    DEBUG_ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
+     LocInfo(host_loc).AddValue(host_loc, def_inst);
+-    ASSERT(*ValueLocation(def_inst) == host_loc);
++    DEBUG_ASSERT(*ValueLocation(def_inst) == host_loc);
+ }
+ 
+ void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, const IR::Value& use_inst) noexcept {
+-    ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
++    DEBUG_ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
+     if (use_inst.IsImmediate()) {
+         const HostLoc location = ScratchImpl(code, gpr_order);
+         DefineValueImpl(code, def_inst, location);
+         LoadImmediate(code, use_inst, location);
+     } else {
+-        ASSERT(ValueLocation(use_inst.GetInst()) && "use_inst must already be defined");
+-        const HostLoc location = *ValueLocation(use_inst.GetInst());
+-        DefineValueImpl(code, def_inst, location);
++        const auto location = ValueLocation(use_inst.GetInst());
++        ASSERT(location && "use_inst must already be defined");
++        DefineValueImpl(code, def_inst, *location);
+     }
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+index 455c6a9..0cad077 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+@@ -65,6 +65,11 @@ public:
+     }
+     void ReleaseOne() noexcept;
+     void ReleaseAll() noexcept;
++    /// True when ReleaseAll would change nothing, as for most of the spill slots most of the time.
++    inline bool IsReleased() const noexcept {
++        return current_references == 0 && is_being_used_count == 0 && !is_scratch && !is_set_last_use &&
++               (total_uses != accumulated_uses || (values.empty() && total_uses == 0 && max_bit_width == 0));
++    }
+     constexpr size_t GetMaxBitWidth() const noexcept { return 1 << max_bit_width; }
+     void AddValue(HostLoc loc, IR::Inst* inst) noexcept;
+     /// Checks if the given instruction is in our values set
+@@ -201,8 +206,10 @@ public:
+     void ReleaseStackSpace(BlockOfCode& code, const size_t stack_space) noexcept;
+ 
+     inline void EndOfAllocScope() noexcept {
++        // After every IR instruction: skip the locations it left alone.
+         for (auto& iter : hostloc_info)
+-            iter.ReleaseAll();
++            if (!iter.IsReleased())
++                iter.ReleaseAll();
+     }
+     inline void AssertNoMoreUses() noexcept {
+         ASSERT(std::all_of(hostloc_info.begin(), hostloc_info.end(), [](const auto& i) noexcept { return i.IsEmpty(); }));
 diff --git a/src/dynarmic/src/dynarmic/common/crypto/qarma.h b/src/dynarmic/src/dynarmic/common/crypto/qarma.h
 new file mode 100644
 index 0000000..add8976
@@ -19637,10 +20410,10 @@ index 0000000..7b682de
 +} // namespace Shader::Ampere
 diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 new file mode 100644
-index 0000000..a0f3126
+index 0000000..40acb3e
 --- /dev/null
 +++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
-@@ -0,0 +1,3960 @@
+@@ -0,0 +1,3967 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Encoding reference: Mesa NAK sm70_encode.rs (MIT), Copyright 2022 Collabora, Ltd.
@@ -20889,9 +21662,9 @@ index 0000000..a0f3126
 +                 (u64{uniform_register(high_result ? high : low)} << 8) | (u64{insn.words[1]} << 20));
 +            break;
 +        }
-+        case 0xb82: { // LDC.64 indexed byte offset
++        case 0xb82: { // LDC, 8 to 64 bits (U8/S8/U16/S16/32/64, Maxwell's order), indexed byte offset
 +            const u32 width = insn.Bits(73, 3);
-+            if ((width != 0 && width != 4 && width != 5) || insn.Bits(78, 2) || insn.Bits(91, 1) ||
++            if (width > 5 || insn.Bits(78, 2) || insn.Bits(91, 1) ||
 +                insn.Bits(54, 5) >= 18 ||
 +                (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
 +            emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
@@ -20975,6 +21748,9 @@ index 0000000..a0f3126
 +        }
 +        case 0x98e: { // RED.E.ADD/MAX.STRONG.GPU U32; uniform pointers support ADD.
 +            u32 address = insn.Bits(24, 8);
++            // A register address may carry a byte offset: 24 bits signed natively, Maxwell RED keeps
++            // 20 (bits 28-47), as for ATOMG.
++            s32 offset = 0;
 +            if ((insn.words[2] & ~0xffU) == 0x0c10e100 && address == 255 &&
 +                insn.Bits(40, 24) == 0 && insn.Bits(64, 8) < 63 - 1 && !(insn.Bits(64, 8) & 1)) {
 +                const u32 uniform = uniform_register(insn.Bits(64, 8));
@@ -20982,12 +21758,16 @@ index 0000000..a0f3126
 +                    emit(0x5c98000000000000ULL | predicate | (250 + word) |
 +                         (u64{uniform + word} << 20) | (u64{15} << 39));
 +                address = 250;
-+            } else if ((insn.words[2] & ~0x03800000U) != 0x0010e100 || // bits 87-89 pick ADD/MIN/MAX/INC/DEC/AND/OR/XOR
-+                       insn.Bits(40, 24) || (address & 1)) {
-+                return fail(index, "native global reduction mode");
++            } else {
++                offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
++                if ((insn.words[2] & ~0x03800000U) != 0x0010e100 || // bits 87-89 pick ADD/MIN/MAX/INC/DEC/AND/OR/XOR
++                    offset < -(1 << 19) || offset >= (1 << 19) || (address & 1)) {
++                    return fail(index, "native global reduction mode");
++                }
 +            }
 +            emit(0xebf8000000000000ULL | predicate | insn.Bits(32, 8) |
-+                (u64{address} << 8) | (u64{insn.Bits(87, 3)} << 23) | (u64{1} << 48));
++                (u64{address} << 8) | (u64{insn.Bits(87, 3)} << 23) |
++                (u64{static_cast<u32>(offset) & 0xfffffU} << 28) | (u64{1} << 48));
 +            break;
 +        }
 +        case 0x2bd: // UFLO.U32, optionally returning the normalization shift.
@@ -30901,6 +31681,25 @@ index fae69ab..7635426 100644
  }
  
  void JoinTextureInfo(Info& base, Info& source) {
+diff --git a/src/shader_recompiler/object_pool.h b/src/shader_recompiler/object_pool.h
+index 5d648b1..edb8cbd 100644
+--- a/src/shader_recompiler/object_pool.h
++++ b/src/shader_recompiler/object_pool.h
+@@ -75,8 +75,13 @@ private:
+             Release();
+         }
+ 
++        // Destroys the objects themselves: Storage's destructor is empty on purpose (the union
++        // also holds unused slots), so destroying the Storage elements would skip T's destructor
++        // and leak what the objects own (e.g. an IR::Inst's phi operand list).
+         void Release() {
+-            std::destroy_n(storage.get(), used_objects);
++            for (size_t index = 0; index < used_objects; ++index) {
++                std::destroy_at(&storage[index].object);
++            }
+             used_objects = 0;
+         }
+ 
 diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
 index 71309e0..1bacf63 100644
 --- a/src/shader_recompiler/shader_info.h
@@ -42523,10 +43322,10 @@ index 64d14ab..d54a141 100644
      texture_cache/image_view_base.h
      texture_cache/image_view_info.cpp
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
-index f30c859..eacaa64 100644
+index f30c859..f39f34a 100644
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
-@@ -9,11 +9,19 @@
+@@ -9,11 +9,20 @@
  #include <algorithm>
  #include <memory>
  #include <numeric>
@@ -42542,11 +43341,12 @@ index f30c859..eacaa64 100644
 +#include "video_core/gpu_write_watch.h"
  #include "video_core/guest_memory.h"
  #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/nx2.h"
 +#include "video_core/nx2_profile.h"
  #include "video_core/texture_cache/util.h"
  
  namespace VideoCommon {
-@@ -54,21 +62,39 @@ template <class P>
+@@ -54,21 +63,39 @@ template <class P>
  BufferCache<P>::~BufferCache() = default;
  
  template <class P>
@@ -42594,7 +43394,7 @@ index f30c859..eacaa64 100644
  }
  
  template <class P>
-@@ -78,6 +104,20 @@ void BufferCache<P>::TickFrame() {
+@@ -78,6 +105,20 @@ void BufferCache<P>::TickFrame() {
          return;
      }
      runtime.TickFrame(slot_buffers);
@@ -42615,7 +43415,7 @@ index f30c859..eacaa64 100644
  
      // Calculate hits and shots and move hit bits to the right
      const u32 hits = std::reduce(channel_state->uniform_cache_hits.begin(),
-@@ -100,8 +140,17 @@ void BufferCache<P>::TickFrame() {
+@@ -100,8 +141,17 @@ void BufferCache<P>::TickFrame() {
      if (runtime.CanReportMemoryUsage()) {
          total_used_memory = runtime.GetDeviceMemoryUsage();
      }
@@ -42635,7 +43435,7 @@ index f30c859..eacaa64 100644
      }
      ++frame_tick;
      delayed_destruction_ring.Tick();
-@@ -114,6 +163,7 @@ void BufferCache<P>::TickFrame() {
+@@ -114,6 +164,7 @@ void BufferCache<P>::TickFrame() {
  
  template <class P>
  void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size) {
@@ -42643,7 +43443,7 @@ index f30c859..eacaa64 100644
      if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
          virtual_ranges.Unmap(as_id, gpu_addr, size);
      }
-@@ -187,6 +237,14 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+@@ -187,6 +238,14 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
      });
  }
  
@@ -42658,7 +43458,7 @@ index f30c859..eacaa64 100644
  template <class P>
  void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
      async_downloads.DeleteAll(device_addr, size);
-@@ -234,7 +292,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+@@ -234,7 +293,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
          const DAddr diff = base_address - *cpu_src_address;
          const DAddr new_base_address = *cpu_dest_address + diff;
          tmp_intervals.push_back({new_base_address, size});
@@ -42667,7 +43467,17 @@ index f30c859..eacaa64 100644
      };
      gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
      // This subtraction in this order is important for overlapping copies.
-@@ -455,8 +513,11 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
+@@ -242,6 +301,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+     const bool has_new_downloads = tmp_intervals.size() != 0;
+     for (const auto& pair : tmp_intervals) {
+         gpu_modified_ranges.Add(pair.first, pair.second);
++        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
++            Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
++        }
+     }
+     const auto& copy = copies[0];
+     src_buffer.MarkUsage(copy.src_offset, copy.size);
+@@ -455,8 +517,11 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
  
      const auto& cbufs = maxwell3d->state.shader_stages[stage];
      const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
@@ -42680,7 +43490,7 @@ index f30c859..eacaa64 100644
      return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
  }
  
-@@ -471,6 +532,8 @@ template <class P>
+@@ -471,6 +536,8 @@ template <class P>
  void BufferCache<P>::BindGraphicsTextureBuffer(size_t stage, size_t tbo_index, GPUVAddr gpu_addr,
                                                 u32 size, PixelFormat format, bool is_written,
                                                 bool is_image) {
@@ -42689,7 +43499,7 @@ index f30c859..eacaa64 100644
      channel_state->enabled_texture_buffers[stage] |= 1U << tbo_index;
      channel_state->written_texture_buffers[stage] |= (is_written ? 1U : 0U) << tbo_index;
      if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
-@@ -531,8 +594,23 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+@@ -531,8 +598,23 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
  
      const auto& cbufs = launch_desc.const_buffer_config;
      const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
@@ -42714,7 +43524,7 @@ index f30c859..eacaa64 100644
  }
  
  template <class P>
-@@ -550,6 +628,7 @@ void BufferCache<P>::BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_add
+@@ -550,6 +632,7 @@ void BufferCache<P>::BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_add
                    tbo_index);
          return;
      }
@@ -42722,7 +43532,7 @@ index f30c859..eacaa64 100644
      channel_state->enabled_compute_texture_buffers |= 1U << tbo_index;
      channel_state->written_compute_texture_buffers |= (is_written ? 1U : 0U) << tbo_index;
      if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
-@@ -649,6 +728,8 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+@@ -649,6 +732,8 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
          async_buffers.emplace_back(std::optional<Async_Buffer>{});
          return;
      }
@@ -42731,7 +43541,7 @@ index f30c859..eacaa64 100644
      auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
      boost::container::small_vector<BufferCopy, 4> normalized_copies;
      runtime.PreCopyBarrier();
-@@ -659,6 +740,19 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+@@ -659,6 +744,19 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
          Buffer& buffer = slot_buffers[buffer_id];
          second_copy.src_offset = static_cast<size_t>(buffer.CpuAddr()) + copy.src_offset;
          const DAddr orig_device_addr = static_cast<DAddr>(second_copy.src_offset);
@@ -42751,7 +43561,7 @@ index f30c859..eacaa64 100644
          async_downloads.Add(orig_device_addr, copy.size);
          buffer.MarkUsage(copy.src_offset, copy.size);
          runtime.CopyBuffer(download_staging.buffer, buffer, copies, false);
-@@ -711,9 +805,28 @@ void BufferCache<P>::PopAsyncBuffers() {
+@@ -711,9 +809,28 @@ void BufferCache<P>::PopAsyncBuffers() {
  
  template <class P>
  bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
@@ -42783,7 +43593,7 @@ index f30c859..eacaa64 100644
  }
  
  template <class P>
-@@ -930,6 +1043,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
+@@ -930,6 +1047,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
  template <class P>
  void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind) {
      ++channel_state->uniform_cache_shots[0];
@@ -42807,7 +43617,7 @@ index f30c859..eacaa64 100644
      const Binding& binding = channel_state->uniform_buffers[stage][index];
      const DAddr device_addr = binding.device_addr;
      const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
-@@ -1006,11 +1136,67 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+@@ -1006,11 +1140,67 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
      channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
  }
  
@@ -42876,7 +43686,7 @@ index f30c859..eacaa64 100644
      if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
          if (binding.gpu_addr == 0 || binding.size == 0) {
              return;
-@@ -1054,7 +1240,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1054,7 +1244,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
          if (binding.segment_first + binding.segment_count > pool.size()) {
              return false;
          }
@@ -42887,7 +43697,7 @@ index f30c859..eacaa64 100644
          runtime.ResetMultiRange();
          for (u32 index = 0; index < binding.segment_count; ++index) {
              const MultiRangeSegment& segment = pool[binding.segment_first + index];
-@@ -1070,6 +1258,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1070,6 +1262,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
              }
              runtime.PushMultiRangeSource(buffer, offset, segment.size);
          }
@@ -42898,7 +43708,7 @@ index f30c859..eacaa64 100644
          return runtime.BindMultiRangeStorageBuffer(key, is_written);
      } else {
          return false;
-@@ -1194,8 +1386,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
+@@ -1194,8 +1390,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                  return alignment > 1 && (offset % alignment) != 0;
              }
          }();
@@ -42915,7 +43725,7 @@ index f30c859..eacaa64 100644
                  const std::span<u8> span =
                      runtime.BindMappedUniformBuffer(0, binding_index, size);
                  device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
-@@ -1292,6 +1491,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
+@@ -1292,6 +1495,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
          if (current_draw_indirect) {
              UpdateDrawIndirect();
          }
@@ -42933,7 +43743,7 @@ index f30c859..eacaa64 100644
      });
  }
  
-@@ -1302,6 +1512,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
+@@ -1302,6 +1516,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
          UpdateComputeUniformBuffers();
          UpdateComputeStorageBuffers();
          UpdateComputeTextureBuffers();
@@ -42950,7 +43760,7 @@ index f30c859..eacaa64 100644
      });
  }
  
-@@ -1372,7 +1592,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
+@@ -1372,7 +1596,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
      const auto& array = maxwell3d->regs.vertex_streams[index];
      const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
      const GPUVAddr gpu_addr_begin = array.Address();
@@ -42964,7 +43774,7 @@ index f30c859..eacaa64 100644
      const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
      const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
      u32 size = address_size; // TODO: Analyze stride and number of vertices
-@@ -1419,6 +1644,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
+@@ -1419,6 +1648,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
  template <class P>
  void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
@@ -42972,7 +43782,7 @@ index f30c859..eacaa64 100644
          Binding& binding = channel_state->uniform_buffers[stage][index];
          if (binding.buffer_id) {
              // Already updated
-@@ -1438,6 +1664,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
+@@ -1438,6 +1668,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->storage_buffers[stage][index];
@@ -42982,7 +43792,7 @@ index f30c859..eacaa64 100644
          const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          binding.buffer_id = buffer_id;
          const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
-@@ -1504,6 +1733,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
+@@ -1504,6 +1737,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
      ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->compute_storage_buffers[index];
@@ -42992,16 +43802,19 @@ index f30c859..eacaa64 100644
          binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          const bool is_written =
              ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-@@ -1529,7 +1761,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+@@ -1529,7 +1765,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
      }
      memory_tracker.MarkRegionAsGpuModified(device_addr, size);
      gpu_modified_ranges.Add(device_addr, size);
 -    uncommitted_gpu_modified_ranges.Add(device_addr, size);
 +    QueueDownload(device_addr, size);
++    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
++        Tegra::Nx2MarkGpuWritten(device_addr, size);
++    }
  }
  
  template <class P>
-@@ -1710,9 +1942,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
+@@ -1710,9 +1949,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
      Buffer& buffer = slot_buffers[buffer_id];
      const auto size = buffer.SizeBytes();
      if (insert) {
@@ -43013,7 +43826,7 @@ index f30c859..eacaa64 100644
          total_used_memory -= Common::AlignUp(size, 1024);
          lru_cache.Free(buffer.getLRUID());
      }
-@@ -1902,6 +2136,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
+@@ -1902,6 +2143,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
      DownloadBufferMemory(buffer, buffer.CpuAddr(), buffer.SizeBytes());
  }
  
@@ -43066,7 +43879,7 @@ index f30c859..eacaa64 100644
  template <class P>
  void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
      boost::container::small_vector<BufferCopy, 1> copies;
-@@ -2030,28 +2310,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+@@ -2030,28 +2317,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
      channel_state->has_deleted_buffers = true;
  }
  
@@ -43662,10 +44475,10 @@ index c2ecc12..e6856aa 100644
                    VertexBuffers);
      }
 diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
-index 2c0ba00..d41a70a 100644
+index 2c0ba00..58cc9f4 100644
 --- a/src/video_core/dma_pusher.cpp
 +++ b/src/video_core/dma_pusher.cpp
-@@ -4,11 +4,18 @@
+@@ -4,13 +4,21 @@
  // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
  // SPDX-License-Identifier: GPL-2.0-or-later
  
@@ -43683,8 +44496,11 @@ index 2c0ba00..d41a70a 100644
 +#include "video_core/gpu_split.h"
  #include "video_core/guest_memory.h"
  #include "video_core/memory_manager.h"
++#include "video_core/nx2.h"
  #include "video_core/rasterizer_interface.h"
-@@ -29,22 +36,69 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
+ 
+ namespace Tegra {
+@@ -29,22 +37,69 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
  DmaPusher::~DmaPusher() = default;
  
  void DmaPusher::DispatchCalls() {
@@ -43755,7 +44571,7 @@ index 2c0ba00..d41a70a 100644
      CommandList& command_list = dma_pushbuffer.front();
  
      const size_t prefetch_size = command_list.prefetch_command_list.size();
-@@ -57,7 +111,10 @@ bool DmaPusher::Step() {
+@@ -57,7 +112,10 @@ bool DmaPusher::Step() {
      }
  
      if (prefetch_size > 0) {
@@ -43767,13 +44583,26 @@ index 2c0ba00..d41a70a 100644
          dma_pushbuffer.pop();
          return true;
      }
-@@ -80,19 +137,35 @@ bool DmaPusher::Step() {
+@@ -80,19 +138,49 @@ bool DmaPusher::Step() {
              const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
              if (kepler_payload || macro_payload) {
                  const size_t words = std::min<size_t>(dma_state.method_count, header.size);
 -                subchannels[dma_state.subchannel]->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
 +                auto* const engine_state = subchannels[dma_state.subchannel];
-+                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++                // Parameters continued in an entry of their own can be arguments the GPU wrote
++                // (an indirect draw record a culling pass filled in). Unsafe reads would give the
++                // macro the older guest words, so flush those first. Safe reads (below) already
++                // flush. EDEN_NX2_PBFLUSH=0 turns this off.
++                static const bool flush_parameters = [] {
++                    const char* value = std::getenv("EDEN_NX2_PBFLUSH");
++                    return value == nullptr || value[0] != '0';
++                }();
++                const bool flushed_parameters =
++                    flush_parameters && words <= 64 &&
++                    FlushGpuWrittenCommands(dma_state.dma_get, words * sizeof(u32));
++                if (flushed_parameters) {
++                    engine_state->current_dirty = false;
++                } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
 +                    // The caches behind IsMemoryDirty belong to the split's back thread.
 +                    split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
 +                                 bytes = words * sizeof(u32)] {
@@ -43795,6 +44624,7 @@ index 2c0ba00..d41a70a 100644
 +            const std::span<const CommandHeader> commands{headers.data(), headers.size()};
 +            command_resume_offset += ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
          } else {
++            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
              Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
 -            ProcessCommands(headers);
 +            const std::span<const CommandHeader> commands{headers.data(), headers.size()};
@@ -43807,7 +44637,7 @@ index 2c0ba00..d41a70a 100644
      if (++dma_pushbuffer_subindex >= command_list_size) {
          dma_pushbuffer.pop();
          dma_pushbuffer_subindex = 0;
-@@ -101,6 +174,7 @@ bool DmaPusher::Step() {
+@@ -101,6 +189,7 @@ bool DmaPusher::Step() {
      }
  
      if (signal_sync) {
@@ -43815,7 +44645,7 @@ index 2c0ba00..d41a70a 100644
          rasterizer->SignalFence([this]() {
              std::scoped_lock lk(sync_mutex);
              synced = true;
-@@ -111,20 +185,21 @@ bool DmaPusher::Step() {
+@@ -111,20 +200,21 @@ bool DmaPusher::Step() {
      return true;
  }
  
@@ -43841,7 +44671,7 @@ index 2c0ba00..d41a70a 100644
              dma_state.is_last_call = dma_state.method_count <= 1;
              CallMethod(command_header.argument);
              dma_state.method += !dma_state.non_incrementing ? 1 : 0;
-@@ -163,7 +238,9 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+@@ -163,7 +253,9 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
              }
              index++;
          }
@@ -43851,7 +44681,7 @@ index 2c0ba00..d41a70a 100644
  }
  
  void DmaPusher::SetState(const CommandHeader& command_header) {
-@@ -182,6 +259,30 @@ void DmaPusher::CallMethod(u32 argument) {
+@@ -182,6 +274,30 @@ void DmaPusher::CallMethod(u32 argument) {
          });
      } else {
          auto subchannel = subchannels[dma_state.subchannel];
@@ -43882,7 +44712,7 @@ index 2c0ba00..d41a70a 100644
          if (!subchannel->execution_mask[dma_state.method]) {
              subchannel->method_sink.emplace_back(dma_state.method, argument);
          } else {
-@@ -197,12 +298,43 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+@@ -197,12 +313,70 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
          puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
      } else {
          auto subchannel = subchannels[dma_state.subchannel];
@@ -43923,11 +44753,38 @@ index 2c0ba00..d41a70a 100644
 +           (engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart);
 +}
 +
++bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
++    // Mario Kart World runs small command lists its culling dispatches fill in each frame. Safe
++    // reads flush every command list; unsafe ones only flush those on pages the GPU has written,
++    // or their draws run with an older frame's words. Only those pages wait for the split's back.
++    if (!g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
++        return false;
++    }
++    bool written = false;
++    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
++        if (const auto device = memory_manager.GpuToCpuAddress(page); device && Nx2IsGpuWritten(*device)) {
++            written = true;
++            break;
++        }
++    }
++    if (!written) {
++        return false;
++    }
++    // The caches belong to the split's back: it first runs what the front queued (the dispatch
++    // that writes these words among it).
++    VideoCommon::GpuSplit::Get().Drain();
++    if (!memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
++        return false;
++    }
++    memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
++    return true;
++}
++
  void DmaPusher::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
      rasterizer = rasterizer_;
  }
 diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
-index 62af628..e59087c 100644
+index 62af628..65a198b 100644
 --- a/src/video_core/dma_pusher.h
 +++ b/src/video_core/dma_pusher.h
 @@ -131,6 +131,8 @@ public:
@@ -43939,7 +44796,7 @@ index 62af628..e59087c 100644
  
      void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
          subchannels[subchannel_id] = engine;
-@@ -142,8 +144,16 @@ public:
+@@ -142,8 +144,19 @@ public:
  private:
      static constexpr u32 non_puller_methods = 0x40;
      static constexpr u32 max_subchannels = 8;
@@ -43953,12 +44810,15 @@ index 62af628..e59087c 100644
      bool Step();
 -    void ProcessCommands(std::span<const CommandHeader> commands);
 +    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
++    /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
++    /// Returns whether anything was flushed.
++    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 +    size_t command_resume_offset{};
  
      void SetState(const CommandHeader& command_header);
  
 diff --git a/src/video_core/engines/draw_manager.cpp b/src/video_core/engines/draw_manager.cpp
-index 5891c25..edd7f41 100644
+index 5891c25..a4b35fe 100644
 --- a/src/video_core/engines/draw_manager.cpp
 +++ b/src/video_core/engines/draw_manager.cpp
 @@ -4,12 +4,17 @@
@@ -43979,7 +44839,41 @@ index 5891c25..edd7f41 100644
  
  namespace Tegra::Engines {
  
-@@ -277,6 +282,45 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
+@@ -80,6 +85,33 @@ void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d) {
+     draw_state.instance_count = 0;
+ }
+ 
++bool Maxwell3D::DrawManager::IsInstanceLoopMethod(u32 method) noexcept {
++    switch (method) {
++    case MAXWELL3D_REG_INDEX(draw.begin):
++    case MAXWELL3D_REG_INDEX(draw.end):
++    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
++    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
++    case MAXWELL3D_REG_INDEX(index_buffer.first):
++    case MAXWELL3D_REG_INDEX(index_buffer.count):
++    case MAXWELL3D_REG_INDEX(index_buffer32_first):
++    case MAXWELL3D_REG_INDEX(index_buffer16_first):
++    case MAXWELL3D_REG_INDEX(index_buffer8_first):
++    case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
++    case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
++    case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
++    case MAXWELL3D_REG_INDEX(draw_inline_index):
++    case MAXWELL3D_REG_INDEX(inline_index_2x16.count):
++    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
++    case MAXWELL3D_REG_INDEX(inline_index_4x8.count):
++    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
++    case MAXWELL3D_REG_INDEX(vertex_array_instance_first):
++    case MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent):
++        return true;
++    default:
++        return false;
++    }
++}
++
+ void Maxwell3D::DrawManager::DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances) {
+     draw_state.topology = topology;
+     draw_state.vertex_buffer.first = vertex_first;
+@@ -277,6 +309,45 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
      LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
      UpdateTopology(maxwell3d);
      if (maxwell3d.ShouldExecute()) {
@@ -44025,7 +44919,7 @@ index 5891c25..edd7f41 100644
          maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
      }
  }
-@@ -285,6 +329,12 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
+@@ -285,6 +356,12 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
      LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
      UpdateTopology(maxwell3d);
      if (maxwell3d.ShouldExecute()) {
@@ -45204,7 +46098,7 @@ index 078d3d4..b525636 100644
  
      void ConsumeSinkImpl(Core::System& system) override;
 diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
-index e7da9d9..a416e5e 100644
+index e7da9d9..28faa00 100644
 --- a/src/video_core/engines/maxwell_3d.cpp
 +++ b/src/video_core/engines/maxwell_3d.cpp
 @@ -4,7 +4,10 @@
@@ -45300,7 +46194,7 @@ index e7da9d9..a416e5e 100644
          num_vertices = (std::max)(
              num_vertices, address_size / (std::max)(attribute.SizeInBytes(), array.stride.Value()));
          break;
-@@ -283,17 +322,25 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
+@@ -283,39 +322,73 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
  
  void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
      const auto control = shadow_state.shadow_ram_control;
@@ -45329,7 +46223,18 @@ index e7da9d9..a416e5e 100644
      }
      method_sink.clear();
  }
-@@ -305,17 +352,36 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+ 
+ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
++    // The instances after the first are drawn together once their loop ends, and they must see
++    // the state they were begun with: NVN2's draw macros reset the base instance (and its copy in
++    // c[0][0x644]) right after the loop, before the macro returns.
++    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method) &&
++        GetNativeMacroEngine().native_turing) [[unlikely]] {
++        draw_manager.DrawDeferred(*this);
++    }
+     regs.reg_array[method] = argument;
+     for (auto const& table : dirty.tables)
+         dirty.flags[table[method]] = true;
  }
  
  void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -45368,7 +46273,7 @@ index e7da9d9..a416e5e 100644
          return ProcessMacroBind(argument);
      case MAXWELL3D_REG_INDEX(falcon[4]):
          return ProcessFirmwareCall4();
-@@ -372,25 +438,40 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
+@@ -372,25 +445,40 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
      }
  }
  
@@ -45412,7 +46317,7 @@ index e7da9d9..a416e5e 100644
  
      // Methods after 0xE00 are special, they're actually triggers for some microcode that was
      // uploaded to the GPU during initialization.
-@@ -398,14 +479,56 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
+@@ -398,20 +486,67 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
          ProcessMacro(system, method, &method_argument, 1, is_last_call);
          return;
      }
@@ -45469,7 +46374,18 @@ index e7da9d9..a416e5e 100644
      // Methods after 0xE00 are special, they're actually triggers for some microcode that was
      // uploaded to the GPU during initialization.
      if (method >= MacroRegistersStart) {
-@@ -453,11 +576,11 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
+         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
+         return;
+     }
++    // As in ProcessDirtyRegisters: the paths below write without it.
++    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method) &&
++        GetNativeMacroEngine().native_turing) [[unlikely]] {
++        draw_manager.DrawDeferred(*this);
++    }
+     switch (method) {
+     case MAXWELL3D_REG_INDEX(const_buffer.buffer):
+     case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 1:
+@@ -453,11 +588,11 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
  }
  
  void Maxwell3D::ProcessMacroUpload(u32 data) {
@@ -45483,7 +46399,7 @@ index e7da9d9..a416e5e 100644
  }
  
  void Maxwell3D::ProcessFirmwareCall4() {
-@@ -586,6 +709,9 @@ void Maxwell3D::ProcessCounterReset() {
+@@ -586,6 +721,9 @@ void Maxwell3D::ProcessCounterReset() {
  }
  
  void Maxwell3D::ProcessSyncPoint() {
@@ -45493,7 +46409,7 @@ index e7da9d9..a416e5e 100644
      const u32 sync_point = regs.sync_info.sync_point.Value();
      [[maybe_unused]] const u32 cache_flush = regs.sync_info.clean_l2.Value();
      rasterizer->SignalSyncPoint(sync_point);
-@@ -595,6 +721,15 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
+@@ -595,6 +733,15 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
      // Bind the buffer currently in CB_ADDRESS to the specified index in the desired shader
      // stage.
      const auto& bind_data = regs.bind_groups[stage_index];
@@ -45509,7 +46425,7 @@ index e7da9d9..a416e5e 100644
      auto& buffer = state.shader_stages[stage_index].const_buffers[bind_data.shader_slot];
      buffer.enabled = bind_data.valid.Value() != 0;
      buffer.address = regs.const_buffer.Address();
-@@ -666,4 +801,417 @@ void Maxwell3D::SetHLEReplacementAttributeType(u32 bank, u32 offset,
+@@ -666,4 +813,417 @@ void Maxwell3D::SetHLEReplacementAttributeType(u32 bank, u32 offset,
      replace_table.emplace(key, name);
  }
  
@@ -45928,7 +46844,7 @@ index e7da9d9..a416e5e 100644
 +
  } // namespace Tegra::Engines
 diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
-index 0cab2ae..84c2a84 100644
+index 0cab2ae..35ab5ed 100644
 --- a/src/video_core/engines/maxwell_3d.h
 +++ b/src/video_core/engines/maxwell_3d.h
 @@ -9,8 +9,10 @@
@@ -45983,7 +46899,20 @@ index 0cab2ae..84c2a84 100644
          // clang-format off
          union {
              struct {
-@@ -3125,16 +3138,46 @@ public:
+@@ -3071,6 +3084,12 @@ public:
+         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
+         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
+         void DrawDeferred(Maxwell3D& maxwell3d);
++        /// Instances after the first wait to be drawn together (DrawDeferred).
++        [[nodiscard]] bool HasDeferredDraw() const noexcept {
++            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
++        }
++        /// Methods an instance loop writes between its draws; any other write ends the loop.
++        [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
+         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
+         void DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
+         void DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
+@@ -3125,16 +3144,46 @@ public:
      };
  
      State state{};
@@ -46030,7 +46959,7 @@ index 0cab2ae..84c2a84 100644
      bool ShouldExecute() const {
          return execute_on;
      }
-@@ -3169,6 +3212,8 @@ public:
+@@ -3169,6 +3218,8 @@ public:
          return 0;
      }
  
@@ -46039,7 +46968,7 @@ index 0cab2ae..84c2a84 100644
      void RefreshParameters() {
          if (!current_macro_dirty) {
              return;
-@@ -3221,7 +3266,16 @@ private:
+@@ -3221,7 +3272,16 @@ private:
       * @param method Method to call
       * @param parameters Arguments to the method call
       */
@@ -46057,7 +46986,7 @@ index 0cab2ae..84c2a84 100644
  
      /// Handles writes to the macro uploading register.
      void ProcessMacroUpload(u32 data);
-@@ -3260,11 +3314,27 @@ private:
+@@ -3260,11 +3320,27 @@ private:
  
      /// Macro method that is currently being executed / being fed parameters.
      u32 executing_macro = 0;
@@ -46085,7 +47014,7 @@ index 0cab2ae..84c2a84 100644
  
      Upload::State upload_state;
  
-@@ -3272,6 +3342,28 @@ private:
+@@ -3272,6 +3348,28 @@ private:
  
      std::vector<std::pair<GPUVAddr, size_t>> macro_segments;
      bool current_macro_dirty{};
@@ -47851,6 +48780,144 @@ index 0000000..72c375a
 +            LOG_WARNING(HW_GPU, "GPU write watch: " what ", address={:#x}, size={:#x}" format,     \
 +                        static_cast<u64>(address), static_cast<u64>(size) __VA_OPT__(,) __VA_ARGS__); \
 +    } while (false)
+diff --git a/src/video_core/host1x/codec_types.h b/src/video_core/host1x/codec_types.h
+index b2f80c8..da9b713 100644
+--- a/src/video_core/host1x/codec_types.h
++++ b/src/video_core/host1x/codec_types.h
+@@ -312,6 +312,10 @@ struct Vp9PictureInfo {
+     bool allow_high_precision_mv;
+     bool segment_enabled;
+     bool mode_ref_delta_enabled;
++
++    Segmentation segmentation;
++    std::array<u8, 7> seg_tree_probs;
++    std::array<u8, 3> seg_pred_probs;
+ };
+ 
+ struct Vp9FrameContainer {
+@@ -377,6 +381,10 @@ struct PictureInfo {
+             .allow_high_precision_mv = allow_high_precision_mv != 0,
+             .segment_enabled = segmentation.enabled != 0,
+             .mode_ref_delta_enabled = loop_filter.mode_ref_delta_enabled != 0,
++
++            .segmentation = segmentation,
++            .seg_tree_probs = {},
++            .seg_pred_probs = {},
+         };
+     }
+ };
+diff --git a/src/video_core/host1x/codecs/vp9.cpp b/src/video_core/host1x/codecs/vp9.cpp
+index dcc6261..bc080f4 100644
+--- a/src/video_core/host1x/codecs/vp9.cpp
++++ b/src/video_core/host1x/codecs/vp9.cpp
+@@ -331,19 +331,16 @@ void VP9::WriteMvProbabilityUpdate(VpxRangeEncoder& writer, u8 new_prob, u8 old_
+ }
+ 
+ void VP9::WriteSegmentation(VpxBitStreamWriter& writer) {
+-    bool enabled = current_picture_info.segmentation.enabled != 0;
++    bool enabled = current_frame_info.segmentation.enabled != 0;
+     writer.WriteBit(enabled);
+     if (!enabled) {
+         return;
+     }
+ 
+-    auto update_map = current_picture_info.segmentation.update_map != 0;
++    auto update_map = current_frame_info.segmentation.update_map != 0;
+     writer.WriteBit(update_map);
+ 
+     if (update_map) {
+-        EntropyProbs entropy_probs{};
+-        host1x.gmmu_manager.ReadBlock(regs.vp9_prob_tab_buffer_offset.Address(), &entropy_probs, sizeof(entropy_probs));
+-
+         auto WriteProb = [&](u8 prob) {
+             bool coded = prob != 255;
+             writer.WriteBit(coded);
+@@ -352,55 +349,55 @@ void VP9::WriteSegmentation(VpxBitStreamWriter& writer) {
+             }
+         };
+ 
+-        for (size_t i = 0; i < entropy_probs.mb_segment_tree_probs.size(); i++) {
+-            WriteProb(entropy_probs.mb_segment_tree_probs[i]);
++        for (size_t i = 0; i < current_frame_info.seg_tree_probs.size(); i++) {
++            WriteProb(current_frame_info.seg_tree_probs[i]);
+         }
+ 
+-        auto temporal_update = current_picture_info.segmentation.temporal_update != 0;
++        auto temporal_update = current_frame_info.segmentation.temporal_update != 0;
+         writer.WriteBit(temporal_update);
+ 
+         if (temporal_update) {
+             for (s32 i = 0; i < 3; i++) {
+-                WriteProb(entropy_probs.segment_pred_probs[i]);
++                WriteProb(current_frame_info.seg_pred_probs[i]);
+             }
+         }
+     }
+ 
+-    if (last_segmentation == current_picture_info.segmentation) {
++    if (last_segmentation == current_frame_info.segmentation) {
+         writer.WriteBit(false);
+         return;
+     }
+ 
+-    last_segmentation = current_picture_info.segmentation;
++    last_segmentation = current_frame_info.segmentation;
+     writer.WriteBit(true);
+-    writer.WriteBit(current_picture_info.segmentation.abs_delta != 0);
++    writer.WriteBit(current_frame_info.segmentation.abs_delta != 0);
+ 
+     constexpr s32 MAX_SEGMENTS = 8;
+     constexpr std::array SegmentationFeatureBits = {8, 6, 2, 0};
+ 
+     for (s32 i = 0; i < MAX_SEGMENTS; i++) {
+-        auto q_enabled = current_picture_info.segmentation.feature_enabled[i][0] != 0;
++        auto q_enabled = current_frame_info.segmentation.feature_enabled[i][0] != 0;
+         writer.WriteBit(q_enabled);
+         if (q_enabled) {
+-            writer.WriteS(current_picture_info.segmentation.feature_data[i][0],
++            writer.WriteS(current_frame_info.segmentation.feature_data[i][0],
+                           SegmentationFeatureBits[0]);
+         }
+ 
+-        auto lf_enabled = current_picture_info.segmentation.feature_enabled[i][1] != 0;
++        auto lf_enabled = current_frame_info.segmentation.feature_enabled[i][1] != 0;
+         writer.WriteBit(lf_enabled);
+         if (lf_enabled) {
+-            writer.WriteS(current_picture_info.segmentation.feature_data[i][1],
++            writer.WriteS(current_frame_info.segmentation.feature_data[i][1],
+                           SegmentationFeatureBits[1]);
+         }
+ 
+-        auto ref_enabled = current_picture_info.segmentation.feature_enabled[i][2] != 0;
++        auto ref_enabled = current_frame_info.segmentation.feature_enabled[i][2] != 0;
+         writer.WriteBit(ref_enabled);
+         if (ref_enabled) {
+-            writer.WriteU(current_picture_info.segmentation.feature_data[i][2],
++            writer.WriteU(current_frame_info.segmentation.feature_data[i][2],
+                           SegmentationFeatureBits[2]);
+         }
+ 
+-        auto skip_enabled = current_picture_info.segmentation.feature_enabled[i][3] != 0;
++        auto skip_enabled = current_frame_info.segmentation.feature_enabled[i][3] != 0;
+         writer.WriteBit(skip_enabled);
+     }
+ }
+@@ -409,7 +406,14 @@ Vp9PictureInfo VP9::GetVp9PictureInfo() {
+     host1x.gmmu_manager.ReadBlock(regs.picture_info_offset.Address(), &current_picture_info, sizeof(PictureInfo));
+     Vp9PictureInfo vp9_info = current_picture_info.Convert();
+ 
+-    InsertEntropy(regs.vp9_prob_tab_buffer_offset.Address(), vp9_info.entropy);
++    // The segmentation probabilities are kept with the frame: a frame can be written out after
++    // the next picture's registers (and probability table) were set up.
++    EntropyProbs entropy_probs;
++    host1x.gmmu_manager.ReadBlock(regs.vp9_prob_tab_buffer_offset.Address(), &entropy_probs,
++                                  sizeof(entropy_probs));
++    entropy_probs.Convert(vp9_info.entropy);
++    vp9_info.seg_tree_probs = entropy_probs.mb_segment_tree_probs;
++    vp9_info.seg_pred_probs = entropy_probs.segment_pred_probs;
+ 
+     // surface_luma_offset[0:3] contains the address of the reference frame offsets in the following
+     // order: last, golden, altref, current.
 diff --git a/src/video_core/host1x/gpu_device_memory_manager.h b/src/video_core/host1x/gpu_device_memory_manager.h
 index a9f2499..1b4f57f 100644
 --- a/src/video_core/host1x/gpu_device_memory_manager.h
@@ -50464,10 +51531,10 @@ index 0000000..8df6e81
 +}
 diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
 new file mode 100644
-index 0000000..9e54097
+index 0000000..41ddd1a
 --- /dev/null
 +++ b/src/video_core/nx2.h
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,185 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -50490,6 +51557,44 @@ index 0000000..9e54097
 +// Set once a channel with the native (Switch 2) ABI binds its 3D engine: the GPU thread split
 +// (gpu_split.h) starts for those titles.
 +inline std::atomic<bool> g_native_channels{false};
++
++// Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Mario
++// Kart World runs small command lists its culling dispatches fill in each frame; read without a
++// flush they hold an older frame's words. The bits never clear: the dispatch that rewrites a page
++// may still be queued on the split's back when its front reads the command list. One bit per
++// 4 KiB of the 36-bit device address space (2 MiB).
++inline constexpr u64 Nx2WrittenPageBits = 12;
++inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
++
++inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
++    if (size == 0) {
++        return;
++    }
++    const u64 last = (std::min)((device_address + size - 1) >> Nx2WrittenPageBits,
++                                u64{g_nx2_gpu_written_pages.size()} * 64 - 1);
++    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last; ++page) {
++        auto& word = g_nx2_gpu_written_pages[page / 64];
++        const u64 bit = u64{1} << (page % 64);
++        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
++            word.fetch_or(bit, std::memory_order_relaxed);
++        }
++    }
++}
++
++/// A new emulation session starts: no page has been written by its GPU yet.
++inline void Nx2ClearGpuWrittenPages() {
++    for (auto& word : g_nx2_gpu_written_pages) {
++        word.store(0, std::memory_order_relaxed);
++    }
++}
++
++[[nodiscard]] inline bool Nx2IsGpuWritten(u64 device_address) {
++    const u64 page = device_address >> Nx2WrittenPageBits;
++    if (page >= u64{g_nx2_gpu_written_pages.size()} * 64) {
++        return false;
++    }
++    return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
++}
 +
 +// NVN2 queues release their progress values into the second page of a two-page GPU-accessible
 +// region and GPU acquires read the same offsets in the first page (the CPU polls the second).
@@ -52644,10 +53749,10 @@ index 9298764..c1724e1 100644
      }
  
 diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-index 264ffb2..5cfd79d 100644
+index 264ffb2..7b2abc2 100644
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-@@ -4,9 +4,20 @@
+@@ -4,9 +4,22 @@
  // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
  // SPDX-License-Identifier: GPL-2.0-or-later
  
@@ -52665,10 +53770,12 @@ index 264ffb2..5cfd79d 100644
 +#include <tuple>
 +#include <set>
 +#include <fstream>
++#include <unordered_map>
++#include <vector>
  #include <mutex>
  
  #include <fmt/format.h>
-@@ -14,12 +25,15 @@
+@@ -14,12 +27,15 @@
  #include "video_core/renderer_vulkan/renderer_vulkan.h"
  
  #include "common/assert.h"
@@ -52684,7 +53791,7 @@ index 264ffb2..5cfd79d 100644
  #include "video_core/engines/maxwell_3d.h"
  #include "video_core/engines/kepler_compute.h"
  #include "video_core/engines/maxwell_3d.h"
-@@ -42,6 +56,7 @@
+@@ -42,6 +58,7 @@
  #include "video_core/texture_cache/texture_cache_base.h"
  #include "video_core/vulkan_common/vulkan_device.h"
  #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -52692,7 +53799,7 @@ index 264ffb2..5cfd79d 100644
  
  namespace Vulkan {
  
-@@ -232,34 +247,596 @@ RasterizerVulkan::~RasterizerVulkan() {
+@@ -232,34 +249,667 @@ RasterizerVulkan::~RasterizerVulkan() {
      scheduler.Finish();
  }
  
@@ -52834,6 +53941,77 @@ index 264ffb2..5cfd79d 100644
 +                        regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
 +        }
 +    };
++    // Donkey Kong Bananza's terrain: a vertex program drawn over points resets each rock and dirt
++    // piece's 5-word indirect draw record ({0 triangles, 1 copy, 0, 0, 0}) through the pointers in
++    // a list (c0[0x110]). The storage buffer tracking does not follow addresses loaded from memory,
++    // so those stores are lost, every record keeps 0 copies and the terrain is never drawn. Do the
++    // program's stores here instead (before the cache locks: the writes take them).
++    // EDEN_NX2_RESETFIX=0 leaves it to the GPU.
++    static const bool reset_fix = [] {
++        const char* value = std::getenv("EDEN_NX2_RESETFIX");
++        return value == nullptr || value[0] != '0';
++    }();
++    if (reset_fix && !is_indexed && maxwell3d->GetNativeMacroEngine().native_turing) {
++        // The program's 11 native instructions.
++        static constexpr std::array<u32, 44> IndirectResetProgram{
++            0xff007321, 0x0002fcff, 0x00000000, 0x000e2400, 0x00007a11, 0x00004400, 0x078018ff,
++            0x001fca00, 0xff017624, 0x00004500, 0x000e06ff, 0x000fcc00, 0x00007381, 0x00000000,
++            0x001eab00, 0x000ea200, 0x00037802, 0x00000001, 0x00000f00, 0x000fca00, 0x00007386,
++            0x00000403, 0x0010a900, 0x004fe800, 0x00007386, 0x000000ff, 0x0010a900, 0x000fe800,
++            0x00007386, 0x000008ff, 0x0010a900, 0x000fe800, 0x00007386, 0x00000cff, 0x0010a900,
++            0x000fe800, 0x00007386, 0x000010ff, 0x0010a900, 0x000fe200, 0x0000794d, 0x00000000,
++            0x03800000, 0x000fea00,
++        };
++        const auto& reset_regs = maxwell3d->regs;
++        const GPUVAddr program =
++            (u64{reset_regs.pipelines[1].reserved[0] & 0xff} << 32) | reset_regs.pipelines[1].reserved[1];
++        static std::unordered_map<GPUVAddr, bool> reset_programs;
++        auto [entry, inserted] = reset_programs.try_emplace(program, false);
++        if (inserted) {
++            std::array<u32, 44> code{};
++            const GPUVAddr code_address = program + 128;
++            if (gpu_memory->IsFullyMappedRange(code_address, sizeof(code))) {
++                gpu_memory->ReadBlockUnsafe(code_address, code.data(), sizeof(code));
++                entry->second = code == IndirectResetProgram;
++            }
++            if (entry->second) {
++                LOG_INFO(HW_GPU, "Indirect draw reset program at {:#x}: its stores are done here", program);
++            }
++        }
++        if (entry->second) {
++            const auto& reset_draw = maxwell3d->draw_manager.draw_state;
++            const auto& cbuf0 = maxwell3d->state.shader_stages[0].const_buffers[0];
++            const GPUVAddr list = gpu_memory->Read<u64>(cbuf0.address + 0x110);
++            const u32 count = (std::min)(reset_draw.vertex_buffer.count, 1U << 20);
++            const GPUVAddr list_begin = list + u64{reset_draw.vertex_buffer.first} * sizeof(u64);
++            const size_t list_bytes = size_t{count} * sizeof(u64);
++            if (count != 0 && gpu_memory->IsFullyMappedRange(list_begin, list_bytes)) {
++                if (gpu_memory->IsMemoryDirty(list_begin, list_bytes, VideoCommon::CacheType::BufferCache)) {
++                    gpu_memory->FlushRegion(list_begin, list_bytes, VideoCommon::CacheType::BufferCache);
++                }
++                std::vector<u64> pointers(count);
++                gpu_memory->ReadBlockUnsafe(list_begin, pointers.data(), list_bytes);
++                static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
++                const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), sizeof(record)};
++                u32 written = 0;
++                for (const u64 pointer : pointers) {
++                    if (pointer == 0 || !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
++                        continue;
++                    }
++                    AccelerateInlineToMemory(pointer, sizeof(record), bytes);
++                    ++written;
++                }
++                static u32 reset_logs{};
++                if (reset_logs < 5) {
++                    ++reset_logs;
++                    LOG_INFO(HW_GPU, "Indirect draw reset: list {:#x}, {} records ({} written)", list_begin,
++                             count, written);
++                }
++            }
++            submitted = true;
++            return;
++        }
++    }
 +    GraphicsPipeline* const pipeline{[&] {
 +        Profile::Scope scope{Profile::Zone::PipelineLookup};
 +        return pipeline_cache.CurrentGraphicsPipeline();
@@ -53097,8 +54275,8 @@ index 264ffb2..5cfd79d 100644
 +            }
 +        }
 +    }
-+}
-+
+ }
+ 
 +
 +namespace {
 +// EDEN_NX2_WINDOW_TRACE: describe clears and draws into screen-sized colour targets (debug aid).
@@ -53178,9 +54356,9 @@ index 264ffb2..5cfd79d 100644
 +            std::fclose(file);
 +        }
 +    }
- }
++}
 +} // Anonymous namespace
- 
++
  void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 +    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
 +    TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
@@ -53295,7 +54473,7 @@ index 264ffb2..5cfd79d 100644
      PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
          const auto& draw_state = maxwell3d->draw_manager.draw_state;
          const u32 num_instances{instance_count};
-@@ -293,6 +870,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+@@ -293,6 +943,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
  }
  
  void RasterizerVulkan::DrawIndirect() {
@@ -53303,7 +54481,7 @@ index 264ffb2..5cfd79d 100644
      const auto& params = maxwell3d->draw_manager.indirect_state;
      buffer_cache.SetDrawIndirect(&params);
      PrepareDraw(params.is_indexed, [this, &params] {
-@@ -398,6 +976,23 @@ void RasterizerVulkan::DrawTexture() {
+@@ -398,6 +1049,23 @@ void RasterizerVulkan::DrawTexture() {
  }
  
  void RasterizerVulkan::Clear(u32 layer_count) {
@@ -53327,7 +54505,7 @@ index 264ffb2..5cfd79d 100644
      FlushWork();
      gpu_memory->FlushCaching();
  
-@@ -485,6 +1080,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+@@ -485,6 +1153,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
          return;
      }
  
@@ -53341,7 +54519,7 @@ index 264ffb2..5cfd79d 100644
      const bool clear_covers_render_area =
          clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
          clear_rect.rect.extent.width >= render_area.width &&
-@@ -510,6 +1112,14 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+@@ -510,6 +1185,14 @@ void RasterizerVulkan::Clear(u32 layer_count) {
          VkClearValue clear_value{};
          if (!is_integer) {
              std::memcpy(clear_value.color.float32, regs.clear_color.data(), regs.clear_color.size() * sizeof(f32));
@@ -53356,7 +54534,7 @@ index 264ffb2..5cfd79d 100644
          } else if (!is_signed) {
              for (size_t i = 0; i < 4; i++)
                  clear_value.color.uint32[i] = u32(f32(u64(int_size) << 1U) * regs.clear_color[i]);
-@@ -583,16 +1193,25 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+@@ -583,16 +1266,25 @@ void RasterizerVulkan::Clear(u32 layer_count) {
  }
  
  void RasterizerVulkan::DispatchCompute() {
@@ -53382,7 +54560,7 @@ index 264ffb2..5cfd79d 100644
          return;
      }
  
-@@ -612,6 +1231,7 @@ void RasterizerVulkan::DispatchCompute() {
+@@ -612,6 +1304,7 @@ void RasterizerVulkan::DispatchCompute() {
              }
              cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
          });
@@ -53390,7 +54568,7 @@ index 264ffb2..5cfd79d 100644
          return;
      }
      const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
-@@ -634,6 +1254,7 @@ void RasterizerVulkan::DispatchCompute() {
+@@ -634,6 +1327,7 @@ void RasterizerVulkan::DispatchCompute() {
          }
          cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
      });
@@ -53398,7 +54576,7 @@ index 264ffb2..5cfd79d 100644
  
      // Log compute dispatch
      if (GPU::Logging::IsActive() &&
-@@ -664,6 +1285,10 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+@@ -664,6 +1358,10 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
      query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
  }
  
@@ -53409,7 +54587,7 @@ index 264ffb2..5cfd79d 100644
  void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                   u32 size) {
      buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
-@@ -710,6 +1335,13 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
+@@ -710,6 +1408,13 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
  }
  
  VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
@@ -53423,7 +54601,7 @@ index 264ffb2..5cfd79d 100644
      {
          std::scoped_lock lock{texture_cache.mutex};
          auto area = texture_cache.GetFlushArea(addr, size);
-@@ -725,10 +1357,43 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
+@@ -725,10 +1430,43 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
      return new_area;
  }
  
@@ -53467,7 +54645,7 @@ index 264ffb2..5cfd79d 100644
      if (True(which & VideoCommon::CacheType::TextureCache)) {
          std::scoped_lock lock{texture_cache.mutex};
          texture_cache.WriteMemory(addr, size);
-@@ -766,7 +1431,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+@@ -766,7 +1504,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
      }
  }
  
@@ -53477,7 +54655,7 @@ index 264ffb2..5cfd79d 100644
      DEBUG_ASSERT(addr != 0 || size != 0);
      {
          std::scoped_lock lock{buffer_cache.mutex};
-@@ -786,6 +1453,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+@@ -786,6 +1526,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
      if (addr == 0 || size == 0) {
          return;
      }
@@ -53485,7 +54663,7 @@ index 264ffb2..5cfd79d 100644
  
      {
          std::scoped_lock lock{texture_cache.mutex};
-@@ -798,6 +1466,24 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+@@ -798,6 +1539,24 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
      pipeline_cache.InvalidateRegion(addr, size);
  }
  
@@ -53510,7 +54688,7 @@ index 264ffb2..5cfd79d 100644
  bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
      if (addr == 0 || size == 0) return true;
      {
-@@ -942,23 +1628,48 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA()
+@@ -942,23 +1701,48 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA()
  void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                  std::span<const u8> memory) {
      auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
@@ -53563,7 +54741,7 @@ index 264ffb2..5cfd79d 100644
  }
  
  std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
-@@ -966,10 +1677,29 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
+@@ -966,10 +1750,29 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
      if (!framebuffer_addr) {
          return {};
      }
@@ -53594,7 +54772,7 @@ index 264ffb2..5cfd79d 100644
          return {};
      }
  
-@@ -997,8 +1727,10 @@ void RasterizerVulkan::FlushWork() {
+@@ -997,8 +1800,10 @@ void RasterizerVulkan::FlushWork() {
      static constexpr u32 DRAWS_TO_DISPATCH = 512;
      static constexpr u32 CHECK_MASK = 3;
  #else
@@ -53817,7 +54995,7 @@ index d926cc1..4151600 100644
      /// Presents the rendered image to the swapchain.
      void Present(VkSemaphore render_semaphore);
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
-index 583cb6e..e898436 100644
+index 583cb6e..6440525 100644
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 @@ -7,6 +7,7 @@
@@ -53897,10 +55075,24 @@ index 583cb6e..e898436 100644
      if (Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu) {
          return false;
      }
-@@ -160,6 +219,60 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+@@ -160,6 +219,75 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
            info.size.depth == 1;
  }
  
++// The most a trimmed ASTC array keeps on the host: 512 MiB, 256 MiB on GPUs with less than 7 GiB
++// (Mario Kart World's two terrain arrays took 724 MiB of a 6 GB card next to ~1.2 GB of other
++// terrain textures). EDEN_NX2_ASTC_ARRAY_MIB=<MiB> sets it.
++[[nodiscard]] u64 TrimmedAstcArrayLimit(const Device& device) {
++    static const u64 forced = [] {
++        const char* value = std::getenv("EDEN_NX2_ASTC_ARRAY_MIB");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
++    }();
++    if (forced != 0) {
++        return forced;
++    }
++    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
++}
++
 +// The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
 +// over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 +// its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
@@ -53945,7 +55137,8 @@ index 583cb6e..e898436 100644
 +    if (decoded_bytes(level_offset) <= (u64{1} << 30)) {
 +        return level_offset != 0 ? host_info() : info;
 +    }
-+    while (level_offset + 1 < levels && decoded_bytes(level_offset) > (u64{512} << 20)) {
++    const u64 limit = TrimmedAstcArrayLimit(device);
++    while (level_offset + 1 < levels && decoded_bytes(level_offset) > limit) {
 +        ++level_offset;
 +    }
 +    LOG_WARNING(Render_Vulkan, "{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ ({}x{})",
@@ -53958,7 +55151,7 @@ index 583cb6e..e898436 100644
  [[nodiscard]] VkImageCreateInfo MakeImageCreateInfo(const Device& device, const ImageInfo& info,
                                                      std::optional<VkFormat> format_override = {}) {
      auto format_info =
-@@ -249,7 +362,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+@@ -249,7 +377,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
  }
  
  [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -53968,7 +55161,7 @@ index 583cb6e..e898436 100644
      static constexpr VkImageViewUsageCreateInfo storage_image_view_usage_create_info{
          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
          .pNext = nullptr,
-@@ -272,8 +386,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+@@ -272,8 +401,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
              .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
              .baseMipLevel = level,
              .levelCount = 1,
@@ -53979,7 +55172,7 @@ index 583cb6e..e898436 100644
          },
      });
  }
-@@ -527,6 +641,20 @@ TransformBufferCopies(std::span<const VideoCommon::BufferCopy> copies, size_t bu
+@@ -527,6 +656,20 @@ TransformBufferCopies(std::span<const VideoCommon::BufferCopy> copies, size_t bu
      };
  }
  
@@ -54000,7 +55193,7 @@ index 583cb6e..e898436 100644
  [[nodiscard]] VkImageSubresourceRange MakeSubresourceRange(const ImageView* image_view) {
      SubresourceRange range = image_view->range;
      if (True(image_view->flags & VideoCommon::ImageViewFlagBits::Slice)) {
-@@ -942,9 +1070,16 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+@@ -942,9 +1085,16 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
      : device{device_}, scheduler{scheduler_}, memory_allocator{memory_allocator_},
        staging_buffer_pool{staging_buffer_pool_}, blit_image_helper{blit_image_helper_},
        render_pass_cache{render_pass_cache_}, resolution{Settings::values.resolution_info} {
@@ -54018,7 +55211,7 @@ index 583cb6e..e898436 100644
      }
      if (!device.IsKhrImageFormatListSupported()) {
          return;
-@@ -1796,6 +1931,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
+@@ -1796,6 +1946,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
      return device.GetDeviceMemoryUsage();
  }
  
@@ -54029,7 +55222,7 @@ index 583cb6e..e898436 100644
  bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
      const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
      if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
-@@ -1814,6 +1953,20 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
+@@ -1814,6 +1968,20 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
      return device.CanReportMemoryUsage();
  }
  
@@ -54050,7 +55243,7 @@ index 583cb6e..e898436 100644
  void TextureCacheRuntime::FlushDeferredClear() {
      scheduler.FlushDeferredClear();
  }
-@@ -1859,6 +2012,9 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
+@@ -1859,6 +2027,9 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
  }
  
  void TextureCacheRuntime::TickFrame() {
@@ -54060,7 +55253,7 @@ index 583cb6e..e898436 100644
      static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
      std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
          if (!scheduler.IsFree(scratch.tick)) {
-@@ -1876,13 +2032,30 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+@@ -1876,13 +2047,30 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
               VAddr cpu_addr_)
      : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
        runtime{&runtime_},
@@ -54095,7 +55288,7 @@ index 583cb6e..e898436 100644
                  flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
              }
              break;
-@@ -1903,11 +2076,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+@@ -1903,11 +2091,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
          original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
      }
      current_image = &Image::original_image;
@@ -54110,7 +55303,7 @@ index 583cb6e..e898436 100644
              storage_image_views[level] =
                  MakeStorageView(device, level, *original_image, storage_format);
          }
-@@ -2085,6 +2259,11 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
+@@ -2085,6 +2274,11 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
  
  void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                              std::span<const VideoCommon::BufferImageCopy> copies) {
@@ -54122,7 +55315,7 @@ index 583cb6e..e898436 100644
      const bool is_rescaled = True(flags & ImageFlagBits::Rescaled);
      if (is_rescaled) {
          ScaleDown();
-@@ -2335,6 +2514,20 @@ VkImageView Image::StorageImageView(s32 level) noexcept {
+@@ -2335,6 +2529,20 @@ VkImageView Image::StorageImageView(s32 level) noexcept {
      return *view;
  }
  
@@ -54143,7 +55336,7 @@ index 583cb6e..e898436 100644
  bool Image::IsRescaled() const noexcept {
      return True(flags & ImageFlagBits::Rescaled);
  }
-@@ -2519,6 +2712,15 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+@@ -2519,6 +2727,15 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
          }
      }
      auto format_info = MaxwellToVK::SurfaceFormat(*device, FormatType::Optimal, true, format);
@@ -54159,7 +55352,7 @@ index 583cb6e..e898436 100644
      if (device->ApiVersion() >= VK_API_VERSION_1_3) {
          const VkFormatProperties3 properties3 =
              device->GetPhysical().GetFormatProperties3(format_info.format);
-@@ -2567,7 +2769,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+@@ -2567,7 +2784,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
          .viewType = VkImageViewType{},
          .format = format_info.format,
          .components = swizzle_mapping,
@@ -54168,7 +55361,7 @@ index 583cb6e..e898436 100644
      };
      const auto create = [&](TextureType tex_type, std::optional<u32> num_layers) {
          VkImageViewCreateInfo ci{create_info};
-@@ -2601,6 +2803,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+@@ -2601,6 +2818,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
          break;
      case VideoCommon::ImageViewType::Cube:
      case VideoCommon::ImageViewType::CubeArray:
@@ -54176,7 +55369,7 @@ index 583cb6e..e898436 100644
          create(TextureType::ColorCube, 6);
          create(TextureType::ColorArrayCube, std::nullopt);
          break;
-@@ -2706,6 +2909,16 @@ vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_
+@@ -2706,6 +2924,16 @@ vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_
                                    std::optional<Shader::TextureType> texture_type) {
      VkImageViewType view_type = ImageViewType(type);
      VkImageSubresourceRange subresource_range = MakeSubresourceRange(aspect_mask, range);
@@ -54193,7 +55386,7 @@ index 583cb6e..e898436 100644
      if (texture_type) {
          view_type = ImageViewType(*texture_type);
          switch (view_type) {
-@@ -2821,6 +3034,11 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
+@@ -2821,6 +3049,11 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
      if (tsc.mipmap_filter != TextureMipmapFilter::None) {
          min_lod = tsc.MinLod();
          max_lod = tsc.MaxLod();
@@ -54205,7 +55398,7 @@ index 583cb6e..e898436 100644
      }
      base_ci = VkSamplerCreateInfo{
          .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-@@ -3133,6 +3351,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
+@@ -3133,6 +3366,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
      u32 z_start, u32 z_count) {
  
      if (IsPixelFormatASTC(image.info.format)) {
@@ -54215,7 +55408,7 @@ index 583cb6e..e898436 100644
          return astc_decoder_pass->Assemble(image, map, swizzles);
      }
  
-@@ -3151,6 +3372,117 @@ void TextureCacheRuntime::AccelerateImageUpload(
+@@ -3151,6 +3387,117 @@ void TextureCacheRuntime::AccelerateImageUpload(
      ASSERT(false);
  }
  
@@ -54707,15 +55900,16 @@ index 997f2b0..b27b15d 100644
  
  } // namespace VideoCommon
 diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
-index 4d5db7e..0790167 100644
+index 4d5db7e..f00155d 100644
 --- a/src/video_core/shader_environment.cpp
 +++ b/src/video_core/shader_environment.cpp
-@@ -4,10 +4,19 @@
+@@ -4,10 +4,20 @@
  // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
  // SPDX-License-Identifier: GPL-2.0-or-later
  
 +#include "video_core/native_diagnostics.h"
  #include <algorithm>
++#include <array>
 +#include <atomic>
 +#include <chrono>
 +#include <cstdlib>
@@ -54730,7 +55924,7 @@ index 4d5db7e..0790167 100644
  #include <optional>
  #include <utility>
  
-@@ -21,6 +30,12 @@
+@@ -21,6 +31,12 @@
  #include "common/settings.h"
  #include <ranges>
  #include "shader_recompiler/environment.h"
@@ -54743,7 +55937,7 @@ index 4d5db7e..0790167 100644
  #include "video_core/engines/kepler_compute.h"
  #include "video_core/memory_manager.h"
  #include "video_core/shader_environment.h"
-@@ -149,11 +164,49 @@ u64 GenericEnvironment::ReadInstruction(u32 address) {
+@@ -149,11 +165,49 @@ u64 GenericEnvironment::ReadInstruction(u32 address) {
      if (address >= cached_lowest && address < cached_highest) {
          return code[(address - cached_lowest) / INST_SIZE];
      }
@@ -54793,7 +55987,7 @@ index 4d5db7e..0790167 100644
      const std::optional<u64> size{TryFindSize()};
      if (!size) {
          return std::nullopt;
-@@ -164,6 +217,12 @@ std::optional<u64> GenericEnvironment::Analyze() {
+@@ -164,6 +218,12 @@ std::optional<u64> GenericEnvironment::Analyze() {
  }
  
  void GenericEnvironment::SetCachedSize(size_t size_bytes) {
@@ -54806,7 +56000,7 @@ index 4d5db7e..0790167 100644
      cached_lowest = start_address;
      cached_highest = start_address + static_cast<u32>(size_bytes);
      code.resize(CachedSizeWords());
-@@ -183,6 +242,7 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
+@@ -183,6 +243,7 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
  }
  
  bool GenericEnvironment::CanBeSerialized() const noexcept {
@@ -54814,7 +56008,7 @@ index 4d5db7e..0790167 100644
      return !has_unbound_instructions;
  }
  
-@@ -202,6 +262,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
+@@ -202,6 +263,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
      const u64 num_texture_types{static_cast<u64>(texture_types.size())};
      const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
      const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size())};
@@ -54822,7 +56016,7 @@ index 4d5db7e..0790167 100644
      const u64 num_cbuf_replacement_values{static_cast<u64>(cbuf_replacements.size())};
  
      file.write(reinterpret_cast<const char*>(&code_size), sizeof(code_size))
-@@ -209,6 +270,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
+@@ -209,6 +271,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
          .write(reinterpret_cast<const char*>(&num_texture_pixel_formats),
                 sizeof(num_texture_pixel_formats))
          .write(reinterpret_cast<const char*>(&num_cbuf_values), sizeof(num_cbuf_values))
@@ -54830,7 +56024,7 @@ index 4d5db7e..0790167 100644
          .write(reinterpret_cast<const char*>(&num_cbuf_replacement_values),
                 sizeof(num_cbuf_replacement_values))
          .write(reinterpret_cast<const char*>(&local_memory_size), sizeof(local_memory_size))
-@@ -232,6 +294,10 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
+@@ -232,6 +295,10 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
          file.write(reinterpret_cast<const char*>(&key), sizeof(key))
              .write(reinterpret_cast<const char*>(&type), sizeof(type));
      }
@@ -54841,7 +56035,7 @@ index 4d5db7e..0790167 100644
      for (const auto& [key, type] : cbuf_replacements) {
          file.write(reinterpret_cast<const char*>(&key), sizeof(key))
              .write(reinterpret_cast<const char*>(&type), sizeof(type));
-@@ -246,6 +312,27 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
+@@ -246,6 +313,27 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
                         sizeof(gp_passthrough_mask));
          }
      }
@@ -54869,7 +56063,7 @@ index 4d5db7e..0790167 100644
  }
  
  std::optional<u64> GenericEnvironment::TryFindSize() {
-@@ -284,13 +371,277 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
+@@ -284,13 +372,331 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
  Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                                               bool via_header_index, u32 raw) {
      const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
@@ -54883,6 +56077,60 @@ index 4d5db7e..0790167 100644
      return entry;
  }
  
++namespace {
++
++// Reads a native program a 4 KiB page at a time instead of one 16-byte instruction at a time (each
++// read checked the GPU caches for the range). Reads still flush: shader code can arrive by a GPU
++// copy that only the caches hold. An instruction outside a fully mapped page is not read.
++class NativeInstructionReader {
++public:
++    using Instruction = Shader::Ampere::Instruction;
++    static constexpr GPUVAddr PageSize = 0x1000;
++
++    explicit NativeInstructionReader(Tegra::MemoryManager& gpu_memory_) : gpu_memory{gpu_memory_} {}
++
++    /// Copies the instruction at `address` into `out`. Returns false when it is not mapped.
++    bool TryRead(GPUVAddr address, Instruction& out) {
++        if (!Holds(address)) {
++            LoadFrom(address);
++        }
++        if (!Holds(address)) {
++            // The page's end is unmapped: read this instruction on its own.
++            if (!gpu_memory.IsFullyMappedRange(address, sizeof(Instruction))) {
++                return false;
++            }
++            gpu_memory.ReadBlock(address, &out, sizeof(out));
++            return true;
++        }
++        out = page[(address - page_begin) / sizeof(Instruction)];
++        return true;
++    }
++
++private:
++    bool Holds(GPUVAddr address) const {
++        return address >= page_begin && address + sizeof(Instruction) <= page_end;
++    }
++
++    // Loads from `address` up to the next page boundary, or nothing if that is not fully mapped.
++    void LoadFrom(GPUVAddr address) {
++        const GPUVAddr next_page = (address | (PageSize - 1)) + 1;
++        const GPUVAddr length = next_page - address;
++        page_begin = address;
++        page_end = address;
++        if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
++            gpu_memory.ReadBlock(address, page.data(), length);
++            page_end = next_page;
++        }
++    }
++
++    Tegra::MemoryManager& gpu_memory;
++    std::array<Instruction, PageSize / sizeof(Instruction)> page;
++    GPUVAddr page_begin{};
++    GPUVAddr page_end{};
++};
++
++} // Anonymous namespace
++
 +void GenericEnvironment::InitializeNativeCode(u32 source_header_size,
 +                                               const Shader::Ampere::TrapGuardReader& guard_reader) {
 +    using Shader::Ampere::Instruction;
@@ -54904,14 +56152,15 @@ index 4d5db7e..0790167 100644
 +        }
 +    };
 +    Shader::Ampere::ProgramCaptureState capture;
++    NativeInstructionReader reader{*gpu_memory};
 +    for (u32 index = 0; index < maximum_instructions; ++index) {
 +        const GPUVAddr address = program_base + native_header_size + index * sizeof(Instruction);
-+        if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) {
++        Instruction instruction;
++        if (!reader.TryRead(address, instruction)) {
 +            dump_failure();
 +            throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
 +        }
-+        auto& instruction = native.emplace_back();
-+        gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
++        native.push_back(instruction);
 +        const auto status = capture.Observe(instruction, index);
 +        if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
 +            dump_failure();
@@ -54925,9 +56174,8 @@ index 4d5db7e..0790167 100644
 +            native, capture, native_header_size,
 +            [&](u32 index) -> std::optional<Instruction> {
 +                const GPUVAddr address = program_base + native_header_size + index * sizeof(Instruction);
-+                if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) return std::nullopt;
 +                Instruction instruction;
-+                gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
++                if (!reader.TryRead(address, instruction)) return std::nullopt;
 +                return instruction;
 +            },
 +            [&](u32 bank, u32 offset) { return ReadCbufValue(bank, offset); });
@@ -55148,7 +56396,7 @@ index 4d5db7e..0790167 100644
  GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                           Tegra::MemoryManager& gpu_memory_,
                                           Maxwell::ShaderType program, GPUVAddr program_base_,
-@@ -298,6 +649,48 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
+@@ -298,6 +704,48 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
      : GenericEnvironment{gpu_memory_, program_base_, start_address_}, maxwell3d{&maxwell3d_} {
      gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
      initial_offset = sizeof(sph);
@@ -55197,7 +56445,7 @@ index 4d5db7e..0790167 100644
      gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
      switch (program) {
      case Maxwell::ShaderType::VertexA:
-@@ -331,13 +724,18 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
+@@ -331,13 +779,18 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
      const u64 local_size{sph.LocalMemorySize()};
      ASSERT(local_size <= (std::numeric_limits<u32>::max)());
      local_memory_size = static_cast<u32>(local_size) + sph.common3.shader_local_memory_crs_size;
@@ -55218,7 +56466,7 @@ index 4d5db7e..0790167 100644
      const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
      ASSERT(cbuf.enabled);
      u32 value{};
-@@ -405,6 +803,18 @@ u32 GraphicsEnvironment::ReadViewportTransformState() {
+@@ -405,6 +858,18 @@ u32 GraphicsEnvironment::ReadViewportTransformState() {
      return viewport_transform_state;
  }
  
@@ -55237,7 +56485,7 @@ index 4d5db7e..0790167 100644
  ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                         Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                         u32 start_address_)
-@@ -417,6 +827,26 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
+@@ -417,6 +882,26 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
      is_proprietary_driver = texture_bound == 2;
      shared_memory_size = qmd.shared_alloc;
      workgroup_size = {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
@@ -55264,7 +56512,7 @@ index 4d5db7e..0790167 100644
  }
  
  u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-@@ -463,12 +893,14 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
+@@ -463,12 +948,14 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
      u64 num_texture_types{};
      u64 num_texture_pixel_formats{};
      u64 num_cbuf_values{};
@@ -55279,7 +56527,7 @@ index 4d5db7e..0790167 100644
          .read(reinterpret_cast<char*>(&num_cbuf_replacement_values),
                sizeof(num_cbuf_replacement_values))
          .read(reinterpret_cast<char*>(&local_memory_size), sizeof(local_memory_size))
-@@ -501,6 +933,13 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
+@@ -501,6 +988,13 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
              .read(reinterpret_cast<char*>(&value), sizeof(value));
          cbuf_values.emplace(key, value);
      }
@@ -55293,7 +56541,7 @@ index 4d5db7e..0790167 100644
      for (size_t i = 0; i < num_cbuf_replacement_values; ++i) {
          u64 key;
          Shader::ReplaceConstant value;
-@@ -511,7 +950,7 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
+@@ -511,7 +1005,7 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
      if (stage == Shader::Stage::Compute) {
          file.read(reinterpret_cast<char*>(&workgroup_size), sizeof(workgroup_size))
              .read(reinterpret_cast<char*>(&shared_memory_size), sizeof(shared_memory_size));
@@ -55302,7 +56550,7 @@ index 4d5db7e..0790167 100644
      } else {
          file.read(reinterpret_cast<char*>(&sph), sizeof(sph));
          initial_offset = sizeof(sph);
-@@ -519,6 +958,44 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
+@@ -519,6 +1013,44 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
              file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
          }
      }
@@ -55347,7 +56595,7 @@ index 4d5db7e..0790167 100644
      is_proprietary_driver = texture_bound == 2;
  }
  
-@@ -526,6 +1003,17 @@ void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
+@@ -526,6 +1058,17 @@ void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
      DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
  }
  
@@ -55365,7 +56613,7 @@ index 4d5db7e..0790167 100644
  u64 FileEnvironment::ReadInstruction(u32 address) {
      if (address < read_lowest || address > read_highest) {
          throw Shader::LogicError("Out of bounds address {}", address);
-@@ -533,6 +1021,13 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
+@@ -533,6 +1076,13 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
      return code[(address - read_lowest) / sizeof(u64)];
  }
  
@@ -57841,18 +59089,36 @@ index a1953c4..e3a0f26 100644
  }
  
 diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
-index be09bca..69c3ba1 100644
+index be09bca..915b22a 100644
 --- a/src/video_core/vulkan_common/vulkan_device.cpp
 +++ b/src/video_core/vulkan_common/vulkan_device.cpp
-@@ -5,6 +5,7 @@
+@@ -5,8 +5,10 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include <algorithm>
 +#include <array>
  #include <bitset>
  #include <chrono>
++#include <cstdlib>
  #include <filesystem>
-@@ -752,9 +753,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+ #include <fstream>
+ #include <optional>
+@@ -748,16 +750,28 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+     if (extensions.buffer_device_address) {
+         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+     }
++    // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
++    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
++    heap_size_limits.fill(VK_WHOLE_SIZE);
++    if (heap_size_limit != 0) {
++        const auto memory_properties = physical.GetMemoryProperties().memoryProperties;
++        for (u32 heap = 0; heap < memory_properties.memoryHeapCount; ++heap) {
++            if (memory_properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
++                heap_size_limits[heap] = heap_size_limit;
++            }
++        }
++    }
+     const VmaAllocatorCreateInfo allocator_info{
              .flags = flags,
              .physicalDevice = physical,
              .device = *logical,
@@ -57865,8 +59131,12 @@ index be09bca..69c3ba1 100644
 +            .preferredLargeHeapBlockSize = 64u * 1024u * 1024u,
              .pAllocationCallbacks = nullptr,
              .pDeviceMemoryCallbacks = nullptr,
-             .pHeapSizeLimit = nullptr,
-@@ -1609,6 +1611,33 @@ u64 Device::GetDeviceMemoryUsage() const {
+-            .pHeapSizeLimit = nullptr,
++            .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
+             .pVulkanFunctions = &functions,
+             .instance = instance,
+             .vulkanApiVersion = ApiVersion(),
+@@ -1609,6 +1623,47 @@ u64 Device::GetDeviceMemoryUsage() const {
      for (const size_t heap : valid_heap_memory) {
          result += budget.heapUsage[heap];
      }
@@ -57893,28 +59163,86 @@ index be09bca..69c3ba1 100644
 +    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
 +    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
 +    physical.GetMemoryProperties(&budget);
-+    u64 result{};
++    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
++    if (allocator != nullptr) {
++        vmaGetHeapBudgets(allocator, heap_budgets.data());
++    }
++    // Only the main heap's budget: summing every heap's counted VRAM twice on AMD (an 8 GB card
++    // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What
++    // the other heaps use is added, as GetDeviceMemoryUsage() counts it too.
++    u64 result = budget.heapBudget[main_heap];
++    if (heap_size_limit != 0) {
++        result = (std::min)(result, heap_size_limit);
++    }
 +    for (const size_t heap : valid_heap_memory) {
-+        result += budget.heapBudget[heap];
++        if (heap != main_heap) {
++            const VmaStatistics& statistics = heap_budgets[heap].statistics;
++            const u64 unused = statistics.blockBytes - statistics.allocationBytes;
++            result += budget.heapUsage[heap] - (std::min)(budget.heapUsage[heap], unused);
++        }
 +    }
      return result;
  }
  
+@@ -1623,6 +1678,15 @@ void Device::CollectPhysicalMemoryInfo() {
+     device_access_memory = 0;
+     u64 device_initial_usage = 0;
+     u64 local_memory = 0;
++    // EDEN_NX2_VRAM_LIMIT_MIB=<n>: treat every device-local heap as n MiB (small card tests).
++    if (const char* value = std::getenv("EDEN_NX2_VRAM_LIMIT_MIB")) {
++        heap_size_limit = std::strtoull(value, nullptr, 10) << 20;
++        LOG_INFO(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB: device-local heaps limited to {} MiB",
++                 heap_size_limit >> 20);
++    }
++    const auto limit = [this](u64 size) {
++        return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;
++    };
+     for (size_t element = 0; element < num_properties; ++element) {
+         const bool is_heap_local =
+             (mem_properties.memoryHeaps[element].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+@@ -1630,15 +1694,22 @@ void Device::CollectPhysicalMemoryInfo() {
+             continue;
+         }
+         valid_heap_memory.push_back(element);
++        const VkMemoryHeap& main = mem_properties.memoryHeaps[main_heap];
++        u64 heap_size = mem_properties.memoryHeaps[element].size;
+         if (is_heap_local) {
+-            local_memory += mem_properties.memoryHeaps[element].size;
++            if ((main.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 || heap_size > main.size) {
++                main_heap = element;
++            }
++            heap_size = limit(heap_size);
++            local_memory += heap_size;
+         }
+         if (extensions.memory_budget) {
+             device_initial_usage += budget.heapUsage[element];
+-            device_access_memory += budget.heapBudget[element];
++            device_access_memory += is_heap_local ? limit(budget.heapBudget[element])
++                                                  : budget.heapBudget[element];
+             continue;
+         }
+-        device_access_memory += mem_properties.memoryHeaps[element].size;
++        device_access_memory += heap_size;
+     }
+     if (is_integrated) {
+         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
 diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
-index bbf3754..b1fa8db 100644
+index bbf3754..6a9732f 100644
 --- a/src/video_core/vulkan_common/vulkan_device.h
 +++ b/src/video_core/vulkan_common/vulkan_device.h
-@@ -963,6 +963,9 @@ FN_MAX_LIMIT_LIST
+@@ -963,6 +963,11 @@ FN_MAX_LIMIT_LIST
  
      u64 GetDeviceMemoryUsage() const;
  
-+    /// The driver's current memory budget for this process (VK_EXT_memory_budget), 0 without it.
++    /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
++    /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its
++    /// budget. 0 without the extension.
 +    u64 GetDeviceMemoryBudget() const;
 +
      u32 GetSetsPerPool() const {
          return sets_per_pool;
      }
-@@ -1145,7 +1148,7 @@ private:
+@@ -1145,7 +1150,7 @@ private:
  
  private:
      VkInstance instance;         ///< Vulkan instance.
@@ -57923,6 +59251,15 @@ index bbf3754..b1fa8db 100644
      vk::DeviceDispatch dld;      ///< Device function pointers.
      vk::PhysicalDevice physical; ///< Physical device.
      vk::Device logical;          ///< Logical device.
+@@ -1249,6 +1254,8 @@ private:
+     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
+     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
+     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
++    size_t main_heap{};    ///< Largest device-local heap, where images live.
++    u64 heap_size_limit{}; ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+ 
+     /// Format properties dictionary.
+     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;
 diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
 index f472154..287381a 100644
 --- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp

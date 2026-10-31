@@ -18,6 +18,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -138,7 +139,20 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                // Parameters continued in an entry of their own can be arguments the GPU wrote
+                // (an indirect draw record a culling pass filled in). Unsafe reads would give the
+                // macro the older guest words, so flush those first. Safe reads (below) already
+                // flush. EDEN_NX2_PBFLUSH=0 turns this off.
+                static const bool flush_parameters = [] {
+                    const char* value = std::getenv("EDEN_NX2_PBFLUSH");
+                    return value == nullptr || value[0] != '0';
+                }();
+                const bool flushed_parameters =
+                    flush_parameters && words <= 64 &&
+                    FlushGpuWrittenCommands(dma_state.dma_get, words * sizeof(u32));
+                if (flushed_parameters) {
+                    engine_state->current_dirty = false;
+                } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
@@ -158,6 +172,7 @@ bool DmaPusher::Step() {
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             command_resume_offset += ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
+            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             command_resume_offset += ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -333,6 +348,33 @@ bool DmaPusher::WantsSegment() const {
     const auto engine = subchannel_type[dma_state.subchannel];
     return engine == Engines::EngineTypes::KeplerCompute ||
            (engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart);
+}
+
+bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+    // Mario Kart World runs small command lists its culling dispatches fill in each frame. Safe
+    // reads flush every command list; unsafe ones only flush those on pages the GPU has written,
+    // or their draws run with an older frame's words. Only those pages wait for the split's back.
+    if (!g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+        return false;
+    }
+    bool written = false;
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page); device && Nx2IsGpuWritten(*device)) {
+            written = true;
+            break;
+        }
+    }
+    if (!written) {
+        return false;
+    }
+    // The caches belong to the split's back: it first runs what the front queued (the dispatch
+    // that writes these words among it).
+    VideoCommon::GpuSplit::Get().Drain();
+    if (!memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
+        return false;
+    }
+    memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
+    return true;
 }
 
 void DmaPusher::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {

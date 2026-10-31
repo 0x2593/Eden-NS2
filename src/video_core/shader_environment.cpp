@@ -6,6 +6,7 @@
 
 #include "video_core/native_diagnostics.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -380,6 +381,60 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     return entry;
 }
 
+namespace {
+
+// Reads a native program a 4 KiB page at a time instead of one 16-byte instruction at a time (each
+// read checked the GPU caches for the range). Reads still flush: shader code can arrive by a GPU
+// copy that only the caches hold. An instruction outside a fully mapped page is not read.
+class NativeInstructionReader {
+public:
+    using Instruction = Shader::Ampere::Instruction;
+    static constexpr GPUVAddr PageSize = 0x1000;
+
+    explicit NativeInstructionReader(Tegra::MemoryManager& gpu_memory_) : gpu_memory{gpu_memory_} {}
+
+    /// Copies the instruction at `address` into `out`. Returns false when it is not mapped.
+    bool TryRead(GPUVAddr address, Instruction& out) {
+        if (!Holds(address)) {
+            LoadFrom(address);
+        }
+        if (!Holds(address)) {
+            // The page's end is unmapped: read this instruction on its own.
+            if (!gpu_memory.IsFullyMappedRange(address, sizeof(Instruction))) {
+                return false;
+            }
+            gpu_memory.ReadBlock(address, &out, sizeof(out));
+            return true;
+        }
+        out = page[(address - page_begin) / sizeof(Instruction)];
+        return true;
+    }
+
+private:
+    bool Holds(GPUVAddr address) const {
+        return address >= page_begin && address + sizeof(Instruction) <= page_end;
+    }
+
+    // Loads from `address` up to the next page boundary, or nothing if that is not fully mapped.
+    void LoadFrom(GPUVAddr address) {
+        const GPUVAddr next_page = (address | (PageSize - 1)) + 1;
+        const GPUVAddr length = next_page - address;
+        page_begin = address;
+        page_end = address;
+        if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
+            gpu_memory.ReadBlock(address, page.data(), length);
+            page_end = next_page;
+        }
+    }
+
+    Tegra::MemoryManager& gpu_memory;
+    std::array<Instruction, PageSize / sizeof(Instruction)> page;
+    GPUVAddr page_begin{};
+    GPUVAddr page_end{};
+};
+
+} // Anonymous namespace
+
 void GenericEnvironment::InitializeNativeCode(u32 source_header_size,
                                                const Shader::Ampere::TrapGuardReader& guard_reader) {
     using Shader::Ampere::Instruction;
@@ -401,14 +456,15 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size,
         }
     };
     Shader::Ampere::ProgramCaptureState capture;
+    NativeInstructionReader reader{*gpu_memory};
     for (u32 index = 0; index < maximum_instructions; ++index) {
         const GPUVAddr address = program_base + native_header_size + index * sizeof(Instruction);
-        if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) {
+        Instruction instruction;
+        if (!reader.TryRead(address, instruction)) {
             dump_failure();
             throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
         }
-        auto& instruction = native.emplace_back();
-        gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+        native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
         if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
             dump_failure();
@@ -422,9 +478,8 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size,
             native, capture, native_header_size,
             [&](u32 index) -> std::optional<Instruction> {
                 const GPUVAddr address = program_base + native_header_size + index * sizeof(Instruction);
-                if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) return std::nullopt;
                 Instruction instruction;
-                gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+                if (!reader.TryRead(address, instruction)) return std::nullopt;
                 return instruction;
             },
             [&](u32 bank, u32 offset) { return ReadCbufValue(bank, offset); });
