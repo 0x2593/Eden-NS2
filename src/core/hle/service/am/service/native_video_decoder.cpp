@@ -660,6 +660,12 @@ private:
                     }
                 }
                 result = Kernel::ResultNotImplemented;
+                if (!h264_context && !mime_is("video/av1")) {
+                    const auto end = std::find(mime.begin(), mime.end(), u8{0});
+                    const std::string name(mime.begin(), end);
+                    LOG_WARNING(Service_AM, "native video configure: unknown codec name \"{}\" ({} bytes)",
+                                name.substr(0, 32), mime.size());
+                }
                 if (h264_context || mime_is("video/av1")) {
                     result = Kernel::ResultInvalidSize;
                     if (request->input_capacity <= transfer_memory->GetSize()) {
@@ -731,8 +737,11 @@ private:
                                 ((!is_200 && request->codec == 3 && request->output_format == 2) ||
                                  (request->codec == 1 && request->output_format == 3)) &&
                                 request->input_format == 3 && request->output_mode == 1;
+            // H.264 also comes with input format 3: Nintendo Switch 2 Welcome Tour sends it through 201
+            // with output format 2 and its parameter sets (Annex B) in Configure's buffer.
             const bool is_h264 = kind == NativeVideoKind::Decoder && request->codec == 0 &&
-                                 request->input_format == 1 && (request->output_format == 2 || request->output_format == 3) &&
+                                 (request->input_format == 1 || request->input_format == 3) &&
+                                 (request->output_format == 2 || request->output_format == 3) &&
                                  request->output_mode == 1;
             // Codec 1 with input format 1 is the VP9 decoder: Donkey Kong Bananza sends it through the
             // command 200 helper (its configuration data comes from Vp9DecoderHolder), Mario Kart
@@ -779,9 +788,16 @@ private:
                     }
                 }
             }
-            LOG_DEBUG(Service_AM, "native video initialize codec={}, output_format={}, input_format={}, output_mode={}, memory_bytes={:#x}, result={:#x}",
-                      request->codec, request->output_format, request->input_format, request->output_mode,
-                      request->memory_size, result.raw);
+            // A refused setup usually makes the game abort (2001-0033 for an unknown codec pairing).
+            if (result.IsSuccess()) {
+                LOG_DEBUG(Service_AM, "native video initialize codec={}, output_format={}, input_format={}, output_mode={}, memory_bytes={:#x}",
+                          request->codec, request->output_format, request->input_format, request->output_mode,
+                          request->memory_size);
+            } else {
+                LOG_WARNING(Service_AM, "native video initialize refused: command {}, codec={}, output_format={}, input_format={}, output_mode={}, memory_bytes={:#x}, result={:#x}",
+                            ctx.GetCommand(), request->codec, request->output_format, request->input_format,
+                            request->output_mode, request->memory_size, result.raw);
+            }
         }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(result.raw);

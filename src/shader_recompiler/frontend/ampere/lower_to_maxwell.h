@@ -1951,6 +1951,31 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                          250 + component);
                 break;
             }
+            // 2D gather with per-texel offsets (bits 76-77 = 2, .PTP): Rb:Rb+1 hold the four
+            // offset pairs. Maxwell TLD4 takes them the same way (offset type 2, bits 54-55)
+            // from its meta register. Welcome Tour gathers like this right after its start.
+            const u32 coordinate = insn.Bits(24, 8), offsets = insn.Bits(32, 8);
+            if (insn.Bits(76, 2) == 2 && insn.Bits(61, 3) == 1 && !insn.Bits(59, 1) && insn.Bits(60, 1) &&
+                mask && !insn.Bits(78, 3) && insn.Bits(81, 3) == 7 && !insn.Bits(89, 1) && !insn.Bits(91, 1) &&
+                binding < 18 && offset <= 0x1fff &&
+                (second != 255 ? count >= 3 : count <= 2) && dest + 1 < reserved_register &&
+                (count == 1 || !(dest & 1)) &&
+                (second == 255 || ((count < 4 || !(second & 1)) && second + 1 < reserved_register)) &&
+                coordinate + 1 < reserved_register && offsets + 1 < reserved_register) {
+                if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+                    return fail(index, "native texture descriptor buffer conflict");
+                result.required_texture_buffer = binding;
+                // The components come back packed from R250 in mask order.
+                emit(0xc800000000000000ULL | (u64{insn.Bits(87, 2)} << 56) | (u64{2} << 54) | predicate |
+                     250 | (u64{coordinate} << 8) | (u64{offsets} << 20) | (u64{2} << 28) |
+                     (u64{mask} << 31) | (u64{offset} << 36) | (u64{insn.Bits(90, 1)} << 49) |
+                     (u64{7} << 51));
+                for (u32 component = 0; component < count; ++component)
+                    emit(0x5c98000000000000ULL | predicate |
+                         (component < 2 ? static_cast<u32>(dest) + component : second + component - 2) |
+                         (u64{15} << 39) | (u64{250 + component} << 20));
+                break;
+            }
             if (insn.Bits(59, 1) || !insn.Bits(60, 1) || insn.Bits(61, 3) != 1 ||
                 !mask || insn.Bits(76, 5) || insn.Bits(81, 3) != 7 ||
                 insn.Bits(89, 1) || insn.Bits(91, 1) || binding >= 18 || offset > 0x1fff ||

@@ -17,7 +17,7 @@ Nintendo Switch 2 games.
 | Mario Kart World (`0400C3F00006E000`, v1.8.0) | Playable in Free Roam and Grand Prix |
 | Pokémon Pokopia (`0400A3A01EE4C000`) | Playable; stable 60 FPS |
 | Splatoon Raiders (`0400380020056000`) | Playable; black screen after the intro |
-| Nintendo Switch 2 Welcome Tour | Boots to a black screen |
+| Nintendo Switch 2 Welcome Tour (`040057C02159A000`) | Boots; runs very slowly |
 
 ### Known issues
 
@@ -26,7 +26,7 @@ Nintendo Switch 2 games.
   loaded. Recommended per-game settings: GPU accuracy Low, asynchronous shaders on, and ASTC
   recompression BC3 (needed on GPUs with less than 8 GB of video memory). Some geometry
   (task/mesh shaders) is missing.
-- **Nintendo Switch 2 Welcome Tour:** launches, but only shows a black screen.
+- **Nintendo Switch 2 Welcome Tour:** reaches the intro and the tour, but runs very slowly.
 
 ## Building (Windows, MSYS2 MINGW64)
 

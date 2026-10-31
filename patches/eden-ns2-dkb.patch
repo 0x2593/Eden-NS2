@@ -9954,10 +9954,10 @@ index 0000000..38cd022
 +} // namespace Service::AM
 diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
 new file mode 100644
-index 0000000..fcb8b74
+index 0000000..a78c743
 --- /dev/null
 +++ b/src/core/hle/service/am/service/native_video_decoder.cpp
-@@ -0,0 +1,983 @@
+@@ -0,0 +1,999 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
 +#include "core/core.h"
@@ -10620,6 +10620,12 @@ index 0000000..fcb8b74
 +                    }
 +                }
 +                result = Kernel::ResultNotImplemented;
++                if (!h264_context && !mime_is("video/av1")) {
++                    const auto end = std::find(mime.begin(), mime.end(), u8{0});
++                    const std::string name(mime.begin(), end);
++                    LOG_WARNING(Service_AM, "native video configure: unknown codec name \"{}\" ({} bytes)",
++                                name.substr(0, 32), mime.size());
++                }
 +                if (h264_context || mime_is("video/av1")) {
 +                    result = Kernel::ResultInvalidSize;
 +                    if (request->input_capacity <= transfer_memory->GetSize()) {
@@ -10691,8 +10697,11 @@ index 0000000..fcb8b74
 +                                ((!is_200 && request->codec == 3 && request->output_format == 2) ||
 +                                 (request->codec == 1 && request->output_format == 3)) &&
 +                                request->input_format == 3 && request->output_mode == 1;
++            // H.264 also comes with input format 3: Nintendo Switch 2 Welcome Tour sends it through 201
++            // with output format 2 and its parameter sets (Annex B) in Configure's buffer.
 +            const bool is_h264 = kind == NativeVideoKind::Decoder && request->codec == 0 &&
-+                                 request->input_format == 1 && (request->output_format == 2 || request->output_format == 3) &&
++                                 (request->input_format == 1 || request->input_format == 3) &&
++                                 (request->output_format == 2 || request->output_format == 3) &&
 +                                 request->output_mode == 1;
 +            // Codec 1 with input format 1 is the VP9 decoder: Donkey Kong Bananza sends it through the
 +            // command 200 helper (its configuration data comes from Vp9DecoderHolder), Mario Kart
@@ -10739,9 +10748,16 @@ index 0000000..fcb8b74
 +                    }
 +                }
 +            }
-+            LOG_DEBUG(Service_AM, "native video initialize codec={}, output_format={}, input_format={}, output_mode={}, memory_bytes={:#x}, result={:#x}",
-+                      request->codec, request->output_format, request->input_format, request->output_mode,
-+                      request->memory_size, result.raw);
++            // A refused setup usually makes the game abort (2001-0033 for an unknown codec pairing).
++            if (result.IsSuccess()) {
++                LOG_DEBUG(Service_AM, "native video initialize codec={}, output_format={}, input_format={}, output_mode={}, memory_bytes={:#x}",
++                          request->codec, request->output_format, request->input_format, request->output_mode,
++                          request->memory_size);
++            } else {
++                LOG_WARNING(Service_AM, "native video initialize refused: command {}, codec={}, output_format={}, input_format={}, output_mode={}, memory_bytes={:#x}, result={:#x}",
++                            ctx.GetCommand(), request->codec, request->output_format, request->input_format,
++                            request->output_mode, request->memory_size, result.raw);
++            }
 +        }
 +        IPC::ResponseBuilder rb{ctx, 2};
 +        rb.Push(result.raw);
@@ -20410,10 +20426,10 @@ index 0000000..7b682de
 +} // namespace Shader::Ampere
 diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 new file mode 100644
-index 0000000..40acb3e
+index 0000000..76531c8
 --- /dev/null
 +++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
-@@ -0,0 +1,3967 @@
+@@ -0,0 +1,3992 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Encoding reference: Mesa NAK sm70_encode.rs (MIT), Copyright 2022 Collabora, Ltd.
@@ -22365,6 +22381,31 @@ index 0000000..40acb3e
 +                for (u32 component = 0; component < count; ++component)
 +                    copy(component < 2 ? static_cast<u32>(dest) + component : second + component - 2,
 +                         250 + component);
++                break;
++            }
++            // 2D gather with per-texel offsets (bits 76-77 = 2, .PTP): Rb:Rb+1 hold the four
++            // offset pairs. Maxwell TLD4 takes them the same way (offset type 2, bits 54-55)
++            // from its meta register. Welcome Tour gathers like this right after its start.
++            const u32 coordinate = insn.Bits(24, 8), offsets = insn.Bits(32, 8);
++            if (insn.Bits(76, 2) == 2 && insn.Bits(61, 3) == 1 && !insn.Bits(59, 1) && insn.Bits(60, 1) &&
++                mask && !insn.Bits(78, 3) && insn.Bits(81, 3) == 7 && !insn.Bits(89, 1) && !insn.Bits(91, 1) &&
++                binding < 18 && offset <= 0x1fff &&
++                (second != 255 ? count >= 3 : count <= 2) && dest + 1 < reserved_register &&
++                (count == 1 || !(dest & 1)) &&
++                (second == 255 || ((count < 4 || !(second & 1)) && second + 1 < reserved_register)) &&
++                coordinate + 1 < reserved_register && offsets + 1 < reserved_register) {
++                if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
++                    return fail(index, "native texture descriptor buffer conflict");
++                result.required_texture_buffer = binding;
++                // The components come back packed from R250 in mask order.
++                emit(0xc800000000000000ULL | (u64{insn.Bits(87, 2)} << 56) | (u64{2} << 54) | predicate |
++                     250 | (u64{coordinate} << 8) | (u64{offsets} << 20) | (u64{2} << 28) |
++                     (u64{mask} << 31) | (u64{offset} << 36) | (u64{insn.Bits(90, 1)} << 49) |
++                     (u64{7} << 51));
++                for (u32 component = 0; component < count; ++component)
++                    emit(0x5c98000000000000ULL | predicate |
++                         (component < 2 ? static_cast<u32>(dest) + component : second + component - 2) |
++                         (u64{15} << 39) | (u64{250 + component} << 20));
 +                break;
 +            }
 +            if (insn.Bits(59, 1) || !insn.Bits(60, 1) || insn.Bits(61, 3) != 1 ||
