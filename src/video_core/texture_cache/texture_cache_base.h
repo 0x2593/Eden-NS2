@@ -478,6 +478,10 @@ private:
     bool ScaleDown(Image& image);
     u64 GetScaledImageSizeBytes(const ImageBase& image);
 
+    /// The device memory an image counts for in total_used_memory between two driver readings
+    /// (none for an unbacked image).
+    u64 ImageMemoryBytes(const ImageBase& image) const;
+
     void QueueAsyncDecode(Image& image, ImageId image_id);
     void TickAsyncDecode();
 

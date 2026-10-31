@@ -251,14 +251,18 @@ void TextureCache<P>::TickFrame() {
         // VRAM (another game: 7.0 -> 6.4 GB), and collecting only past it means the driver pages
         // textures out. It is also the room to use: Eden's device memory figure is capped near
         // 7 GB, which on a 12 GB card (11.2 GB budget) kept title 1 evicting textures with 3 GB
-        // unused. EDEN_NX2_TC_*_MIB overrides still win.
+        // unused. Both thresholds stay under it with a margin (1/8 of it, 768 MiB to 1 GiB): past
+        // it allocations fail and images end up unbacked, and Windows shrinks the budget as the
+        // card fills (16 GB card: 13.5 GB left mid-race), hence the re-read every 30 frames.
+        // EDEN_NX2_TC_*_MIB overrides still win.
         if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
-            if (native_thresholds_applied && budget_check_frames++ % 60 == 0) {
+            if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
                     const u64 old_critical = critical_memory;
-                    critical_memory = budget - 768_MiB;
-                    expected_memory = budget - 1536_MiB;
+                    const u64 margin = std::clamp<u64>(budget / 8, 768_MiB, 1_GiB);
+                    critical_memory = budget - margin;
+                    expected_memory = budget - 2 * margin;
                     // Log only real changes (the budget moves by a few MiB all the time).
                     const u64 change = critical_memory > old_critical
                                            ? critical_memory - old_critical
@@ -1839,6 +1843,22 @@ void TextureCache<P>::InvalidateScale(Image& image) {
 }
 
 template <class P>
+u64 TextureCache<P>::ImageMemoryBytes(const ImageBase& image) const {
+    // An unbacked image has no device memory: counted at its full size (GBs for sparse virtual
+    // textures), deleting it would look to the collector like freeing that much.
+    if (True(image.flags & ImageFlagBits::Unbacked)) {
+        return 0;
+    }
+    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+    if ((IsPixelFormatASTC(image.info.format) &&
+         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+        True(image.flags & ImageFlagBits::Converted)) {
+        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
+    }
+    return Common::AlignUp(tentative_size, 1024);
+}
+
+template <class P>
 u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
     const u64 scale_up = static_cast<u64>(Settings::values.resolution_info.up_scale *
                                           Settings::values.resolution_info.up_scale);
@@ -2756,13 +2776,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
-    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
-    if ((IsPixelFormatASTC(image.info.format) &&
-         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
-        True(image.flags & ImageFlagBits::Converted)) {
-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
-    }
-    total_used_memory += Common::AlignUp(tentative_size, 1024);
+    total_used_memory += ImageMemoryBytes(image);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
@@ -3122,13 +3136,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }
-    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
-    if ((IsPixelFormatASTC(image.info.format) &&
-         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
-        True(image.flags & ImageFlagBits::Converted)) {
-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
-    }
-    total_used_memory -= Common::AlignUp(tentative_size, 1024);
+    // TickFrame sets the total from the driver, which can be under the sum of these estimates.
+    total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
     const GPUVAddr gpu_addr = image.gpu_addr;
     const auto alloc_it = image_allocs_table.find(gpu_addr);
     if (alloc_it == image_allocs_table.end()) {
