@@ -47241,7 +47241,7 @@ index ed4675e..8603c71 100644
  
  void MaxwellDMA::ReleaseSemaphore() {
 diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
-index 0b05d31..b8dae87 100644
+index 0b05d31..8971a54 100644
 --- a/src/video_core/engines/puller.cpp
 +++ b/src/video_core/engines/puller.cpp
 @@ -4,6 +4,9 @@
@@ -47384,7 +47384,7 @@ index 0b05d31..b8dae87 100644
          break;
      default:
          UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
-@@ -79,16 +165,117 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+@@ -79,16 +165,120 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
      }
  }
  
@@ -47437,6 +47437,9 @@ index 0b05d31..b8dae87 100644
 +        OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
 +            rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
 +        });
++        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++            split.NoteRelease(sequence_address);
++        }
      } else {
 +        // An acquire reads what earlier work released: let the split's back thread finish it.
 +        // A GEQUAL acquire that guest memory already meets needs no wait: the counters only
@@ -47504,7 +47507,7 @@ index 0b05d31..b8dae87 100644
              regs.acquire_source = true;
              regs.acquire_value = regs.semaphore_sequence;
              if (op == GpuSemaphoreOperation::AcquireEqual) {
-@@ -120,10 +307,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+@@ -120,10 +310,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
  void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
      const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
      const u32 payload = regs.semaphore_release;
@@ -47523,7 +47526,7 @@ index 0b05d31..b8dae87 100644
      u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
      const auto value = regs.semaphore_acquire;
      while (word != value) {
-@@ -155,13 +349,13 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+@@ -155,13 +352,13 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
      case BufferMethods::WrcacheFlush:
          break;
      case BufferMethods::RefCnt:
@@ -47539,7 +47542,7 @@ index 0b05d31..b8dae87 100644
          break;
      case BufferMethods::SemaphoreOperation: {
          ProcessSemaphoreTriggerMethod(dma_pusher);
-@@ -172,17 +366,22 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+@@ -172,17 +369,22 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
          break;
      }
      case BufferMethods::MemOpA: {
@@ -47565,7 +47568,7 @@ index 0b05d31..b8dae87 100644
          break;
      }
      case BufferMethods::SemaphoreAcquire: {
-@@ -211,12 +410,19 @@ void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+@@ -211,12 +413,19 @@ void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
      case EngineID::FERMI_TWOD_A:
          dma_pusher.channel_state.payload->fermi_2d.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
          break;
@@ -47585,7 +47588,7 @@ index 0b05d31..b8dae87 100644
      case EngineID::MAXWELL_DMA_COPY_A:
          dma_pusher.channel_state.payload->maxwell_dma.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
          break;
-@@ -239,12 +445,19 @@ void Puller::CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subcha
+@@ -239,12 +448,19 @@ void Puller::CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subcha
      case EngineID::FERMI_TWOD_A:
          dma_pusher.channel_state.payload->fermi_2d.CallMultiMethod(dma_pusher.system, method, base_start, amount, methods_pending);
          break;
@@ -48031,10 +48034,10 @@ index 974d214..47f50cd 100644
  
 diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
 new file mode 100644
-index 0000000..9ce9276
+index 0000000..a80c5dd
 --- /dev/null
 +++ b/src/video_core/gpu_split.cpp
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,398 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -48241,6 +48244,26 @@ index 0000000..9ce9276
 +    }
 +}
 +
++void GpuSplit::AwaitReleases(GPUVAddr address, u64 size) {
++    if (sent_releases.empty()) {
++        return;
++    }
++    const u64 done = consumed.load(std::memory_order_acquire);
++    bool wait = false;
++    for (auto it = sent_releases.begin(); it != sent_releases.end();) {
++        if (it->second <= done) {
++            it = sent_releases.erase(it);
++            continue;
++        }
++        wait |= it->first >= address && it->first < address + size;
++        ++it;
++    }
++    if (wait) {
++        Drain();
++        sent_releases.clear();
++    }
++}
++
 +void GpuSplit::Drain() {
 +    consumed_cache = consumed.load(std::memory_order_acquire);
 +    if (consumed_cache == write_position) {
@@ -48415,10 +48438,10 @@ index 0000000..9ce9276
 +} // namespace VideoCommon
 diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
 new file mode 100644
-index 0000000..cf2adde
+index 0000000..b8fd99b
 --- /dev/null
 +++ b/src/video_core/gpu_split.h
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,219 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -48430,6 +48453,7 @@ index 0000000..cf2adde
 +#include <memory>
 +#include <thread>
 +#include <type_traits>
++#include <unordered_map>
 +
 +#include "common/common_types.h"
 +
@@ -48543,6 +48567,14 @@ index 0000000..cf2adde
 +    static inline bool check_owner{};
 +    static void CheckOwner(const char* where);
 +
++    /// A semaphore release sent to the back at `address` (front thread only).
++    void NoteRelease(GPUVAddr address) {
++        sent_releases.insert_or_assign(address, write_position);
++    }
++    /// Waits for the back to run the releases sent to [address, address + size): macros on the
++    /// front read memory that the GPU would have written by then (front thread only).
++    void AwaitReleases(GPUVAddr address, u64 size);
++
 +    /// Makes what was sent visible to the back.
 +    void Publish();
 +    /// Waits until the back executed everything sent so far.
@@ -48611,6 +48643,8 @@ index 0000000..cf2adde
 +    Tegra::Engines::EngineInterface* front_engine{};
 +    void (*front_after_method)(void*){};
 +    void* front_after_context{};
++    /// Semaphore releases sent to the back: address, write position after them.
++    std::unordered_map<GPUVAddr, u64> sent_releases;
 +
 +    // Back side.
 +    Tegra::Engines::EngineInterface* back_engine{};
@@ -49325,7 +49359,7 @@ index e084837..28b1dcf 100644
  
  uvec4 ReadTexel(uint offset) {
 diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
-index 86f528a..48fa89a 100644
+index 86f528a..6cf07cf 100644
 --- a/src/video_core/macro.cpp
 +++ b/src/video_core/macro.cpp
 @@ -4,6 +4,10 @@
@@ -49347,15 +49381,16 @@ index 86f528a..48fa89a 100644
  #endif
  
  #include "common/assert.h"
-@@ -25,6 +30,7 @@
+@@ -25,6 +30,8 @@
  #include "video_core/engines/maxwell_3d.h"
  #include "video_core/engines/maxwell_3d.h"
  #include "video_core/dirty_flags.h"
 +#include "video_core/memory_manager.h"
++#include "video_core/gpu_split.h"
  #include "video_core/rasterizer_interface.h"
  #include "video_core/macro.h"
  
-@@ -32,6 +38,7 @@
+@@ -32,6 +39,7 @@
  #include "common/bit_field.h"
  #include "common/logging.h"
  #include "video_core/engines/maxwell_3d.h"
@@ -49363,7 +49398,7 @@ index 86f528a..48fa89a 100644
  
  namespace Tegra {
  
-@@ -1339,6 +1346,212 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
+@@ -1339,6 +1347,229 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
  
  void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
                            std::span<const u32> parameters) {
@@ -49417,7 +49452,7 @@ index 86f528a..48fa89a 100644
 +        const auto emit = [&](u32 address, u32 value) {
 +                if (address >= 0xe00) return false;
 +                if (address == 0x556) {
-+                    // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
++                    // SET_RENDER_ENABLE_C (render_enable.mode): 0 never, 1 always, 2-4 conditional.
 +                    // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
 +                    static std::array<u64, 4> modes{};
 +                    static u64 enable_writes{};
@@ -49442,6 +49477,23 @@ index 86f528a..48fa89a 100644
 +                                            maxwell3d.GetRegisterValue(MemAddressB);
 +                    auto& memory = maxwell3d.GetMemoryManager();
 +                    const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
++                    // The GPU reads what the semaphore releases before it wrote (title 4 keeps
++                    // "clear pending" flags that way): wait for the back to run those sent to
++                    // the words, then take releases that still wait for the host GPU (accurate
++                    // GPU mode writes them from a fence).
++                    const u64 dma_bytes = u64{std::min<u32>(value, 0x1000)} * 4;
++                    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && split.FrontMacros()) {
++                        split.AwaitReleases(source, dma_bytes);
++                    }
++                    const auto read_word = [&](GPUVAddr address) {
++                        if (const auto device = dma_bytes <= 256 ? memory.GpuToCpuAddress(address)
++                                                                 : std::nullopt) {
++                            if (const auto pending = maxwell3d.Rasterizer().PendingSemaphoreRelease(*device)) {
++                                return *pending;
++                            }
++                        }
++                        return memory.Read<u32>(address);
++                    };
 +                    // The words may have just been written by the GPU (e.g. indirect draw arguments
 +                    // from a culling dispatch) and still be only in host buffers: flush them first,
 +                    // or the macro draws with an older frame's arguments (objects pop in and out).
@@ -49470,7 +49522,7 @@ index 86f528a..48fa89a 100644
 +                                 address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
 +                    }
 +                    for (u32 i = 0; i < std::min<u32>(value, 0x1000); ++i) {
-+                        const u32 word = memory.Read<u32>(source + u64{i} * 4);
++                        const u32 word = read_word(source + u64{i} * 4);
 +                        if (address == DmaReadFifoed) {
 +                            fifo.push_back(word);
 +                        } else if (ram + i < native_interpreter.active_dram->size()) {

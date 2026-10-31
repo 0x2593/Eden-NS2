@@ -213,6 +213,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.NoteRelease(sequence_address);
+        }
     } else {
         // An acquire reads what earlier work released: let the split's back thread finish it.
         // A GEQUAL acquire that guest memory already meets needs no wait: the counters only

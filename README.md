@@ -13,10 +13,10 @@ Nintendo Switch 2 games.
 
 | Game | State |
 | --- | --- |
-| Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Playable; blue screen after reaching a certain area |
+| Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Playable; slow in some areas |
 | Mario Kart World (`0400C3F00006E000`, v1.8.0) | Playable in Free Roam and Grand Prix |
 | Pokémon Pokopia (`0400A3A01EE4C000`) | Playable; stable 60 FPS |
-| Splatoon Raiders (`0400380020056000`) | Playable; black screen after the intro |
+| Splatoon Raiders (`0400380020056000`) | Playable |
 | Nintendo Switch 2 Welcome Tour (`040057C02159A000`) | Boots; runs very slowly |
 
 ### Known issues

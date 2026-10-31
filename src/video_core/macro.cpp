@@ -31,6 +31,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/memory_manager.h"
+#include "video_core/gpu_split.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
 
@@ -1396,7 +1397,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         const auto emit = [&](u32 address, u32 value) {
                 if (address >= 0xe00) return false;
                 if (address == 0x556) {
-                    // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
+                    // SET_RENDER_ENABLE_C (render_enable.mode): 0 never, 1 always, 2-4 conditional.
                     // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
                     static std::array<u64, 4> modes{};
                     static u64 enable_writes{};
@@ -1421,6 +1422,23 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                                             maxwell3d.GetRegisterValue(MemAddressB);
                     auto& memory = maxwell3d.GetMemoryManager();
                     const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
+                    // The GPU reads what the semaphore releases before it wrote (title 4 keeps
+                    // "clear pending" flags that way): wait for the back to run those sent to
+                    // the words, then take releases that still wait for the host GPU (accurate
+                    // GPU mode writes them from a fence).
+                    const u64 dma_bytes = u64{std::min<u32>(value, 0x1000)} * 4;
+                    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && split.FrontMacros()) {
+                        split.AwaitReleases(source, dma_bytes);
+                    }
+                    const auto read_word = [&](GPUVAddr address) {
+                        if (const auto device = dma_bytes <= 256 ? memory.GpuToCpuAddress(address)
+                                                                 : std::nullopt) {
+                            if (const auto pending = maxwell3d.Rasterizer().PendingSemaphoreRelease(*device)) {
+                                return *pending;
+                            }
+                        }
+                        return memory.Read<u32>(address);
+                    };
                     // The words may have just been written by the GPU (e.g. indirect draw arguments
                     // from a culling dispatch) and still be only in host buffers: flush them first,
                     // or the macro draws with an older frame's arguments (objects pop in and out).
@@ -1449,7 +1467,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                                  address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
                     }
                     for (u32 i = 0; i < std::min<u32>(value, 0x1000); ++i) {
-                        const u32 word = memory.Read<u32>(source + u64{i} * 4);
+                        const u32 word = read_word(source + u64{i} * 4);
                         if (address == DmaReadFifoed) {
                             fifo.push_back(word);
                         } else if (ram + i < native_interpreter.active_dram->size()) {
