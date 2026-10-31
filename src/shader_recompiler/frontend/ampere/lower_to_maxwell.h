@@ -1437,13 +1437,16 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 (u64{data} << 20) | (u64{1} << 48));
             break;
         }
-        case 0x9a8: { // ATOMG.E.ADD.STRONG.GPU U32 through a uniform pointer.
+        case 0x9a8: { // ATOMG.E.ADD.STRONG.GPU U32 through a uniform pointer plus a byte offset.
             const u32 address = uniform_register(insn.Bits(64, 6));
-            if (insn.Bits(24, 8) != 255 || insn.Bits(40, 24) ||
+            // The native offset is 24 bits signed; Maxwell ATOM keeps 20 (bits 28-47).
+            const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
+            if (insn.Bits(24, 8) != 255 || offset < -(1 << 19) || offset >= (1 << 19) ||
                 (insn.words[2] & ~0x3fU) != 0x081ee140 || address == ~0U || (address & 1))
                 return fail(index, "native global atomic mode");
             emit(0xed00000000000000ULL | predicate | dest | (u64{address} << 8) |
-                (u64{insn.Bits(32, 8)} << 20) | (u64{1} << 48));
+                (u64{insn.Bits(32, 8)} << 20) | (u64{static_cast<u32>(offset) & 0xfffffU} << 28) |
+                (u64{1} << 48));
             break;
         }
         case 0xb97: { // SULD.P.2D/2D_ARRAY.IGN, direct descriptor and R, RG, or RGBA channels.
@@ -3654,8 +3657,14 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             if (std::ranges::find(validated_barrier_cancellations, index) != validated_barrier_cancellations.end()) break;
             // A BREAK (optionally conditional) out of the innermost PBK scope only drops that scope's
             // token; the threads then branch past its BSYNC, and an enclosing SYNC scope pops the
-            // leftover PBK token together with everything above it, so nothing is emitted.
-            if (!barrier_tokens.empty() && insn.Bits(16, 4) == barrier_tokens.back() &&
+            // leftover PBK token together with everything above it, so nothing is emitted. When the
+            // next instruction breaks the enclosing scope too (same predicate), it is a multi-level
+            // exit and the cancellation sequence below validates it as a whole.
+            const bool breaks_outer_next =
+                barrier_tokens.size() >= 2 && index + 1 < code.size() &&
+                code[index + 1].Bits(0, 12) == 0x942 && code[index + 1].Bits(12, 4) == insn.Bits(12, 4) &&
+                code[index + 1].Bits(16, 4) == barrier_tokens[barrier_tokens.size() - 2];
+            if (!breaks_outer_next && !barrier_tokens.empty() && insn.Bits(16, 4) == barrier_tokens.back() &&
                 !barrier_sync_scopes.back() && insn.words[1] == 0 && (insn.words[2] & ~0x07800000U) == 0 &&
                 std::any_of(barrier_sync_scopes.begin(), barrier_sync_scopes.end() - 1,
                             [](bool sync) { return sync; }))

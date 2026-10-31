@@ -194,6 +194,9 @@ private:
 
     void InnerGatherDeviceAddresses(Common::ScratchBuffer<u32>& buffer, PAddr address);
 
+    /// Cuts the contiguous runs of the pages before page_index short of it (its mapping changed).
+    void TruncateContinuityBefore(size_t page_index);
+
     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
 
     const uintptr_t physical_base;

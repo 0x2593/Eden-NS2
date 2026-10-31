@@ -213,9 +213,12 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
+    TruncateContinuityBefore(start_page_d);
     for (size_t i = 0; i < num_pages; i++) {
         const VAddr new_vaddress = virtual_address + i * Memory::YUZU_PAGESIZE;
         auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
+        // Runs from an earlier mapping no longer hold; TrackContinuityImpl recomputes them.
+        tracked_entries.GetUnchecked(start_page_d + i).continuity_tracker = 0;
         if (ptr == nullptr) [[unlikely]] {
             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
             InsertCPUBacking(start_page_d + i, new_vaddress, asid);
@@ -263,11 +266,13 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
+    TruncateContinuityBefore(start_page_d);
     for (size_t i = 0; i < num_pages; i++) {
         auto& entry = tracked_entries.GetUnchecked(start_page_d + i);
         auto phys_addr = entry.compressed_physical_ptr;
         entry.compressed_physical_ptr = 0;
         entry.cpu_backing_address = 0;
+        entry.continuity_tracker = 0;
         if (phys_addr != 0) [[likely]] {
             u32& base_dev = compressed_device_addr.GetAndFault(phys_addr - 1U);
             if ((base_dev >> MULTI_FLAG_BITS) == 0) [[likely]] {
@@ -285,6 +290,20 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     }
     translation_generation.fetch_add(1, std::memory_order_release);
 }
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::TruncateContinuityBefore(size_t page_index) {
+    // A page's run counts the pages after it that are physically contiguous with it. Runs only
+    // ever shrink by one per page, so stop at the first page whose run already ends in time.
+    for (size_t index = page_index; index > 0; --index) {
+        const size_t pages_before = page_index - index;
+        if (tracked_entries[index - 1].continuity_tracker <= pages_before) {
+            break;
+        }
+        tracked_entries.GetUnchecked(index - 1).continuity_tracker = static_cast<u32>(pages_before);
+    }
+}
+
 template <typename Traits>
 void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtual_address,
                                                       size_t size, Asid asid) {
@@ -394,7 +413,10 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
     std::size_t page_index = addr >> Memory::YUZU_PAGEBITS;
     std::size_t page_offset = addr & Memory::YUZU_PAGEMASK;
     while (remaining_size) {
-        const size_t next_pages = std::size_t(tracked_entries[page_index].continuity_tracker+1);
+        const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
+        // An unmapped page says nothing about the pages after it.
+        const size_t next_pages =
+            phys_addr == 0 ? 1 : std::size_t(tracked_entries[page_index].continuity_tracker + 1);
         const std::size_t copy_amount = (std::min)((next_pages << Memory::YUZU_PAGEBITS) - page_offset, remaining_size);
         const auto current_vaddr = u64((page_index << Memory::YUZU_PAGEBITS) + page_offset);
         SCOPE_EXIT{
@@ -404,7 +426,6 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
             remaining_size -= copy_amount;
         };
 
-        auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
         if (phys_addr == 0) {
             on_unmapped(copy_amount, current_vaddr);
             continue;

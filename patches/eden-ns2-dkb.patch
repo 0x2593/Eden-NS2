@@ -2320,7 +2320,7 @@ index 44ddf11..71af2ac 100644
  
      std::span<const u8> reply_span{reinterpret_cast<u8*>(&reply.front()), reply.size()};
 diff --git a/src/core/device_memory_manager.h b/src/core/device_memory_manager.h
-index b4b3b46..f441d0a 100644
+index b4b3b46..cf8a6d9 100644
 --- a/src/core/device_memory_manager.h
 +++ b/src/core/device_memory_manager.h
 @@ -59,6 +59,11 @@ public:
@@ -2372,7 +2372,17 @@ index b4b3b46..f441d0a 100644
      static constexpr size_t page_bits = 12;
      static constexpr size_t page_size = 1ULL << page_bits;
      static constexpr size_t page_mask = page_size - 1ULL;
-@@ -204,8 +230,7 @@ private:
+@@ -168,6 +194,9 @@ private:
+ 
+     void InnerGatherDeviceAddresses(Common::ScratchBuffer<u32>& buffer, PAddr address);
+ 
++    /// Cuts the contiguous runs of the pages before page_index short of it (its mapping changed).
++    void TruncateContinuityBefore(size_t page_index);
++
+     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
+ 
+     const uintptr_t physical_base;
+@@ -204,8 +233,7 @@ private:
          tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
      }
  
@@ -2383,7 +2393,7 @@ index b4b3b46..f441d0a 100644
      using CounterAtomicType = std::atomic_uint8_t;
      static constexpr size_t subentries = 8 / sizeof(CounterType);
 diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
-index 97c2706..8cb8625 100644
+index 97c2706..bff7416 100644
 --- a/src/core/device_memory_manager.inc
 +++ b/src/core/device_memory_manager.inc
 @@ -21,7 +21,9 @@
@@ -2405,15 +2415,23 @@ index 97c2706..8cb8625 100644
      , tracked_entries(device_as_size >> Memory::YUZU_PAGEBITS)
  {
      impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
-@@ -216,6 +218,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
+@@ -211,11 +213,15 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
+     std::scoped_lock lk(mapping_guard);
+ 
+     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
++    TruncateContinuityBefore(start_page_d);
+     for (size_t i = 0; i < num_pages; i++) {
+         const VAddr new_vaddress = virtual_address + i * Memory::YUZU_PAGESIZE;
          auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
++        // Runs from an earlier mapping no longer hold; TrackContinuityImpl recomputes them.
++        tracked_entries.GetUnchecked(start_page_d + i).continuity_tracker = 0;
          if (ptr == nullptr) [[unlikely]] {
              tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
 +            InsertCPUBacking(start_page_d + i, new_vaddress, asid);
              continue;
          }
          auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
-@@ -234,12 +237,24 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
+@@ -234,12 +240,24 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
          }
          impl->multi_dev_address.Register(new_dev, start_id);
      }
@@ -2439,16 +2457,45 @@ index 97c2706..8cb8625 100644
  template <typename Traits>
  void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
      size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
-@@ -268,7 +283,7 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+@@ -248,11 +266,13 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+     std::scoped_lock lk(mapping_guard);
+ 
+     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
++    TruncateContinuityBefore(start_page_d);
+     for (size_t i = 0; i < num_pages; i++) {
+         auto& entry = tracked_entries.GetUnchecked(start_page_d + i);
+         auto phys_addr = entry.compressed_physical_ptr;
+         entry.compressed_physical_ptr = 0;
+         entry.cpu_backing_address = 0;
++        entry.continuity_tracker = 0;
+         if (phys_addr != 0) [[likely]] {
+             u32& base_dev = compressed_device_addr.GetAndFault(phys_addr - 1U);
+             if ((base_dev >> MULTI_FLAG_BITS) == 0) [[likely]] {
+@@ -268,8 +288,22 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
              base_dev = new_start | MULTI_FLAG;
          }
      }
 -    t_slot = {};
 +    translation_generation.fetch_add(1, std::memory_order_release);
++}
++
++template <typename Traits>
++void DeviceMemoryManager<Traits>::TruncateContinuityBefore(size_t page_index) {
++    // A page's run counts the pages after it that are physically contiguous with it. Runs only
++    // ever shrink by one per page, so stop at the first page whose run already ends in time.
++    for (size_t index = page_index; index > 0; --index) {
++        const size_t pages_before = page_index - index;
++        if (tracked_entries[index - 1].continuity_tracker <= pages_before) {
++            break;
++        }
++        tracked_entries.GetUnchecked(index - 1).continuity_tracker = static_cast<u32>(pages_before);
++    }
  }
++
  template <typename Traits>
  void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtual_address,
-@@ -357,6 +372,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
+                                                       size_t size, Asid asid) {
+@@ -357,6 +391,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
      if (!ptr) [[unlikely]] {
          return;
      }
@@ -2456,7 +2503,27 @@ index 97c2706..8cb8625 100644
      std::memcpy(ptr, &value, sizeof(T));
  }
  
-@@ -404,9 +420,10 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
+@@ -378,7 +413,10 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
+     std::size_t page_index = addr >> Memory::YUZU_PAGEBITS;
+     std::size_t page_offset = addr & Memory::YUZU_PAGEMASK;
+     while (remaining_size) {
+-        const size_t next_pages = std::size_t(tracked_entries[page_index].continuity_tracker+1);
++        const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
++        // An unmapped page says nothing about the pages after it.
++        const size_t next_pages =
++            phys_addr == 0 ? 1 : std::size_t(tracked_entries[page_index].continuity_tracker + 1);
+         const std::size_t copy_amount = (std::min)((next_pages << Memory::YUZU_PAGEBITS) - page_offset, remaining_size);
+         const auto current_vaddr = u64((page_index << Memory::YUZU_PAGEBITS) + page_offset);
+         SCOPE_EXIT{
+@@ -388,7 +426,6 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
+             remaining_size -= copy_amount;
+         };
+ 
+-        auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
+         if (phys_addr == 0) {
+             on_unmapped(copy_amount, current_vaddr);
+             continue;
+@@ -404,9 +441,10 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
      const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
      if (size <= Memory::YUZU_PAGESIZE - page_offset) {
          const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -2470,7 +2537,7 @@ index 97c2706..8cb8625 100644
                  return;
              }
          }
-@@ -415,8 +432,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
+@@ -415,8 +453,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
          const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
          if (phys_addr != 0) {
              auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
@@ -2481,7 +2548,7 @@ index 97c2706..8cb8625 100644
              std::memcpy(dest_pointer, mem_ptr + page_offset, size);
              return;
          }
-@@ -424,10 +441,13 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
+@@ -424,10 +462,13 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
      WalkBlock(
          address, size,
          [&](size_t copy_amount, DAddr current_vaddr) {
@@ -2499,7 +2566,7 @@ index 97c2706..8cb8625 100644
              std::memset(dest_pointer, 0, copy_amount);
          },
          [&](size_t copy_amount, const u8* const src_ptr) {
-@@ -443,12 +463,16 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
+@@ -443,12 +484,16 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
      WalkBlock(
          address, size,
          [&](size_t copy_amount, DAddr current_vaddr) {
@@ -2520,7 +2587,7 @@ index 97c2706..8cb8625 100644
              std::memcpy(dst_ptr, src_pointer, copy_amount);
          },
          [&](const std::size_t copy_amount) {
-@@ -462,9 +486,10 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+@@ -462,9 +507,10 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
      const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
      if (size <= Memory::YUZU_PAGESIZE - page_offset) {
          const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -2534,7 +2601,7 @@ index 97c2706..8cb8625 100644
                  return;
              }
          }
-@@ -473,8 +498,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+@@ -473,8 +519,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
          const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
          if (phys_addr != 0) {
              auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
@@ -2545,7 +2612,7 @@ index 97c2706..8cb8625 100644
              std::memcpy(dest_pointer, mem_ptr + page_offset, size);
              return;
          }
-@@ -482,10 +507,13 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+@@ -482,10 +528,13 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
      WalkBlock(
          address, size,
          [&](size_t copy_amount, DAddr current_vaddr) {
@@ -2563,7 +2630,7 @@ index 97c2706..8cb8625 100644
              std::memset(dest_pointer, 0, copy_amount);
          },
          [&](size_t copy_amount, const u8* const src_ptr) {
-@@ -502,12 +530,16 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
+@@ -502,12 +551,16 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
      WalkBlock(
          address, size,
          [&](size_t copy_amount, DAddr current_vaddr) {
@@ -19570,10 +19637,10 @@ index 0000000..7b682de
 +} // namespace Shader::Ampere
 diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 new file mode 100644
-index 0000000..b35e850
+index 0000000..a0f3126
 --- /dev/null
 +++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
-@@ -0,0 +1,3951 @@
+@@ -0,0 +1,3960 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Encoding reference: Mesa NAK sm70_encode.rs (MIT), Copyright 2022 Collabora, Ltd.
@@ -21013,13 +21080,16 @@ index 0000000..b35e850
 +                (u64{data} << 20) | (u64{1} << 48));
 +            break;
 +        }
-+        case 0x9a8: { // ATOMG.E.ADD.STRONG.GPU U32 through a uniform pointer.
++        case 0x9a8: { // ATOMG.E.ADD.STRONG.GPU U32 through a uniform pointer plus a byte offset.
 +            const u32 address = uniform_register(insn.Bits(64, 6));
-+            if (insn.Bits(24, 8) != 255 || insn.Bits(40, 24) ||
++            // The native offset is 24 bits signed; Maxwell ATOM keeps 20 (bits 28-47).
++            const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
++            if (insn.Bits(24, 8) != 255 || offset < -(1 << 19) || offset >= (1 << 19) ||
 +                (insn.words[2] & ~0x3fU) != 0x081ee140 || address == ~0U || (address & 1))
 +                return fail(index, "native global atomic mode");
 +            emit(0xed00000000000000ULL | predicate | dest | (u64{address} << 8) |
-+                (u64{insn.Bits(32, 8)} << 20) | (u64{1} << 48));
++                (u64{insn.Bits(32, 8)} << 20) | (u64{static_cast<u32>(offset) & 0xfffffU} << 28) |
++                (u64{1} << 48));
 +            break;
 +        }
 +        case 0xb97: { // SULD.P.2D/2D_ARRAY.IGN, direct descriptor and R, RG, or RGBA channels.
@@ -23230,8 +23300,14 @@ index 0000000..b35e850
 +            if (std::ranges::find(validated_barrier_cancellations, index) != validated_barrier_cancellations.end()) break;
 +            // A BREAK (optionally conditional) out of the innermost PBK scope only drops that scope's
 +            // token; the threads then branch past its BSYNC, and an enclosing SYNC scope pops the
-+            // leftover PBK token together with everything above it, so nothing is emitted.
-+            if (!barrier_tokens.empty() && insn.Bits(16, 4) == barrier_tokens.back() &&
++            // leftover PBK token together with everything above it, so nothing is emitted. When the
++            // next instruction breaks the enclosing scope too (same predicate), it is a multi-level
++            // exit and the cancellation sequence below validates it as a whole.
++            const bool breaks_outer_next =
++                barrier_tokens.size() >= 2 && index + 1 < code.size() &&
++                code[index + 1].Bits(0, 12) == 0x942 && code[index + 1].Bits(12, 4) == insn.Bits(12, 4) &&
++                code[index + 1].Bits(16, 4) == barrier_tokens[barrier_tokens.size() - 2];
++            if (!breaks_outer_next && !barrier_tokens.empty() && insn.Bits(16, 4) == barrier_tokens.back() &&
 +                !barrier_sync_scopes.back() && insn.words[1] == 0 && (insn.words[2] & ~0x07800000U) == 0 &&
 +                std::any_of(barrier_sync_scopes.begin(), barrier_sync_scopes.end() - 1,
 +                            [](bool sync) { return sync; }))
