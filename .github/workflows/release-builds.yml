@@ -1,0 +1,106 @@
+# Windows zip and Linux AppImage of Eden-NS2, built with tools/release/build-windows.sh and
+# tools/release/build-linux-appimage.sh (the same scripts work on a PC).
+#
+# Run it from the Actions tab for test builds (artifacts only), or push a tag such as v1.0: the tag
+# becomes the version in the window title and file names, and both packages are attached to a draft
+# GitHub release, published from the Releases page when you are ready.
+
+name: Release builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version shown in the window title and file names (empty = commit hash)
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git autotools
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-boost mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-fmt mingw-w64-x86_64-glslang mingw-w64-x86_64-lz4
+            mingw-w64-x86_64-nlohmann-json mingw-w64-x86_64-openssl mingw-w64-x86_64-opus
+            mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-charts mingw-w64-x86_64-qt6-svg
+            mingw-w64-x86_64-qt6-tools mingw-w64-x86_64-sdl3 mingw-w64-x86_64-spirv-headers
+            mingw-w64-x86_64-spirv-tools mingw-w64-x86_64-vulkan-headers
+            mingw-w64-x86_64-vulkan-loader mingw-w64-x86_64-vulkan-utility-libraries
+            mingw-w64-x86_64-zlib mingw-w64-x86_64-zstd
+
+      - uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: cpm-windows-${{ hashFiles('cpmfile.json', '**/cpmfile.json') }}
+          restore-keys: cpm-windows-
+
+      - name: Build and package
+        run: bash tools/release/build-windows.sh "${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eden-NS2-windows-x86_64
+          path: build-release-windows/*.zip
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cpm
+            .cache/qt
+          key: deps-linux-${{ hashFiles('cpmfile.json', '**/cpmfile.json', 'tools/release/build-linux-appimage.sh') }}
+          restore-keys: deps-linux-
+
+      - name: Build and package
+        run: bash tools/release/build-linux-appimage.sh --install-deps "${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eden-NS2-linux-x86_64
+          path: build-release-linux/*.AppImage
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: Eden-NS2 ${{ github.ref_name }}
+          files: packages/*

@@ -75,6 +75,32 @@ Not tested yet; nothing in the changes is Windows-only.
    command above.
 3. The binary is `build/bin/eden`; no DLL copying is needed.
 
+## Release packages
+
+Scripts in `tools/release/` build a release and package it. The version you give (for example `v1.0`)
+is shown in the window title and used in the file names; without one the commit hash is used.
+
+- **Windows zip**, in an MSYS2 MINGW64 shell with the packages from the Windows build section:
+
+  ```sh
+  bash tools/release/build-windows.sh v1.0
+  ```
+
+  The result is `build-release-windows/Eden-NS2-v1.0-windows-x86_64.zip`: `eden.exe` with every DLL and
+  Qt plugin it needs.
+- **Linux AppImage**, on Ubuntu 24.04. On Windows this works in WSL (`wsl --install -d Ubuntu-24.04`;
+  clone the repository inside the Linux home folder, building under `/mnt/c` is very slow):
+
+  ```sh
+  bash tools/release/build-linux-appimage.sh --install-deps v1.0
+  ```
+
+  `--install-deps` installs the build packages with apt; Qt 6.8.3 and linuxdeploy are downloaded into
+  `.cache/`. The result is `build-release-linux/Eden-NS2-v1.0-x86_64.AppImage`, for distributions with
+  glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Arch and later).
+- **GitHub Actions**: the "Release builds" workflow runs both scripts. Start it from the Actions tab for
+  test builds, or push a tag such as `v1.0` to have both packages attached to a draft release.
+
 ## Running
 
 Use your own dumped games, keys and firmware. Load a game from its extracted dump (the `romfs`

@@ -11,6 +11,10 @@ out/
 AppDir/
 uruntime
 
+# Release version files written by tools/release/*.sh while they build
+/GIT-TAG
+/GIT-RELEASE
+
 # dtrace and ktrace stuffs
 [dk]trace-out/
 [dk]trace.out
