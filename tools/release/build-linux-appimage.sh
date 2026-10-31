@@ -39,7 +39,7 @@ if [[ $install_deps == 1 ]]; then
         libopus-dev libpulse-dev libssl-dev libswscale-dev libtool libudev-dev libusb-1.0-0-dev \
         libva-dev libvdpau-dev libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
         libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
-        libxcb-xkb1 mesa-common-dev nasm ninja-build pkg-config python3-venv spirv-headers \
+        libxcb-xkb1 mesa-common-dev nasm ninja-build patch pkg-config python3-venv spirv-headers \
         spirv-tools zlib1g-dev
 fi
 

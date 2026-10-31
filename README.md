@@ -3,7 +3,7 @@
 A fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator that runs
 Nintendo Switch 2 games.
 
-![Donkey Kong Bananza gameplay](docs/ns2/screenshots/bananza-ingame.png)
+![Donkey Kong Bananza gameplay](docs/ns2/screenshots/bananza-cave.png)
 
 ![Mario Kart World title screen](docs/ns2/screenshots/mario-kart-world-title.png)
 
@@ -31,8 +31,8 @@ Nintendo Switch 2 games.
 ## Building (Windows, MSYS2 MINGW64)
 
 1. Install [MSYS2](https://www.msys2.org) and, in a **MINGW64** shell, install the MinGW toolchain,
-   CMake, Ninja, Qt 6, FFmpeg, SDL3, Boost, OpenSSL and the Vulkan headers, plus git and autotools
-   (for example `pacman -S --needed mingw-w64-x86_64-{toolchain,cmake,ninja,qt6,ffmpeg,sdl3,boost,openssl,vulkan-headers} git autotools`;
+   CMake, Ninja, Qt 6, FFmpeg, SDL3, Boost, OpenSSL and the Vulkan headers, plus git, patch and autotools
+   (for example `pacman -S --needed mingw-w64-x86_64-{toolchain,cmake,ninja,qt6,ffmpeg,sdl3,boost,openssl,vulkan-headers} git patch autotools`;
    exact package names may differ — see [docs/Deps.md](docs/Deps.md)).
 2. Configure and build from the repository root:
 

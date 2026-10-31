@@ -37,7 +37,7 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
-            git autotools
+            git autotools patch
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf mingw-w64-x86_64-boost mingw-w64-x86_64-ffmpeg
             mingw-w64-x86_64-fmt mingw-w64-x86_64-glslang mingw-w64-x86_64-lz4
