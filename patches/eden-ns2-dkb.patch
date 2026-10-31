@@ -20426,10 +20426,10 @@ index 0000000..7b682de
 +} // namespace Shader::Ampere
 diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 new file mode 100644
-index 0000000..76531c8
+index 0000000..1ac54c0
 --- /dev/null
 +++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
-@@ -0,0 +1,3992 @@
+@@ -0,0 +1,4009 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Encoding reference: Mesa NAK sm70_encode.rs (MIT), Copyright 2022 Collabora, Ltd.
@@ -21034,6 +21034,23 @@ index 0000000..76531c8
 +            emit(0x5d20000000000000ULL | predicate | (u64{insn.Bits(81, 3)} << 3) |
 +                 insn.Bits(84, 3) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
 +                 (u64{14} << 35) | (u64{7} << 39) | (u64{a.swizzle} << 47));
++            break;
++        }
++        case 0x234: { // HSETP2, packed half comparison of two registers into two predicates.
++            // Laid out like HSET2 (compare 76-79, combine 69-70, .H_AND 71, FTZ 80, Pc 87-90) with
++            // predicate outputs in 81-83 and 84-86 (as 0x434). Donkey Kong Bananza's compute shaders
++            // in some levels use it; rejecting them left the screen blue.
++            const u32 combine = insn.Bits(69, 2);
++            if (insn.Bits(16, 8) || insn.Bits(64, 5) || combine > 2 || insn.Bits(91, 1) ||
++                (insn.words[1] & 0x0fffff00U))
++                return fail(index, "native packed half predicate mode");
++            const auto a = half_source(0), b = half_source(1);
++            emit(0x5d20000000000000ULL | predicate | (u64{insn.Bits(81, 3)} << 3) | insn.Bits(84, 3) |
++                 (u64{insn.Bits(80, 1)} << 6) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
++                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) | (u64{b.negate} << 31) |
++                 (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 4)} << 39) |
++                 (u64{a.negate} << 43) | (u64{a.absolute} << 44) | (u64{combine} << 45) |
++                 (u64{a.swizzle} << 47) | (u64{insn.Bits(71, 1)} << 49));
 +            break;
 +        }
 +        case 0x233: case 0x433: case 0x633: { // HSET2, packed half comparisons and predicate combination.
@@ -43363,7 +43380,7 @@ index 64d14ab..d54a141 100644
      texture_cache/image_view_base.h
      texture_cache/image_view_info.cpp
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
-index f30c859..f39f34a 100644
+index f30c859..9db5ab1 100644
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
 @@ -9,11 +9,20 @@
@@ -43658,7 +43675,7 @@ index f30c859..f39f34a 100644
      const Binding& binding = channel_state->uniform_buffers[stage][index];
      const DAddr device_addr = binding.device_addr;
      const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
-@@ -1006,11 +1140,67 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+@@ -1006,11 +1140,82 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
      channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
  }
  
@@ -43681,7 +43698,22 @@ index f30c859..f39f34a 100644
 +            if (size > std::numeric_limits<u32>::max())
 +                throw Shader::RuntimeError("Grouped storage range exceeds supported size");
 +            const VirtualSegments* found = virtual_ranges.Query(*gpu_memory, group.address, static_cast<u32>(size));
-+            if (!found || found->empty()) throw Shader::RuntimeError("Unmapped grouped storage range");
++            if (!found || found->empty()) {
++                // The group has unmapped pages (a binding window larger than the data behind it, as
++                // Donkey Kong Bananza's terrain draws in some levels bind). Bind its members one by
++                // one, as without grouping; refusing the draw failed its whole command list.
++                static std::atomic<u32> logged{};
++                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
++                    LOG_WARNING(HW_GPU, "Grouped storage range [{:#x}, +{:#x}) has unmapped pages; its {} bindings are bound individually",
++                                group.address, size, group.members.size());
++                }
++                for (size_t member : group.members) {
++                    auto& binding = *bindings[member].first;
++                    binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
++                    ResolveMultiRangeStorage(binding, bindings[member].second, pool);
++                }
++                continue;
++            }
 +            const bool written = std::any_of(group.members.begin(), group.members.end(),
 +                [&](size_t member) { return bindings[member].second; });
 +            for (const auto& [previous, previous_written] : physical_groups) {
@@ -43727,7 +43759,7 @@ index f30c859..f39f34a 100644
      if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
          if (binding.gpu_addr == 0 || binding.size == 0) {
              return;
-@@ -1054,7 +1244,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1054,7 +1259,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
          if (binding.segment_first + binding.segment_count > pool.size()) {
              return false;
          }
@@ -43738,7 +43770,7 @@ index f30c859..f39f34a 100644
          runtime.ResetMultiRange();
          for (u32 index = 0; index < binding.segment_count; ++index) {
              const MultiRangeSegment& segment = pool[binding.segment_first + index];
-@@ -1070,6 +1262,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1070,6 +1277,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
              }
              runtime.PushMultiRangeSource(buffer, offset, segment.size);
          }
@@ -43749,7 +43781,7 @@ index f30c859..f39f34a 100644
          return runtime.BindMultiRangeStorageBuffer(key, is_written);
      } else {
          return false;
-@@ -1194,8 +1390,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
+@@ -1194,8 +1405,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                  return alignment > 1 && (offset % alignment) != 0;
              }
          }();
@@ -43766,7 +43798,7 @@ index f30c859..f39f34a 100644
                  const std::span<u8> span =
                      runtime.BindMappedUniformBuffer(0, binding_index, size);
                  device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
-@@ -1292,6 +1495,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
+@@ -1292,6 +1510,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
          if (current_draw_indirect) {
              UpdateDrawIndirect();
          }
@@ -43784,7 +43816,7 @@ index f30c859..f39f34a 100644
      });
  }
  
-@@ -1302,6 +1516,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
+@@ -1302,6 +1531,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
          UpdateComputeUniformBuffers();
          UpdateComputeStorageBuffers();
          UpdateComputeTextureBuffers();
@@ -43801,7 +43833,7 @@ index f30c859..f39f34a 100644
      });
  }
  
-@@ -1372,7 +1596,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
+@@ -1372,7 +1611,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
      const auto& array = maxwell3d->regs.vertex_streams[index];
      const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
      const GPUVAddr gpu_addr_begin = array.Address();
@@ -43815,7 +43847,7 @@ index f30c859..f39f34a 100644
      const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
      const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
      u32 size = address_size; // TODO: Analyze stride and number of vertices
-@@ -1419,6 +1648,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
+@@ -1419,6 +1663,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
  template <class P>
  void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
@@ -43823,7 +43855,7 @@ index f30c859..f39f34a 100644
          Binding& binding = channel_state->uniform_buffers[stage][index];
          if (binding.buffer_id) {
              // Already updated
-@@ -1438,6 +1668,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
+@@ -1438,6 +1683,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->storage_buffers[stage][index];
@@ -43833,7 +43865,7 @@ index f30c859..f39f34a 100644
          const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          binding.buffer_id = buffer_id;
          const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
-@@ -1504,6 +1737,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
+@@ -1504,6 +1752,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
      ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->compute_storage_buffers[index];
@@ -43843,7 +43875,7 @@ index f30c859..f39f34a 100644
          binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          const bool is_written =
              ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-@@ -1529,7 +1765,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+@@ -1529,7 +1780,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
      }
      memory_tracker.MarkRegionAsGpuModified(device_addr, size);
      gpu_modified_ranges.Add(device_addr, size);
@@ -43855,7 +43887,7 @@ index f30c859..f39f34a 100644
  }
  
  template <class P>
-@@ -1710,9 +1949,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
+@@ -1710,9 +1964,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
      Buffer& buffer = slot_buffers[buffer_id];
      const auto size = buffer.SizeBytes();
      if (insert) {
@@ -43867,7 +43899,7 @@ index f30c859..f39f34a 100644
          total_used_memory -= Common::AlignUp(size, 1024);
          lru_cache.Free(buffer.getLRUID());
      }
-@@ -1902,6 +2143,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
+@@ -1902,6 +2158,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
      DownloadBufferMemory(buffer, buffer.CpuAddr(), buffer.SizeBytes());
  }
  
@@ -43920,7 +43952,7 @@ index f30c859..f39f34a 100644
  template <class P>
  void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
      boost::container::small_vector<BufferCopy, 1> copies;
-@@ -2030,28 +2317,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+@@ -2030,28 +2332,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
      channel_state->has_deleted_buffers = true;
  }
  

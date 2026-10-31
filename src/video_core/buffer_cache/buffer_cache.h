@@ -1159,7 +1159,22 @@ void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, b
             if (size > std::numeric_limits<u32>::max())
                 throw Shader::RuntimeError("Grouped storage range exceeds supported size");
             const VirtualSegments* found = virtual_ranges.Query(*gpu_memory, group.address, static_cast<u32>(size));
-            if (!found || found->empty()) throw Shader::RuntimeError("Unmapped grouped storage range");
+            if (!found || found->empty()) {
+                // The group has unmapped pages (a binding window larger than the data behind it, as
+                // Donkey Kong Bananza's terrain draws in some levels bind). Bind its members one by
+                // one, as without grouping; refusing the draw failed its whole command list.
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(HW_GPU, "Grouped storage range [{:#x}, +{:#x}) has unmapped pages; its {} bindings are bound individually",
+                                group.address, size, group.members.size());
+                }
+                for (size_t member : group.members) {
+                    auto& binding = *bindings[member].first;
+                    binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+                    ResolveMultiRangeStorage(binding, bindings[member].second, pool);
+                }
+                continue;
+            }
             const bool written = std::any_of(group.members.begin(), group.members.end(),
                 [&](size_t member) { return bindings[member].second; });
             for (const auto& [previous, previous_written] : physical_groups) {

@@ -604,6 +604,23 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{14} << 35) | (u64{7} << 39) | (u64{a.swizzle} << 47));
             break;
         }
+        case 0x234: { // HSETP2, packed half comparison of two registers into two predicates.
+            // Laid out like HSET2 (compare 76-79, combine 69-70, .H_AND 71, FTZ 80, Pc 87-90) with
+            // predicate outputs in 81-83 and 84-86 (as 0x434). Donkey Kong Bananza's compute shaders
+            // in some levels use it; rejecting them left the screen blue.
+            const u32 combine = insn.Bits(69, 2);
+            if (insn.Bits(16, 8) || insn.Bits(64, 5) || combine > 2 || insn.Bits(91, 1) ||
+                (insn.words[1] & 0x0fffff00U))
+                return fail(index, "native packed half predicate mode");
+            const auto a = half_source(0), b = half_source(1);
+            emit(0x5d20000000000000ULL | predicate | (u64{insn.Bits(81, 3)} << 3) | insn.Bits(84, 3) |
+                 (u64{insn.Bits(80, 1)} << 6) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
+                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) | (u64{b.negate} << 31) |
+                 (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 4)} << 39) |
+                 (u64{a.negate} << 43) | (u64{a.absolute} << 44) | (u64{combine} << 45) |
+                 (u64{a.swizzle} << 47) | (u64{insn.Bits(71, 1)} << 49));
+            break;
+        }
         case 0x233: case 0x433: case 0x633: { // HSET2, packed half comparisons and predicate combination.
             const u32 combine = insn.Bits(69, 2);
             if (insn.Bits(64, 5) || combine > 2 || insn.Bits(81, 6) || insn.Bits(91, 1) ||
