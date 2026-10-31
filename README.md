@@ -13,7 +13,7 @@ Nintendo Switch 2 games.
 
 | Game | State |
 | --- | --- |
-| Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Playable |
+| Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Playable; blue screen after reaching a certain area |
 | Mario Kart World (`0400C3F00006E000`, v1.8.0) | Playable in Free Roam and Grand Prix |
 | Pokémon Pokopia (`0400A3A01EE4C000`) | Playable; stable 60 FPS |
 | Splatoon Raiders (`0400380020056000`) | Playable; black screen after the intro |
@@ -22,6 +22,7 @@ Nintendo Switch 2 games.
 ### Known issues
 
 - **Performance:** still a work in progress; expect slowdowns and stutter.
+- **Donkey Kong Bananza:** destructible terrain is invisible on AMD GPUs.
 - **Mario Kart World:** loading screens can take a long time, especially the first time a course is
   loaded. Recommended per-game settings: GPU accuracy Low, asynchronous shaders on, and ASTC
   recompression BC3 (needed on GPUs with less than 8 GB of video memory). Some geometry
