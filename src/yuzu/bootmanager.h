@@ -93,6 +93,8 @@ public:
 
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
+    /// Keeps Tab as a game key instead of moving keyboard focus.
+    bool focusNextPrevChild(bool next) override;
 
     /// Converts a Qt mouse button into MouseInput mouse button
     static InputCommon::MouseButton QtButtonToMouseButton(Qt::MouseButton button);

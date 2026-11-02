@@ -456,6 +456,7 @@ private:
     void UpdateUISettings();
     void UpdateInputDrivers();
     void HideMouseCursor();
+    void SyncMousePanningWithBindings(bool at_boot);
     void ShowMouseCursor();
     void OpenURL(const QUrl& url);
     void LoadTranslation();
@@ -547,6 +548,7 @@ private:
     bool auto_paused = false;
     bool auto_muted = false;
     QTimer mouse_hide_timer;
+    bool mouse_right_stick = false;
     QTimer update_input_timer;
 
     QString startup_icon_theme;

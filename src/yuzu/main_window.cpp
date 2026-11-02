@@ -10,6 +10,7 @@
 
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
+#include "common/param_package.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
@@ -2005,6 +2006,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     refresh_button->setDisabled(true);
     SetFPSSuffix();
 
+    SyncMousePanningWithBindings(true);
     if (UISettings::values.hide_mouse || Settings::values.mouse_panning) {
         render_window->installEventFilter(render_window);
         render_window->setAttribute(Qt::WA_Hover, true);
@@ -3488,6 +3490,7 @@ void MainWindow::OnConfigure() {
 
     config->SaveAllValues();
 
+    SyncMousePanningWithBindings(false);
     if ((UISettings::values.hide_mouse || Settings::values.mouse_panning) && emulation_running) {
         render_window->installEventFilter(render_window);
         render_window->setAttribute(Qt::WA_Hover, true);
@@ -4317,6 +4320,18 @@ void MainWindow::UpdateInputDrivers() {
     if (!input_subsystem)
         return;
     input_subsystem->PumpEvents();
+}
+
+// Mouse panning follows the bindings: binding player 1's right stick to the mouse turns it on,
+// binding it to something else turns it off. The hotkey still toggles it in between.
+void MainWindow::SyncMousePanningWithBindings(bool at_boot) {
+    const auto& player = Settings::values.players.GetValue()[0];
+    const Common::ParamPackage right_stick{player.analogs[Settings::NativeAnalog::RStick]};
+    const bool mouse_stick = right_stick.Get("engine", "") == "mouse";
+    if (mouse_stick ? at_boot || !mouse_right_stick : mouse_right_stick) {
+        Settings::values.mouse_panning = mouse_stick;
+    }
+    mouse_right_stick = mouse_stick;
 }
 
 void MainWindow::HideMouseCursor() {
