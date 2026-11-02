@@ -147,7 +147,13 @@ void Visitor::HFMA2() {
     const auto [lhs_a, rhs_a] = HalfLanes(a);
     auto [lhs_b, rhs_b] = HalfLanes(b);
     if (negate_high_b) {
-        rhs_b = ir.FPAbsNeg(rhs_b, false, true);
+        // .H0_NH1 names B's lanes high first, as .H1_H0 names the identity: the high lane reads
+        // B's low half and the low lane reads B's high half negated. Read as a plain upper-lane
+        // negation it crossed the two lanes of Pokopia's sun-shadow mask (shadow against the
+        // cloud map instead of the cascade fade), which lit cave floors and dropped cloud shadows.
+        const IR::F16F32F64 old_high{rhs_b};
+        rhs_b = lhs_b;
+        lhs_b = ir.FPAbsNeg(old_high, false, true);
     }
     const auto [lhs_c, rhs_c] = HalfLanes(c);
     const IR::FpControl control{
