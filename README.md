@@ -3,7 +3,7 @@
 A fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator that runs
 Nintendo Switch 2 games.
 
-![Pokémon Pokopia gameplay]<img width="1202" height="666" alt="Screenshot 2026-11-02 020223" src="https://github.com/user-attachments/assets/8f7c039d-4a81-45cb-a1a2-786768545c8d" />
+<img width="1202" height="666" alt="Screenshot 2026-11-02 020223" src="https://github.com/user-attachments/assets/8f7c039d-4a81-45cb-a1a2-786768545c8d" />
 
 <img width="1199" height="669" alt="Screenshot 2026-11-02 020703" src="https://github.com/user-attachments/assets/d897cb3f-3e3d-4098-8f2c-c736569a8342" />
 
