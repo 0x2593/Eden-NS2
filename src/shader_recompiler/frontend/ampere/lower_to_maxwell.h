@@ -40,7 +40,7 @@ inline bool LowerGroupDisabled(std::string_view group) {
 }
 
 // EDEN_NATIVE_LOWER_ENABLE=<group>[,<group>...] turns on lowering fixes that are off by default.
-// Groups: audit_fsel (FSEL operand neg/abs, suspected of changing FastFusion colours).
+// Groups: none at present.
 inline bool LowerGroupEnabled(std::string_view group) {
     static const std::string list = [] {
         const char* value = std::getenv("EDEN_NATIVE_LOWER_ENABLE");
@@ -542,11 +542,15 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             auto a = half_source(0);
             auto b = half_source(1);
             const auto c = half_source(2);
-            if (insn.Bits(86, 1)) { // H0_NH1: negate only the upper packed component.
+            if (insn.Bits(86, 1)) { // H0_NH1: B's lanes swap, and the half that lands in the low lane (the old H1) is negated (see ops_half.cpp).
                 if (b.swizzle != 0 || b.absolute || b.reg >= 250)
                     return fail(index, "native half mixed-sign source mode");
-                emit(0x0400000000000000ULL | predicate | 251 | (u64{b.reg} << 8) |
-                     (u64{0x80000000} << 20) | (u64{2} << 53));
+                emit(0x3828000000000000ULL | predicate | 250 | (u64{b.reg} << 8) | (u64{16} << 20));   // SHR.U32 R250 = B >> 16: the old H1 in the low half
+                emit(0x3848000000000000ULL | predicate | 251 | (u64{b.reg} << 8) | (u64{16} << 20));   // SHL R251 = B << 16: the old H0 in the high half
+                emit(0x5c40000000000000ULL | predicate | 251 | (u64{251} << 8) | (u64{250} << 20) |
+                     (u64{1} << 41) | (u64{7} << 48));                                                   // LOP.OR R251 |= R250
+                emit(0x0400000000000000ULL | predicate | 251 | (u64{251} << 8) |
+                     (u64{0x8000} << 20) | (u64{2} << 53));                                              // LOP32I.XOR: negate the low half
                 b.reg = 251;
             }
             if (b.absolute || c.absolute || (a.absolute && a.reg >= 248))
@@ -2976,8 +2980,10 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x207: case 0x807: case 0xa07:
         case 0x208: case 0x808: case 0xa08: { // Bitwise SEL / FSEL
             // FSEL carries abs/neg on both selected operands (bits 73/72 and 62/63, as for FADD).
-            // Off by default until it is proven not to change FastFusion colours: EDEN_NATIVE_LOWER_ENABLE=audit_fsel.
-            const bool floating = (opcode & 0x1ff) == 0x8 && LowerGroupEnabled("audit_fsel");
+            // Shaders use them to pick x or -x from one register (Pokopia's character and prop
+            // lighting has dozens); without them both sides are x. EDEN_NATIVE_LOWER_DISABLE=audit_fsel
+            // restores the old form.
+            const bool floating = (opcode & 0x1ff) == 0x8 && !LowerGroupDisabled("audit_fsel");
             const u32 a = operand(0, floating), b = operand(1, floating);
             emit(base(0x5ca0000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));

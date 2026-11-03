@@ -439,6 +439,10 @@ void GRenderWindow::keyPressEvent(QKeyEvent* event) {
     }
 }
 
+bool GRenderWindow::focusNextPrevChild(bool) {
+    return false;
+}
+
 void GRenderWindow::keyReleaseEvent(QKeyEvent* event) {
     /**
      * This feature can be enhanced with the following functions, but they do not provide

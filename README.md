@@ -3,11 +3,15 @@
 A fork of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo Switch emulator that runs
 Nintendo Switch 2 games.
 
+<img width="1202" height="666" alt="Screenshot 2026-11-02 020223" src="https://github.com/user-attachments/assets/8f7c039d-4a81-45cb-a1a2-786768545c8d" />
+
+<img width="1199" height="669" alt="Screenshot 2026-11-02 020703" src="https://github.com/user-attachments/assets/d897cb3f-3e3d-4098-8f2c-c736569a8342" />
+
+<img width="1201" height="664" alt="Screenshot 2026-11-02 020233" src="https://github.com/user-attachments/assets/8ef81766-cf52-4994-835c-a566321f97bb" />
+
 ![Donkey Kong Bananza gameplay](docs/ns2/screenshots/bananza-cave.png)
 
 ![Mario Kart World title screen](docs/ns2/screenshots/mario-kart-world-title.png)
-
-![Pokémon Pokopia gameplay](docs/ns2/screenshots/pokopia-gameplay.png)
 
 ## Status
 
@@ -15,7 +19,7 @@ Nintendo Switch 2 games.
 | --- | --- |
 | Donkey Kong Bananza (`040074A01BF12000`, v7.0.0) | Playable; slow in some areas |
 | Mario Kart World (`0400C3F00006E000`, v1.8.0) | Playable; slow in some areas |
-| Pokémon Pokopia (`0400A3A01EE4C000`) | Playable; stable 60 FPS |
+| Pokémon Pokopia (`0400A3A01EE4C000`) | Playable with fully fixed shaders; stable 60 FPS |
 | Splatoon Raiders (`0400380020056000`) | Playable; stable 60 FPS |
 | Nintendo Switch 2 Welcome Tour (`040057C02159A000`) | Boots; runs very slowly |
 
